@@ -8,9 +8,12 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <map>
 #include <set>
 #include <string>
@@ -19,6 +22,8 @@
 #include <vector>
 
 #include <fmt/format.h>
+
+#include "common/logging.h"
 
 #include <windows.h>
 // windows.h first: the other two use its types.
@@ -76,14 +81,66 @@ bool Matches(const std::string& thread_name, const std::vector<std::string>& pat
     return false;
 }
 
-std::vector<Target> FindThreads(const std::vector<std::string>& patterns) {
+// A beep that wireless headsets do not swallow: a short silence first wakes the device. It plays
+// through the normal audio engine (PlaySound, loaded on demand), with Beep() as the fallback.
+void Tone(unsigned frequency, unsigned milliseconds, unsigned lead_milliseconds) {
+    constexpr unsigned SampleRate = 22050;
+    const unsigned lead = SampleRate * lead_milliseconds / 1000;
+    const unsigned tone = SampleRate * milliseconds / 1000;
+    const unsigned count = lead + tone;
+    std::vector<unsigned char> wav(44 + static_cast<size_t>(count) * 2);
+    const auto put32 = [&](size_t at, std::uint32_t value) { std::memcpy(wav.data() + at, &value, 4); };
+    const auto put16 = [&](size_t at, std::uint16_t value) { std::memcpy(wav.data() + at, &value, 2); };
+    std::memcpy(wav.data(), "RIFF", 4);
+    put32(4, 36 + count * 2);
+    std::memcpy(wav.data() + 8, "WAVEfmt ", 8);
+    put32(16, 16);
+    put16(20, 1); // PCM
+    put16(22, 1); // mono
+    put32(24, SampleRate);
+    put32(28, SampleRate * 2);
+    put16(32, 2);
+    put16(34, 16);
+    std::memcpy(wav.data() + 36, "data", 4);
+    put32(40, count * 2);
+    for (unsigned i = 0; i < tone; ++i) {
+        const double fade = (std::min)({1.0, i / 400.0, (tone - i) / 400.0});
+        const auto value = static_cast<std::int16_t>(
+            20000.0 * fade * std::sin(6.283185307 * frequency * i / SampleRate));
+        std::memcpy(wav.data() + 44 + static_cast<size_t>(lead + i) * 2, &value, 2);
+    }
+    using PlaySoundFn = BOOL(WINAPI*)(LPCSTR, HMODULE, DWORD);
+    const HMODULE winmm = LoadLibraryA("winmm.dll");
+    const auto play =
+        winmm != nullptr ? reinterpret_cast<PlaySoundFn>(GetProcAddress(winmm, "PlaySoundA")) : nullptr;
+    // SND_MEMORY | SND_NODEFAULT, synchronous.
+    if (play == nullptr || !play(reinterpret_cast<LPCSTR>(wav.data()), nullptr, 0x0004 | 0x0002)) {
+        Beep(frequency, milliseconds);
+    }
+}
+
+// Names are matched like EDEN_NX2_SAMPLE says; "@busiest" or "@busiest:N" adds the N threads
+// (default 8) that used the most CPU in the 2 seconds after the call, whatever their name.
+std::vector<Target> FindThreads(const std::vector<std::string>& patterns, std::string& listing) {
     using GetThreadDescriptionFn = HRESULT(WINAPI*)(HANDLE, PWSTR*);
     const auto get_description = reinterpret_cast<GetThreadDescriptionFn>(
         GetProcAddress(GetModuleHandleA("KernelBase.dll"), "GetThreadDescription"));
-    std::vector<Target> targets;
-    if (get_description == nullptr) {
-        return targets;
+    std::vector<std::string> name_patterns;
+    size_t busiest = 0;
+    for (const auto& pattern : patterns) {
+        if (pattern.compare(0, 8, "@busiest") == 0) {
+            const size_t colon = pattern.find(':');
+            const long requested =
+                colon != std::string::npos ? std::strtol(pattern.c_str() + colon + 1, nullptr, 10) : 8;
+            busiest = static_cast<size_t>((std::max)(1L, requested));
+        } else {
+            name_patterns.push_back(pattern);
+        }
     }
+    std::vector<Target> targets;
+    std::vector<Target> others;
+    listing = get_description == nullptr ? "GetThreadDescription is not available. " : "";
+    unsigned unnamed = 0;
     const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     if (snapshot == INVALID_HANDLE_VALUE) {
         return targets;
@@ -103,19 +160,63 @@ std::vector<Target> FindThreads(const std::vector<std::string>& patterns) {
         }
         PWSTR wide{};
         std::string name;
-        if (SUCCEEDED(get_description(handle, &wide)) && wide != nullptr) {
+        if (get_description != nullptr && SUCCEEDED(get_description(handle, &wide)) &&
+            wide != nullptr) {
             char buffer[256]{};
             WideCharToMultiByte(CP_UTF8, 0, wide, -1, buffer, sizeof(buffer) - 1, nullptr, nullptr);
             name = buffer;
             LocalFree(wide);
         }
-        if (Matches(name, patterns)) {
-            targets.push_back({handle, name});
+        if (name.empty()) {
+            ++unnamed;
+        } else {
+            listing += fmt::format("{}={} ", entry.th32ThreadID, name);
+        }
+        const std::string label = name.empty() ? fmt::format("tid {}", entry.th32ThreadID) : name;
+        if (Matches(name, name_patterns)) {
+            targets.push_back({handle, label});
+        } else if (busiest > 0) {
+            others.push_back({handle, label});
         } else {
             CloseHandle(handle);
         }
     }
     CloseHandle(snapshot);
+    listing += fmt::format("({} unnamed)", unnamed);
+    if (busiest > 0) {
+        const auto cpu_time = [](HANDLE handle) {
+            FILETIME created{}, exited{}, kernel{}, user{};
+            if (!GetThreadTimes(handle, &created, &exited, &kernel, &user)) {
+                return ULONGLONG{0};
+            }
+            const auto to_integer = [](const FILETIME& time) {
+                return (static_cast<ULONGLONG>(time.dwHighDateTime) << 32) | time.dwLowDateTime;
+            };
+            return to_integer(kernel) + to_integer(user);
+        };
+        std::vector<ULONGLONG> before;
+        for (const Target& other : others) {
+            before.push_back(cpu_time(other.handle));
+        }
+        Sleep(2000);
+        std::vector<std::pair<ULONGLONG, size_t>> used;
+        for (size_t i = 0; i < others.size(); ++i) {
+            const ULONGLONG after = cpu_time(others[i].handle);
+            used.emplace_back(after > before[i] ? after - before[i] : ULONGLONG{0}, i);
+        }
+        std::sort(used.rbegin(), used.rend());
+        std::vector<bool> keep(others.size(), false);
+        for (size_t i = 0; i < (std::min)(busiest, used.size()); ++i) {
+            keep[used[i].second] = used[i].first > 0;
+        }
+        for (size_t i = 0; i < others.size(); ++i) {
+            if (keep[i]) {
+                targets.push_back(others[i]);
+            } else {
+                CloseHandle(others[i].handle);
+            }
+        }
+    }
     return targets;
 }
 
@@ -308,11 +409,36 @@ std::string Report(const std::vector<Target>& targets, const std::vector<Sample>
 
 std::string SampleThreads(const std::vector<std::string>& patterns, double seconds,
                           const std::string& out) {
-    const std::vector<Target> targets = FindThreads(patterns);
+    // EDEN_NX2_SAMPLE_BEEP=0 silences the tones that mark the start (two rising) and the end (one
+    // long low) of the sampling.
+    const bool beep = EnvSeconds("EDEN_NX2_SAMPLE_BEEP", 1.0) != 0.0;
+    std::error_code ignored;
+    std::filesystem::create_directories(std::filesystem::path{out}.parent_path(), ignored);
+    std::string listing;
+    const std::vector<Target> targets = FindThreads(patterns, listing);
     std::fprintf(stderr, "nx2 sampler: %zu threads match, sampling %.0f s\n", targets.size(),
                  seconds);
+    std::string chosen;
+    for (const Target& target : targets) {
+        chosen += target.name + "; ";
+    }
+    LOG_INFO(Common, "nx2 sampler: {} threads sampled for {:.0f} s: {}", targets.size(), seconds,
+             chosen);
+    LOG_INFO(Common, "nx2 sampler: threads of the process: {}", listing);
     if (targets.empty()) {
-        return "no thread matches";
+        const std::string text = "no thread matches\nthreads of the process: " + listing + "\n";
+        if (std::FILE* const file = std::fopen(out.c_str(), "w")) {
+            std::fputs(text.c_str(), file);
+            std::fclose(file);
+        }
+        if (beep) {
+            Tone(300, 1500, 400);
+        }
+        return text;
+    }
+    if (beep) {
+        Tone(800, 500, 400);
+        Tone(1100, 500, 0);
     }
     std::vector<Sample> samples;
     samples.reserve(static_cast<size_t>(seconds * 1100.0) * targets.size() + 16);
@@ -337,8 +463,12 @@ std::string SampleThreads(const std::vector<std::string>& patterns, double secon
     }
     std::string text = Report(targets, samples, out.c_str());
     std::fprintf(stderr, "nx2 sampler: %zu samples written to %s\n", samples.size(), out.c_str());
+    LOG_INFO(Common, "nx2 sampler: {} samples written to {}", samples.size(), out);
     for (const auto& target : targets) {
         CloseHandle(target.handle);
+    }
+    if (beep) {
+        Tone(500, 1200, 400);
     }
     return text;
 }
