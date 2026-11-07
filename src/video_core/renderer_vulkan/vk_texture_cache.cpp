@@ -20,6 +20,7 @@
 #include "common/bit_util.h"
 #include "common/div_ceil.h"
 #include "common/literals.h"
+#include "common/nx2_sampler.h"
 #include "common/settings.h"
 
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
@@ -3346,22 +3347,26 @@ bool Image::BindZeroBlock() {
         .signalSemaphoreCount = 0,
         .pSignalSemaphores = nullptr,
     };
-    vk::Fence fence = device.GetLogical().CreateFence(VkFenceCreateInfo{
-        .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-    });
-    VkResult result;
     {
-        std::scoped_lock lock{scheduler->submit_mutex};
-        result = device.GetGraphicsQueue().BindSparse(bind_info, *fence);
+        const Nx2Sampler::ScopedMicros bind_time{Nx2Sampler::g_sparse_bind_us,
+                                                 &Nx2Sampler::g_sparse_binds};
+        vk::Fence fence = device.GetLogical().CreateFence(VkFenceCreateInfo{
+            .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+        });
+        VkResult result;
+        {
+            std::scoped_lock lock{scheduler->submit_mutex};
+            result = device.GetGraphicsQueue().BindSparse(bind_info, *fence);
+        }
+        if (result != VK_SUCCESS) {
+            LOG_ERROR(Render_Vulkan, "Sparse tiled image {:#x}: binding the zeroed block failed ({})",
+                      gpu_addr, static_cast<int>(result));
+            return false;
+        }
+        fence.Wait();
     }
-    if (result != VK_SUCCESS) {
-        LOG_ERROR(Render_Vulkan, "Sparse tiled image {:#x}: binding the zeroed block failed ({})",
-                  gpu_addr, static_cast<int>(result));
-        return false;
-    }
-    fence.Wait();
     // Every block now reads the shared block (and the tail its own memory): zero them all.
     ClearTiles();
     return true;
@@ -3567,6 +3572,8 @@ bool Image::BindTiles(std::span<const VideoCommon::LevelRect> rects) {
         .pSignalSemaphores = nullptr,
     };
     // Bound before the command buffer that uploads the blocks is submitted (as BindLayers).
+    const Nx2Sampler::ScopedMicros bind_time{Nx2Sampler::g_sparse_bind_us,
+                                             &Nx2Sampler::g_sparse_binds};
     vk::Fence fence = device.GetLogical().CreateFence(VkFenceCreateInfo{
         .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
         .pNext = nullptr,
@@ -3727,6 +3734,8 @@ std::vector<u32> Image::BindLayers(std::span<const u32> layers) {
     };
     // Bound before the command buffer that uploads the layers is submitted (as the multi-range
     // buffer cache does).
+    const Nx2Sampler::ScopedMicros bind_time{Nx2Sampler::g_sparse_bind_us,
+                                             &Nx2Sampler::g_sparse_binds};
     vk::Fence fence = device.GetLogical().CreateFence(VkFenceCreateInfo{
         .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
         .pNext = nullptr,

@@ -458,12 +458,22 @@ struct StallCounters {
     std::uint64_t astc;
     std::uint64_t pipelines;
     std::uint64_t pipeline_us;
+    std::uint64_t sparse_binds;
+    std::uint64_t sparse_us;
+    std::uint64_t created;
+    std::uint64_t deleted;
+    std::uint64_t gc_us;
 };
 
 StallCounters ReadCounters() {
     return {g_astc_decodes.load(std::memory_order_relaxed),
             g_pipelines_built.load(std::memory_order_relaxed),
-            g_pipeline_build_us.load(std::memory_order_relaxed)};
+            g_pipeline_build_us.load(std::memory_order_relaxed),
+            g_sparse_binds.load(std::memory_order_relaxed),
+            g_sparse_bind_us.load(std::memory_order_relaxed),
+            g_images_created.load(std::memory_order_relaxed),
+            g_images_deleted.load(std::memory_order_relaxed),
+            g_gc_us.load(std::memory_order_relaxed)};
 }
 
 int StallGroupOf(const std::string& name) {
@@ -573,9 +583,13 @@ void ReportStall(unsigned index, double at_seconds, long long gap_ms, unsigned r
     const StallCounters after = ReadCounters();
     LOG_INFO(Common,
              "nx2 stall #{} at {:.1f} s: {} ms between presents, {} sampling rounds; ASTC decodes "
-             "+{}, pipelines built +{} ({:.1f} ms)",
+             "+{}, pipelines built +{} ({:.1f} ms), sparse binds +{} ({:.1f} ms), images +{} -{}, "
+             "texture GC {:.1f} ms",
              index, at_seconds, gap_ms, rounds, after.astc - before.astc,
-             after.pipelines - before.pipelines, (after.pipeline_us - before.pipeline_us) / 1000.0);
+             after.pipelines - before.pipelines, (after.pipeline_us - before.pipeline_us) / 1000.0,
+             after.sparse_binds - before.sparse_binds, (after.sparse_us - before.sparse_us) / 1000.0,
+             after.created - before.created, after.deleted - before.deleted,
+             (after.gc_us - before.gc_us) / 1000.0);
     if (!threads.empty()) {
         LOG_INFO(Common, "nx2 stall: threads seen: {}", threads);
     }
@@ -818,17 +832,20 @@ void NotePresent(long long frame_us, long long fence_us, long long composite_us,
         const auto path = Common::FS::GetEdenPath(Common::FS::EdenPath::LogDir) / "nx2_frames.csv";
         frames.file.open(path, std::ios::out | std::ios::trunc);
         frames.pending =
-            "t_s,frame_ms,fence_ms,composite_ms,pace_ms,astc_decodes,pipelines_built,pipeline_ms\n";
+            "t_s,frame_ms,fence_ms,composite_ms,pace_ms,astc_decodes,pipelines_built,pipeline_ms,"
+            "sparse_binds,sparse_ms,images_created,images_deleted,gc_ms\n";
     }
     if (!frames.file.is_open()) {
         return;
     }
     const StallCounters counters = ReadCounters();
-    frames.pending += fmt::format("{:.3f},{:.2f},{:.2f},{:.2f},{:.2f},{},{},{:.1f}\n",
+    frames.pending += fmt::format("{:.3f},{:.2f},{:.2f},{:.2f},{:.2f},{},{},{:.1f},{},{:.1f},{},{},{:.1f}\n",
                                   std::chrono::duration<double>(now - g_process_start).count(),
                                   frame_us / 1000.0, fence_us / 1000.0, composite_us / 1000.0,
                                   pace_us / 1000.0, counters.astc, counters.pipelines,
-                                  counters.pipeline_us / 1000.0);
+                                  counters.pipeline_us / 1000.0, counters.sparse_binds,
+                                  counters.sparse_us / 1000.0, counters.created, counters.deleted,
+                                  counters.gc_us / 1000.0);
     if (++frames.lines % 150 == 0) {
         frames.Flush();
     }

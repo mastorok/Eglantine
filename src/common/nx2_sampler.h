@@ -4,6 +4,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <string>
 
@@ -33,6 +34,39 @@ std::string Sample(const char* names, double seconds, const std::string& out);
 inline std::atomic<std::uint64_t> g_astc_decodes{0};
 inline std::atomic<std::uint64_t> g_pipelines_built{0};
 inline std::atomic<std::uint64_t> g_pipeline_build_us{0};
+// Sparse image binds (queue bind + wait for its fence), texture cache images made and deleted,
+// and time spent in the texture cache's garbage collector.
+inline std::atomic<std::uint64_t> g_sparse_binds{0};
+inline std::atomic<std::uint64_t> g_sparse_bind_us{0};
+inline std::atomic<std::uint64_t> g_images_created{0};
+inline std::atomic<std::uint64_t> g_images_deleted{0};
+inline std::atomic<std::uint64_t> g_gc_us{0};
+
+/// Adds the lifetime of the object, in microseconds, to `total` (and one to `count`, if given).
+class ScopedMicros {
+public:
+    explicit ScopedMicros(std::atomic<std::uint64_t>& total_,
+                          std::atomic<std::uint64_t>* count_ = nullptr)
+        : total{total_}, count{count_}, begin{std::chrono::steady_clock::now()} {}
+
+    ~ScopedMicros() {
+        total.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                       std::chrono::steady_clock::now() - begin)
+                                                       .count()),
+                        std::memory_order_relaxed);
+        if (count != nullptr) {
+            count->fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    ScopedMicros(const ScopedMicros&) = delete;
+    ScopedMicros& operator=(const ScopedMicros&) = delete;
+
+private:
+    std::atomic<std::uint64_t>& total;
+    std::atomic<std::uint64_t>* count;
+    std::chrono::steady_clock::time_point begin;
+};
 
 /// Called by the present path with the times (microseconds) of the present that just ended.
 void NotePresent(long long frame_us, long long fence_us, long long composite_us, long long pace_us);

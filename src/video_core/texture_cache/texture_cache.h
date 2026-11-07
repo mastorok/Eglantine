@@ -18,6 +18,7 @@
 #include <boost/container/small_vector.hpp>
 
 #include "common/alignment.h"
+#include "common/nx2_sampler.h"
 #include "common/settings.h"
 #include "common/slot_vector.h"
 #include "video_core/control/channel_state.h"
@@ -448,6 +449,7 @@ void TextureCache<P>::TickFrame() {
         images_created = images_deleted = 0;
     }
     if (total_used_memory > minimum_memory) {
+        const Nx2Sampler::ScopedMicros gc_time{Nx2Sampler::g_gc_us};
         RunGarbageCollector();
     }
     sentenced_images.Tick();
@@ -2621,6 +2623,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             shape.second = gpu_addr;
         }
         ++images_created;
+        Nx2Sampler::g_images_created.fetch_add(1, std::memory_order_relaxed);
     }
 
     if (!gpu_memory->IsContinuousRange(new_image.gpu_addr, new_image.guest_size_bytes) &&
@@ -3376,6 +3379,7 @@ template <class P>
 void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
     ImageBase& image = slot_images[image_id];
     ++images_deleted;
+    Nx2Sampler::g_images_deleted.fetch_add(1, std::memory_order_relaxed);
     // Drop every decode still queued for it, whatever IsDecoding says: an image re-decoded while
     // a decode was in flight has two, and the first to finish clears the flag. A decode left
     // behind was uploaded into the next image to take this slot (another texture's data: garbage
