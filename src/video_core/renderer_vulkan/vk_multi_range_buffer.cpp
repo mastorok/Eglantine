@@ -5,6 +5,7 @@
 #include <mutex>
 #include <utility>
 
+#include "common/nx2_sampler.h"
 #include "video_core/renderer_vulkan/vk_multi_range_buffer.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -155,12 +156,15 @@ SparseBuffer MultiRangeBufferCache::CreateSparse(const Device& device, Scheduler
         .pNext = nullptr,
         .flags = 0,
     };
+    const Nx2Sampler::ScopedMicros bind_time{Nx2Sampler::g_sparse_bind_us,
+                                             &Nx2Sampler::g_sparse_binds};
     vk::Fence fence = device.GetLogical().CreateFence(fence_ci);
     VkResult bind_result = VK_ERROR_UNKNOWN;
     {
         std::scoped_lock lock{scheduler.submit_mutex};
         bind_result = device.GetGraphicsQueue().BindSparse(bind_info, *fence);
     }
+    bind_time.Split(Nx2Sampler::g_sparse_call_us);
     if (bind_result != VK_SUCCESS) {
         return SparseBuffer{};
     }
