@@ -3360,6 +3360,7 @@ bool Image::BindZeroBlock() {
             std::scoped_lock lock{scheduler->submit_mutex};
             result = device.GetGraphicsQueue().BindSparse(bind_info, *fence);
         }
+        bind_time.Split(Nx2Sampler::g_sparse_call_us);
         if (result != VK_SUCCESS) {
             LOG_ERROR(Render_Vulkan, "Sparse tiled image {:#x}: binding the zeroed block failed ({})",
                       gpu_addr, static_cast<int>(result));
@@ -3584,6 +3585,7 @@ bool Image::BindTiles(std::span<const VideoCommon::LevelRect> rects) {
         std::scoped_lock lock{scheduler->submit_mutex};
         result = device.GetGraphicsQueue().BindSparse(bind_info, *fence);
     }
+    bind_time.Split(Nx2Sampler::g_sparse_call_us);
     if (result != VK_SUCCESS) {
         LOG_ERROR(Render_Vulkan, "Sparse tiled image {:#x}: binding failed ({})", gpu_addr,
                   static_cast<int>(result));
@@ -3746,6 +3748,7 @@ std::vector<u32> Image::BindLayers(std::span<const u32> layers) {
         std::scoped_lock lock{scheduler->submit_mutex};
         result = device.GetGraphicsQueue().BindSparse(bind_info, *fence);
     }
+    bind_time.Split(Nx2Sampler::g_sparse_call_us);
     if (result != VK_SUCCESS) {
         LOG_ERROR(Render_Vulkan, "Sparse layered image {:#x}: binding failed ({})", gpu_addr,
                   static_cast<int>(result));

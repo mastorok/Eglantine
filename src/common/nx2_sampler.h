@@ -38,6 +38,8 @@ inline std::atomic<std::uint64_t> g_pipeline_build_us{0};
 // and time spent in the texture cache's garbage collector.
 inline std::atomic<std::uint64_t> g_sparse_binds{0};
 inline std::atomic<std::uint64_t> g_sparse_bind_us{0};
+// Part of g_sparse_bind_us up to the end of vkQueueBindSparse (the rest is the wait for its fence).
+inline std::atomic<std::uint64_t> g_sparse_call_us{0};
 inline std::atomic<std::uint64_t> g_images_created{0};
 inline std::atomic<std::uint64_t> g_images_deleted{0};
 inline std::atomic<std::uint64_t> g_gc_us{0};
@@ -57,6 +59,14 @@ public:
         if (count != nullptr) {
             count->fetch_add(1, std::memory_order_relaxed);
         }
+    }
+
+    /// Adds the time since construction to `into` now (a part of the total).
+    void Split(std::atomic<std::uint64_t>& into) const {
+        into.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                      std::chrono::steady_clock::now() - begin)
+                                                      .count()),
+                       std::memory_order_relaxed);
     }
 
     ScopedMicros(const ScopedMicros&) = delete;
