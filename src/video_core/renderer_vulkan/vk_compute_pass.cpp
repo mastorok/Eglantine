@@ -14,6 +14,7 @@
 
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 
+#include "common/nx2_sampler.h"
 #include "common/assert.h"
 #include "common/common_types.h"
 #include "common/logging.h"
@@ -822,6 +823,7 @@ void ASTCDecoderPass::AssembleInto(const VideoCommon::ImageInfo& info, u32 skip,
     static std::chrono::nanoseconds waited{};
     static auto window_start = end;
     ++decodes;
+    Nx2Sampler::g_astc_decodes.fetch_add(1, std::memory_order_relaxed);
     waited += end - start;
     if (end - window_start >= std::chrono::seconds{5}) {
         LOG_INFO(Render_Vulkan, "ASTC GPU decodes: {} in {} ms, {} ms waiting ({})", decodes,

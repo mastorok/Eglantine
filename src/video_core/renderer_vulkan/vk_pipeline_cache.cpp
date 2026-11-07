@@ -15,6 +15,7 @@
 #include <vector>
 #include <bit>
 #include <numeric>
+#include "common/nx2_sampler.h"
 #include "common/cityhash.h"
 #include "common/scope_exit.h"
 #include "common/fs/fs.h"
@@ -1456,6 +1457,10 @@ void ReportRuntimePipeline(const char* kind, std::chrono::steady_clock::time_poi
     const auto elapsed = now - begin;
     total += elapsed;
     ++count;
+    Nx2Sampler::g_pipelines_built.fetch_add(1, std::memory_order_relaxed);
+    Nx2Sampler::g_pipeline_build_us.fetch_add(
+        static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count()),
+        std::memory_order_relaxed);
     const auto ms = [](auto d) { return std::chrono::duration<double, std::milli>(d).count(); };
     if (elapsed > std::chrono::milliseconds{2} && logged < 400) {
         ++logged;

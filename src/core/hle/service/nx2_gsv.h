@@ -29,6 +29,7 @@
 #include "common/alignment.h"
 #include "common/div_ceil.h"
 #include "common/game_presets.h"
+#include "common/nx2_sampler.h"
 #include "common/settings.h"
 #include "common/thread.h"
 #include "core/core.h"
@@ -1800,13 +1801,17 @@ private:
                 !system.Host1x().GetSyncpointManager().IsReadyGuest(fence_id, w[24])) {
                 ++m_stats.ran_ahead;
             }
+            long long since_last_present = 0;
             if (m_stats.last_present != std::chrono::steady_clock::time_point{}) {
                 const long long frame = to_us(entered - m_stats.last_present);
+                since_last_present = frame;
                 m_stats.frame_us += frame;
                 m_stats.max_frame_us = (std::max)(m_stats.max_frame_us, frame);
                 m_stats.hitches += frame > 100'000 ? 1 : 0;
             }
             m_stats.last_present = entered;
+            Nx2Sampler::NotePresent(since_last_present, to_us(waited - entered),
+                                    to_us(composited - waited), to_us(paced - composited));
             if (++m_stats.presents == 600) {
                 LOG_INFO(Service,
                          "nx2:vi2 last 600 presents: frame {} us (max {}, {} over 100 ms), "

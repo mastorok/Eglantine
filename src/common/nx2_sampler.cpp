@@ -14,7 +14,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <map>
+#include <mutex>
 #include <set>
 #include <string>
 #include <thread>
@@ -23,7 +25,9 @@
 
 #include <fmt/format.h>
 
+#include "common/fs/path_util.h"
 #include "common/logging.h"
+#include "common/thread.h"
 
 #include <windows.h>
 // windows.h first: the other two use its types.
@@ -247,10 +251,18 @@ unsigned Walk(CONTEXT context, std::array<DWORD64, MaxDepth>& frames) {
     return depth;
 }
 
+// dbghelp is initialised once per process: the profiler's report and the stall watchdog share
+// this one, and hold `mutex` while they look names up.
 struct Symbolizer {
     using SymInitializeFn = BOOL(WINAPI*)(HANDLE, PCSTR, BOOL);
     using SymSetOptionsFn = DWORD(WINAPI*)(DWORD);
     using SymFromAddrFn = BOOL(WINAPI*)(HANDLE, DWORD64, PDWORD64, PSYMBOL_INFO);
+    using SymGetLineFn = BOOL(WINAPI*)(HANDLE, DWORD64, PDWORD, PIMAGEHLP_LINE64);
+
+    static Symbolizer& Shared() {
+        static Symbolizer instance;
+        return instance;
+    }
 
     Symbolizer() {
         const HMODULE dbghelp = LoadLibraryA("dbghelp.dll");
@@ -262,14 +274,33 @@ struct Symbolizer {
         const auto initialize =
             reinterpret_cast<SymInitializeFn>(GetProcAddress(dbghelp, "SymInitialize"));
         from_address = reinterpret_cast<SymFromAddrFn>(GetProcAddress(dbghelp, "SymFromAddr"));
+        from_line = reinterpret_cast<SymGetLineFn>(GetProcAddress(dbghelp, "SymGetLineFromAddr64"));
         if (set_options == nullptr || initialize == nullptr || from_address == nullptr) {
             from_address = nullptr;
+            from_line = nullptr;
             return;
         }
-        set_options(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+        set_options(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES);
         if (!initialize(GetCurrentProcess(), nullptr, TRUE)) {
             from_address = nullptr;
+            from_line = nullptr;
         }
+    }
+
+    /// "file.cpp:123" of an address, or nothing without line information.
+    std::string Line(DWORD64 address) {
+        if (from_line == nullptr) {
+            return {};
+        }
+        IMAGEHLP_LINE64 line{};
+        line.SizeOfStruct = sizeof(line);
+        DWORD displacement{};
+        if (!from_line(GetCurrentProcess(), address, &displacement, &line) ||
+            line.FileName == nullptr) {
+            return {};
+        }
+        const char* base = std::strrchr(line.FileName, '\\');
+        return fmt::format("{}:{}", base != nullptr ? base + 1 : line.FileName, line.LineNumber);
     }
 
     const std::string& Name(DWORD64 address) {
@@ -302,13 +333,16 @@ struct Symbolizer {
         return it->second;
     }
 
+    std::mutex mutex;
     SymFromAddrFn from_address{};
+    SymGetLineFn from_line{};
     std::unordered_map<DWORD64, std::string> cache;
 };
 
 std::string Report(const std::vector<Target>& targets, const std::vector<Sample>& samples,
                    const char* path) {
-    Symbolizer symbolizer;
+    Symbolizer& symbolizer = Symbolizer::Shared();
+    const std::scoped_lock symbol_lock{symbolizer.mutex};
     std::string text;
     for (unsigned thread = 0; thread < targets.size(); ++thread) {
         std::map<std::string, unsigned> self;
@@ -407,6 +441,278 @@ std::string Report(const std::vector<Target>& targets, const std::vector<Sample>
     return text;
 }
 
+// ---- Stall watchdog (EDEN_NX2_STALL_MS) and frame log (EDEN_NX2_FRAME_LOG) ----------------------
+
+const auto g_process_start = std::chrono::steady_clock::now();
+std::atomic<long long> g_last_present_ns{0};
+
+constexpr std::array<const char*, 6> StallGroups{"GPU",     "GPUBack", "VulkanWorker",
+                                                 "CPUCores", "Workers", "Service"};
+
+struct StallTarget {
+    HANDLE handle;
+    int group;
+};
+
+struct StallCounters {
+    std::uint64_t astc;
+    std::uint64_t pipelines;
+    std::uint64_t pipeline_us;
+};
+
+StallCounters ReadCounters() {
+    return {g_astc_decodes.load(std::memory_order_relaxed),
+            g_pipelines_built.load(std::memory_order_relaxed),
+            g_pipeline_build_us.load(std::memory_order_relaxed)};
+}
+
+int StallGroupOf(const std::string& name) {
+    if (name == "GPU") {
+        return 0;
+    }
+    if (name == "GPUBack") {
+        return 1;
+    }
+    if (name == "VulkanWorker") {
+        return 2;
+    }
+    if (name.starts_with("CPUCore_")) {
+        return 3;
+    }
+    if (name.starts_with("VkPipelineBuilder") || name.starts_with("TextureDecoder") ||
+        name.starts_with("nx2")) {
+        return 4;
+    }
+    if (name.starts_with("Service") || name.starts_with("HLE") || name.starts_with("Hle")) {
+        return 5;
+    }
+    return -1;
+}
+
+void CloseStallTargets(std::vector<StallTarget>& targets) {
+    for (const StallTarget& target : targets) {
+        CloseHandle(target.handle);
+    }
+    targets.clear();
+}
+
+// Opens the threads of the groups above (by their names) and returns every name it saw.
+std::string CollectStallTargets(std::vector<StallTarget>& targets) {
+    CloseStallTargets(targets);
+    using GetThreadDescriptionFn = HRESULT(WINAPI*)(HANDLE, PWSTR*);
+    const auto get_description = reinterpret_cast<GetThreadDescriptionFn>(
+        GetProcAddress(GetModuleHandleA("KernelBase.dll"), "GetThreadDescription"));
+    if (get_description == nullptr) {
+        return "GetThreadDescription is not available";
+    }
+    std::string seen;
+    const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        return seen;
+    }
+    THREADENTRY32 entry{};
+    entry.dwSize = sizeof(entry);
+    const DWORD self = GetCurrentThreadId();
+    for (BOOL ok = Thread32First(snapshot, &entry); ok; ok = Thread32Next(snapshot, &entry)) {
+        if (entry.th32OwnerProcessID != GetCurrentProcessId() || entry.th32ThreadID == self) {
+            continue;
+        }
+        const HANDLE handle = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
+                                             THREAD_QUERY_LIMITED_INFORMATION,
+                                         FALSE, entry.th32ThreadID);
+        if (handle == nullptr) {
+            continue;
+        }
+        PWSTR wide{};
+        std::string name;
+        if (SUCCEEDED(get_description(handle, &wide)) && wide != nullptr) {
+            char buffer[256]{};
+            WideCharToMultiByte(CP_UTF8, 0, wide, -1, buffer, sizeof(buffer) - 1, nullptr, nullptr);
+            name = buffer;
+            LocalFree(wide);
+        }
+        const int group = StallGroupOf(name);
+        if (!name.empty()) {
+            seen += name + " ";
+        }
+        if (group < 0) {
+            CloseHandle(handle);
+        } else {
+            targets.push_back({handle, group});
+        }
+    }
+    CloseHandle(snapshot);
+    return seen;
+}
+
+// One pass over the targets. Nothing may allocate while a thread is paused (it could hold the
+// heap lock): the sample vector is reserved by the caller and never grows here.
+void SampleStallRound(const std::vector<StallTarget>& targets, std::vector<Sample>& samples) {
+    for (unsigned i = 0; i < targets.size(); ++i) {
+        if (samples.size() == samples.capacity()) {
+            return;
+        }
+        const HANDLE handle = targets[i].handle;
+        if (SuspendThread(handle) == static_cast<DWORD>(-1)) {
+            continue;
+        }
+        CONTEXT context{};
+        context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+        if (GetThreadContext(handle, &context)) {
+            Sample& sample = samples.emplace_back();
+            sample.thread = i;
+            sample.depth = Walk(context, sample.frames);
+        }
+        ResumeThread(handle);
+    }
+}
+
+void ReportStall(unsigned index, double at_seconds, long long gap_ms, unsigned rounds,
+                 const std::vector<StallTarget>& targets, const std::vector<Sample>& samples,
+                 const StallCounters& before, const std::string& threads) {
+    const StallCounters after = ReadCounters();
+    LOG_INFO(Common,
+             "nx2 stall #{} at {:.1f} s: {} ms between presents, {} sampling rounds; ASTC decodes "
+             "+{}, pipelines built +{} ({:.1f} ms)",
+             index, at_seconds, gap_ms, rounds, after.astc - before.astc,
+             after.pipelines - before.pipelines, (after.pipeline_us - before.pipeline_us) / 1000.0);
+    if (!threads.empty()) {
+        LOG_INFO(Common, "nx2 stall: threads seen: {}", threads);
+    }
+    Symbolizer& symbolizer = Symbolizer::Shared();
+    const std::scoped_lock symbol_lock{symbolizer.mutex};
+    for (size_t group = 0; group < StallGroups.size(); ++group) {
+        struct Entry {
+            unsigned count{};
+            DWORD64 address{};
+        };
+        std::map<std::string, Entry> signatures;
+        unsigned total = 0;
+        for (const Sample& sample : samples) {
+            if (sample.depth == 0 || targets[sample.thread].group != static_cast<int>(group)) {
+                continue;
+            }
+            ++total;
+            std::string signature;
+            const std::string* previous = nullptr;
+            for (unsigned i = 0; i < (std::min)(sample.depth, 6U); ++i) {
+                const std::string& name = symbolizer.Name(sample.frames[i]);
+                if (previous != nullptr && *previous == name) {
+                    continue;
+                }
+                previous = &name;
+                if (!signature.empty()) {
+                    signature += " <- ";
+                }
+                signature += name.substr(0, 90);
+            }
+            Entry& entry = signatures[signature];
+            ++entry.count;
+            entry.address = sample.frames[0];
+        }
+        if (total == 0) {
+            continue;
+        }
+        std::vector<std::pair<unsigned, std::string>> ranked;
+        std::map<std::string, DWORD64> addresses;
+        for (const auto& [signature, entry] : signatures) {
+            ranked.emplace_back(entry.count, signature);
+            addresses[signature] = entry.address;
+        }
+        std::sort(ranked.rbegin(), ranked.rend());
+        const size_t shown = group <= 2 ? 3 : 2;
+        for (size_t i = 0; i < (std::min)(shown, ranked.size()); ++i) {
+            LOG_INFO(Common, "  {} {:.0f}% of {}: {}  [{}]", StallGroups[group],
+                     100.0 * ranked[i].first / total, total, ranked[i].second,
+                     symbolizer.Line(addresses[ranked[i].second]));
+        }
+    }
+}
+
+void StallLoop(unsigned threshold_ms) {
+    Common::SetCurrentThreadName("Nx2Stall");
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    {
+        // The first lookup reads this module's whole PDB: do it now, in the background.
+        Symbolizer& symbolizer = Symbolizer::Shared();
+        const std::scoped_lock symbol_lock{symbolizer.mutex};
+        symbolizer.Name(reinterpret_cast<DWORD64>(&StallLoop));
+    }
+    LOG_INFO(Common, "nx2 stall watchdog: stacks are taken when presents are {} ms or more apart",
+             threshold_ms);
+    constexpr unsigned MaxReports = 300;
+    constexpr unsigned MaxRounds = 600;
+    std::vector<StallTarget> targets;
+    std::vector<Sample> samples;
+    std::string threads;
+    bool listed = false;
+    bool stalling = false;
+    long long stall_from = 0;
+    unsigned rounds = 0;
+    unsigned reports = 0;
+    StallCounters before{};
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{stalling ? 2 : 4});
+        const long long last = g_last_present_ns.load(std::memory_order_relaxed);
+        if (last == 0) {
+            continue;
+        }
+        const long long now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                  std::chrono::steady_clock::now().time_since_epoch())
+                                  .count();
+        if (!stalling) {
+            if (now - last < static_cast<long long>(threshold_ms) * 1'000'000LL ||
+                reports >= MaxReports) {
+                continue;
+            }
+            stalling = true;
+            stall_from = last;
+            rounds = 0;
+            samples.clear();
+            threads = CollectStallTargets(targets);
+            if (listed) {
+                threads.clear();
+            }
+            listed = true;
+            samples.reserve(size_t{MaxRounds} * (targets.size() + 1));
+            before = ReadCounters();
+            continue;
+        }
+        if (last != stall_from) {
+            ++reports;
+            const double at_seconds =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - g_process_start)
+                    .count();
+            ReportStall(reports, at_seconds, (last - stall_from) / 1'000'000, rounds, targets,
+                        samples, before, threads);
+            stalling = false;
+            continue;
+        }
+        if (rounds < MaxRounds) {
+            SampleStallRound(targets, samples);
+            ++rounds;
+        }
+    }
+}
+
+struct FrameLog {
+    ~FrameLog() {
+        Flush();
+    }
+    void Flush() {
+        if (file.is_open() && !pending.empty()) {
+            file << pending;
+            file.flush();
+            pending.clear();
+        }
+    }
+    std::mutex mutex;
+    std::ofstream file;
+    std::string pending;
+    unsigned lines{};
+    bool opened{};
+};
+
 std::string SampleThreads(const std::vector<std::string>& patterns, double seconds,
                           const std::string& out) {
     // EDEN_NX2_SAMPLE_BEEP=0 silences the tones that mark the start (two rising) and the end (one
@@ -480,6 +786,10 @@ std::string Sample(const char* names, double seconds, const std::string& out) {
 }
 
 void StartFromEnvironment() {
+    if (const char* stall = std::getenv("EDEN_NX2_STALL_MS"); stall != nullptr && *stall != '\0') {
+        const auto threshold = static_cast<unsigned>((std::max)(20L, std::strtol(stall, nullptr, 10)));
+        std::thread{[threshold] { StallLoop(threshold); }}.detach();
+    }
     const char* names = std::getenv("EDEN_NX2_SAMPLE");
     if (names == nullptr || *names == '\0') {
         return;
@@ -493,6 +803,37 @@ void StartFromEnvironment() {
     }}.detach();
 }
 
+void NotePresent(long long frame_us, long long fence_us, long long composite_us, long long pace_us) {
+    const auto now = std::chrono::steady_clock::now();
+    g_last_present_ns.store(std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count(),
+                            std::memory_order_relaxed);
+    static const bool log_frames = std::getenv("EDEN_NX2_FRAME_LOG") != nullptr;
+    if (!log_frames) {
+        return;
+    }
+    static FrameLog frames;
+    const std::scoped_lock lock{frames.mutex};
+    if (!frames.opened) {
+        frames.opened = true;
+        const auto path = Common::FS::GetEdenPath(Common::FS::EdenPath::LogDir) / "nx2_frames.csv";
+        frames.file.open(path, std::ios::out | std::ios::trunc);
+        frames.pending =
+            "t_s,frame_ms,fence_ms,composite_ms,pace_ms,astc_decodes,pipelines_built,pipeline_ms\n";
+    }
+    if (!frames.file.is_open()) {
+        return;
+    }
+    const StallCounters counters = ReadCounters();
+    frames.pending += fmt::format("{:.3f},{:.2f},{:.2f},{:.2f},{:.2f},{},{},{:.1f}\n",
+                                  std::chrono::duration<double>(now - g_process_start).count(),
+                                  frame_us / 1000.0, fence_us / 1000.0, composite_us / 1000.0,
+                                  pace_us / 1000.0, counters.astc, counters.pipelines,
+                                  counters.pipeline_us / 1000.0);
+    if (++frames.lines % 150 == 0) {
+        frames.Flush();
+    }
+}
+
 } // namespace Nx2Sampler
 
 #else
@@ -502,6 +843,7 @@ void StartFromEnvironment() {}
 std::string Sample(const char*, double, const std::string&) {
     return "the sampler is Windows only";
 }
+void NotePresent(long long, long long, long long, long long) {}
 } // namespace Nx2Sampler
 
 #endif

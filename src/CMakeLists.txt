@@ -145,7 +145,7 @@ if(MSVC AND NOT CXX_CLANG)
     endif()
 
     set(CMAKE_EXE_LINKER_FLAGS_DEBUG "/DEBUG /MANIFEST:NO" CACHE STRING "" FORCE)
-    set(CMAKE_EXE_LINKER_FLAGS_RELEASE "/DEBUG /MANIFEST:NO /INCREMENTAL:NO /OPT:REF,ICF" CACHE STRING "" FORCE)
+    set(CMAKE_EXE_LINKER_FLAGS_RELEASE "/DEBUG /MANIFEST:NO /INCREMENTAL:NO /OPT:REF,NOICF" CACHE STRING "" FORCE)
 else()
     if(NOT MSVC)
         add_compile_options(
@@ -278,6 +278,15 @@ add_subdirectory(hid_core)
 add_subdirectory(input_common)
 add_subdirectory(frontend_common)
 add_subdirectory(shader_recompiler)
+
+# Full debug info for the code the GPU and the present path run, and no identical-function
+# folding: the stall watchdog and the sampler (common/nx2_sampler.cpp) read function names and
+# source lines through dbghelp from eglantine.pdb.
+if(MSVC AND NOT CXX_CLANG)
+    foreach(nx2_symbols_target common core video_core)
+        target_compile_options(${nx2_symbols_target} PRIVATE $<$<CONFIG:Release>:/Z7>)
+    endforeach()
+endif()
 
 if(YUZU_TESTS)
     add_subdirectory(tests)
