@@ -1855,10 +1855,21 @@ private:
             const char* value = std::getenv("EDEN_NX2_SWAP_INTERVAL");
             return value ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 0U;
         }();
-        const auto& process = Kernel::GetCurrentProcess(kernel);
+        // This runs on a service thread, whose owner process is a host-core process and not the
+        // game: GetCurrentProcess() never matched Mario Kart World here, so the dynamic FPS
+        // pacing below was dead and presents stayed held to the 30 FPS word (swap interval 2).
+        // Look the game up through the system, as PresentClientBuffer does.
+        // EDEN_NX2_MKW_DYNAMIC_PACING=0 restores the old behaviour for A/B measurements.
+        static const bool mkw_dynamic_pacing_enabled = [] {
+            const char* value = std::getenv("EDEN_NX2_MKW_DYNAMIC_PACING");
+            return value == nullptr || value[0] != '0';
+        }();
+        const Kernel::KProcess* const app_process = system.ApplicationProcess();
         const bool mkw_dynamic =
-            process.GetProgramId() == Settings::MarioKartWorldProgramId &&
-            process.IsMkwDynamicFpsPatchApplied() && Settings::values.mkw_dynamic_fps.GetValue();
+            mkw_dynamic_pacing_enabled && app_process != nullptr &&
+            app_process->GetProgramId() == Settings::MarioKartWorldProgramId &&
+            app_process->IsMkwDynamicFpsPatchApplied() &&
+            Settings::values.mkw_dynamic_fps.GetValue();
         u32 swap_interval = std::clamp<u32>(timing >> 16, 1, 4);
         if (mkw_dynamic) {
             swap_interval = 1;
