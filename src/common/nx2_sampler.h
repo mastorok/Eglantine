@@ -74,6 +74,21 @@ inline std::atomic<std::uint64_t> g_dma_drain_us{0};
 // untouched by the GPU before (EDEN_NX2_TRUST_CLEAN), and pages that were written after that.
 inline std::atomic<std::uint64_t> g_trust_skips{0};
 inline std::atomic<std::uint64_t> g_clean_violations{0};
+// Semaphore acquires of the puller: evaluated; met by a look at the memory before the back was
+// drained, so the drain was skipped (EDEN_NX2_ACQ_SKIP); and, of those read both before and after
+// a drain, how the two compare: met both times, met only after (the drain was needed), met
+// neither time (a real wait), met only before (a skip would have gone wrong). Pages the GPU wrote
+// are not looked at before. Acquires from SEM_EXECUTE, and polls of suspended channels.
+inline std::atomic<std::uint64_t> g_acq_checks{0};
+inline std::atomic<std::uint64_t> g_acq_skips{0};
+inline std::atomic<std::uint64_t> g_acq_same{0};
+inline std::atomic<std::uint64_t> g_acq_needed{0};
+inline std::atomic<std::uint64_t> g_acq_waits{0};
+inline std::atomic<std::uint64_t> g_acq_wrong{0};
+inline std::atomic<std::uint64_t> g_acq_written{0};
+inline std::atomic<std::uint64_t> g_acq_exec{0};
+inline std::atomic<std::uint64_t> g_resume_polls{0};
+inline std::atomic<std::uint64_t> g_resume_skips{0};
 // Draws, indirect draws and compute dispatches the rasterizer ran (calls, not primitives).
 inline std::atomic<std::uint64_t> g_draws{0};
 inline std::atomic<std::uint64_t> g_indirect_draws{0};

@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: 2022 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
 #include <atomic>
 #include <cstdlib>
 
@@ -63,6 +64,64 @@ void DrainBack() {
     VideoCommon::GpuSplit::Get().Drain();
 }
 
+// EDEN_NX2_ACQ_SKIP (A/B knob): 0 drains the back before reading every acquired semaphore. 1 first
+// looks at the memory, where no GPU-written copy can be in a cache: a value that already meets the
+// acquire needs no drain (a release queued behind it cannot take it back in any program that does
+// not rewind its semaphores), anything else drains and reads again as before. 2 also lets a
+// suspended channel's poll go on without draining. EDEN_NX2_ACQ_VERIFY=<n>: of the skips, every
+// n-th drains and reads anyway, to count a skip that went wrong (acq_wrong). EDEN_NX2_ACQ_STATS=0
+// stops the look before the drain when nothing is skipped (it only classifies the acquires).
+long long AcquireSkipLevel() {
+    static const Nx2Sampler::Knob knob = Nx2Sampler::MakeKnob("ACQ_SKIP", 0);
+    return VideoCommon::GpuSplit::Get().Active() ? knob.Get() : 0;
+}
+
+// Whether the memory of a semaphore may be read as it is, without the back's queued work: the
+// page holds no copy the GPU wrote (those wait in the buffer cache until flushed).
+bool CanLookAtSemaphore(DmaPusher& dma_pusher, GPUVAddr address) {
+    const auto device = dma_pusher.memory_manager.GpuToCpuAddress(address);
+    return device && !Nx2IsGpuWritten(*device);
+}
+
+// Whether the semaphore at `address` meets an acquire (`matches`), as the acquire needs it: with
+// the back drained and the caches flushed, unless a look at the memory already shows the value
+// (EDEN_NX2_ACQ_SKIP).
+template <typename Matches>
+bool AcquireMet(DmaPusher& dma_pusher, GPUVAddr address, const Matches& matches) {
+    static const Nx2Sampler::Knob stats_knob = Nx2Sampler::MakeKnob("ACQ_STATS", 1);
+    static const Nx2Sampler::Knob verify_knob = Nx2Sampler::MakeKnob("ACQ_VERIFY", 16);
+    static u32 skipped{}; // The puller runs on the one GPU thread.
+    Nx2Sampler::g_acq_checks.fetch_add(1, std::memory_order_relaxed);
+    const long long level = AcquireSkipLevel();
+    bool looked = false;
+    bool met_before = false;
+    if (VideoCommon::GpuSplit::Get().Active() && (level >= 1 || stats_knob.Get() != 0)) {
+        if (CanLookAtSemaphore(dma_pusher, address)) {
+            met_before = matches(dma_pusher.memory_manager.Read<u32>(address));
+            looked = true;
+        } else {
+            Nx2Sampler::g_acq_written.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    if (looked && met_before && level >= 1) {
+        const auto every = static_cast<u32>(std::max<long long>(verify_knob.Get(), 0));
+        if (every == 0 || ++skipped % every != 0) {
+            Nx2Sampler::g_acq_skips.fetch_add(1, std::memory_order_relaxed);
+            // What was sent since the last publish would wait for the next batch otherwise.
+            VideoCommon::GpuSplit::Get().PublishIfBackIdle();
+            return true;
+        }
+    }
+    DrainBack();
+    const bool met = matches(ReadSemaphoreWord(dma_pusher, address));
+    if (looked) {
+        auto& counter = met_before ? (met ? Nx2Sampler::g_acq_same : Nx2Sampler::g_acq_wrong)
+                                   : (met ? Nx2Sampler::g_acq_needed : Nx2Sampler::g_acq_waits);
+        counter.fetch_add(1, std::memory_order_relaxed);
+    }
+    return met;
+}
+
 // The fence manager records into the scheduler and downloads the CPU's writes over GPU data:
 // the back's state, which a drained back still uses from its idle hook (it submits).
 void ReleaseFences(DmaPusher& dma_pusher) {
@@ -89,10 +148,28 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
     if (!pending_acquire) {
         return true;
     }
-    // The release may still be queued for the split GPU thread's back half (and the caches
-    // ReadSemaphoreWord asks are its state).
-    DrainBack();
-    const u32 current = ReadSemaphoreWord(dma_pusher, pending_acquire->address);
+    Nx2Sampler::g_resume_polls.fetch_add(1, std::memory_order_relaxed);
+    u32 current{};
+    bool looked = false;
+    if (const long long level = AcquireSkipLevel();
+        level >= 1 && CanLookAtSemaphore(dma_pusher, pending_acquire->address)) {
+        current = dma_pusher.memory_manager.Read<u32>(pending_acquire->address);
+        if (pending_acquire->Matches(current)) {
+            Nx2Sampler::g_resume_skips.fetch_add(1, std::memory_order_relaxed);
+            looked = true;
+        } else if (level >= 2) {
+            // Not there yet: what the back still has queued reaches memory without the front
+            // waiting for it (the next poll sees it); it only has to be told about the work.
+            VideoCommon::GpuSplit::Get().PublishIfBackIdle();
+            looked = true;
+        }
+    }
+    if (!looked) {
+        // The release may still be queued for the split GPU thread's back half (and the caches
+        // ReadSemaphoreWord asks are its state).
+        DrainBack();
+        current = ReadSemaphoreWord(dma_pusher, pending_acquire->address);
+    }
     if (Nx2SemaphoreWaiters::Get().Latched(this)) {
         if (static std::atomic<u32> rescued{};
             !pending_acquire->Matches(current) && rescued.fetch_add(1) < 64) {
@@ -278,8 +355,8 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             return;
         }
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireChecks, 1);
-        DrainBack();
-        if (acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address))) {
+        if (AcquireMet(dma_pusher, acquire.address,
+                       [&acquire](u32 word) { return acquire.Matches(word); })) {
             return;
         }
         // Registered before the fences run, so a release among them that meets the value counts
@@ -367,6 +444,7 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
         return;
     }
     // Acquires: check once after flushing pending fences; never block the GPU thread on them.
+    Nx2Sampler::g_acq_exec.fetch_add(1, std::memory_order_relaxed);
     DrainBack();
     ReleaseFences(dma_pusher);
     const u32 word = dma_pusher.memory_manager.Read<u32>(address);
