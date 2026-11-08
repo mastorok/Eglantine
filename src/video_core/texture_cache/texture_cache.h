@@ -49,6 +49,19 @@ using VideoCore::Surface::PixelFormat;
 using VideoCore::Surface::SurfaceType;
 using namespace Common::Literals;
 
+/// Identifies an image by address and shape, to tell when one is created again after a deletion.
+inline u64 Nx2ImageKey(GPUVAddr gpu_addr, const ImageInfo& info) {
+    u64 hash = 0xCBF29CE484222325ULL;
+    const auto mix = [&hash](u64 value) { hash = (hash ^ value) * 0x100000001B3ULL; };
+    mix(gpu_addr);
+    mix(static_cast<u64>(info.format));
+    mix(static_cast<u64>(info.type));
+    mix((u64{info.size.width} << 32) | info.size.height);
+    mix((u64{info.size.depth} << 32) | (u64{static_cast<u32>(info.resources.levels)} << 16) |
+        static_cast<u32>(info.resources.layers));
+    return hash;
+}
+
 template <class P>
 TextureCache<P>::TextureCache(Runtime& runtime_, Tegra::MaxwellDeviceMemoryManager& device_memory_)
     : runtime{runtime_}, device_memory{device_memory_} {
@@ -2635,6 +2648,15 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         }
         ++images_created;
         Nx2Sampler::g_images_created.fetch_add(1, std::memory_order_relaxed);
+        if (const auto deleted = nx2_deleted_at.find(Nx2ImageKey(gpu_addr, new_info));
+            deleted != nx2_deleted_at.end()) {
+            const u64 age = frame_tick - deleted->second;
+            auto& counter = age < 30    ? Nx2Sampler::g_recreated_30
+                            : age < 150 ? Nx2Sampler::g_recreated_150
+                            : age < 600 ? Nx2Sampler::g_recreated_600
+                                        : Nx2Sampler::g_recreated_old;
+            counter.fetch_add(1, std::memory_order_relaxed);
+        }
         if (!join_copies_to_do.empty() || !join_ignore_textures.empty()) {
             Nx2Sampler::g_created_replace.fetch_add(1, std::memory_order_relaxed);
         }
@@ -3396,6 +3418,10 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
     ImageBase& image = slot_images[image_id];
     ++images_deleted;
     Nx2Sampler::g_images_deleted.fetch_add(1, std::memory_order_relaxed);
+    if (nx2_deleted_at.size() >= (size_t{1} << 18)) {
+        nx2_deleted_at.clear();
+    }
+    nx2_deleted_at[Nx2ImageKey(image.gpu_addr, image.info)] = frame_tick;
     // Drop every decode still queued for it, whatever IsDecoding says: an image re-decoded while
     // a decode was in flight has two, and the first to finish clears the flag. A decode left
     // behind was uploaded into the next image to take this slot (another texture's data: garbage

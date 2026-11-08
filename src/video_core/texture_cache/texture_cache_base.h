@@ -148,6 +148,9 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     std::vector<u8> astc_scan_buffer;
     u64 images_deleted{};
     std::map<u64, std::pair<u32, GPUVAddr>> created_shapes;
+    // When an image of this address and shape was last deleted (frame tick), for the "created
+    // again" counters of Nx2Sampler. Emptied when it grows large.
+    std::unordered_map<u64, u64> nx2_deleted_at;
     bool debug_stats{true}; ///< Collect what only the debug statistics lines use
 
     static constexpr s64 DEFAULT_EXPECTED_MEMORY = 1_GiB + 125_MiB;

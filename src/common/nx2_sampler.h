@@ -50,6 +50,12 @@ inline std::atomic<std::uint64_t> g_del_unmap{0};       // guest memory unmapped
 inline std::atomic<std::uint64_t> g_del_join{0};        // replaced by an overlapping new image
 inline std::atomic<std::uint64_t> g_created_replace{0}; // new images that replaced overlaps
 inline std::atomic<std::uint64_t> g_gc_finish_us{0};    // GPU waits inside the collector
+// Images created again at the same address and shape as one deleted earlier, by the time since
+// that deletion in frames: thrash (soon again) against streaming (never seen before, or long ago).
+inline std::atomic<std::uint64_t> g_recreated_30{0};    // under 30 frames
+inline std::atomic<std::uint64_t> g_recreated_150{0};   // 30 to 149 frames
+inline std::atomic<std::uint64_t> g_recreated_600{0};   // 150 to 599 frames
+inline std::atomic<std::uint64_t> g_recreated_old{0};   // 600 frames or more
 inline std::atomic<std::uint64_t> g_list_waits{0};      // GPU-written command list reads that waited
 inline std::atomic<std::uint64_t> g_list_wait_us{0};
 inline std::atomic<std::uint64_t> g_tc_used_mib{0};

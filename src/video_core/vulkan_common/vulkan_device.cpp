@@ -44,6 +44,19 @@
 namespace Vulkan {
 using namespace Common::Literals;
 namespace {
+
+/// Size of the blocks the memory allocator carves images out of (16 MiB, see the comment where
+/// it is used). EDEN_NX2_VMA_BLOCK_MIB tries another one (4 to 256), for measuring only.
+VkDeviceSize Nx2VmaBlockBytes() {
+    constexpr VkDeviceSize fallback = 16u * 1024u * 1024u;
+    const char* text = std::getenv("EDEN_NX2_VMA_BLOCK_MIB");
+    if (text == nullptr || *text == '\0') {
+        return fallback;
+    }
+    const unsigned long mib = std::strtoul(text, nullptr, 10);
+    return mib >= 4 && mib <= 256 ? static_cast<VkDeviceSize>(mib) * 1024u * 1024u : fallback;
+}
+
 namespace Alternatives {
 constexpr std::array STENCIL8_UINT{
     VK_FORMAT_D16_UNORM_S8_UINT,
@@ -806,7 +819,7 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
             // after ten minutes, with 32 MiB ones ~0.5 GB: a block drains only once all of its
             // images are gone, and fewer per block drain sooner. VMA gives allocations over half a
             // block (8 MiB) their own memory, which goes back to the driver when they are freed.
-            .preferredLargeHeapBlockSize = 16u * 1024u * 1024u,
+            .preferredLargeHeapBlockSize = Nx2VmaBlockBytes(),
             .pAllocationCallbacks = nullptr,
             .pDeviceMemoryCallbacks = nullptr,
             .pHeapSizeLimit = heap_size_limit != 0 ? heap_size_limits.data() : nullptr,

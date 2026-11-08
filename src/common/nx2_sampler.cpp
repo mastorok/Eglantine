@@ -227,9 +227,9 @@ std::vector<Target> FindThreads(const std::vector<std::string>& patterns, std::s
 }
 
 // Walks a suspended thread's stack from its context. Nothing here may allocate: the thread
-// could be paused holding the heap lock.
-unsigned Walk(CONTEXT context, std::array<DWORD64, MaxDepth>& frames) {
-    unsigned depth = 0;
+// could be paused holding the heap lock. `depth` is updated as frames are found, so that what was
+// read before a fault is kept.
+void WalkFrames(CONTEXT context, std::array<DWORD64, MaxDepth>& frames, unsigned& depth) {
     while (depth < MaxDepth && context.Rip != 0) {
         frames[depth++] = context.Rip;
         DWORD64 image_base{};
@@ -250,6 +250,22 @@ unsigned Walk(CONTEXT context, std::array<DWORD64, MaxDepth>& frames) {
         RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, context.Rip, function, &context,
                          &handler_data, &establisher_frame, nullptr);
     }
+}
+
+// The unwind data of a paused thread can be half-written (JIT code, a driver, a module being
+// unloaded): RtlVirtualUnwind then faults inside ntdll. That took the whole process down when the
+// window lost focus and presents stopped for seconds (build 6, alt-tab). A fault ends the walk
+// here and the thread is resumed as usual.
+unsigned Walk(CONTEXT context, std::array<DWORD64, MaxDepth>& frames) {
+    unsigned depth = 0;
+#if defined(_MSC_VER) || defined(__clang__)
+    __try {
+        WalkFrames(context, frames, depth);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+#else
+    WalkFrames(context, frames, depth);
+#endif
     return depth;
 }
 
@@ -939,14 +955,14 @@ void NotePresent(long long frame_us, long long fence_us, long long composite_us,
             "t_s,frame_ms,fence_ms,composite_ms,pace_ms,astc_decodes,pipelines_built,pipeline_ms,"
             "sparse_binds,sparse_ms,sparse_call_ms,images_created,images_deleted,gc_ms,"
             "tc_used_mib,tc_expected_mib,tc_critical_mib,gc_mode,del_gc,del_gc_download,del_unmap,"
-            "del_join,created_replace,gc_finish_ms,list_waits,list_wait_ms\n";
+            "del_join,created_replace,gc_finish_ms,list_waits,list_wait_ms,recr_30,recr_150,recr_600,recr_old\n";
     }
     if (!frames.file.is_open()) {
         return;
     }
     const StallCounters counters = ReadCounters();
     frames.pending += fmt::format("{:.3f},{:.2f},{:.2f},{:.2f},{:.2f},{},{},{:.1f},{},{:.1f},{:.1f},{},{},{:.1f},"
-                                  "{},{},{},{},{},{},{},{},{},{:.1f},{},{:.1f}\n",
+                                  "{},{},{},{},{},{},{},{},{},{:.1f},{},{:.1f},{},{},{},{}\n",
                                   std::chrono::duration<double>(now - g_process_start).count(),
                                   frame_us / 1000.0, fence_us / 1000.0, composite_us / 1000.0,
                                   pace_us / 1000.0, counters.astc, counters.pipelines,
@@ -959,7 +975,11 @@ void NotePresent(long long frame_us, long long fence_us, long long composite_us,
                                   g_tc_mode.load(std::memory_order_relaxed), counters.del_gc,
                                   counters.del_gc_download, counters.del_unmap, counters.del_join,
                                   counters.created_replace, counters.gc_finish_us / 1000.0,
-                                  counters.list_waits, counters.list_wait_us / 1000.0);
+                                  counters.list_waits, counters.list_wait_us / 1000.0,
+                                  g_recreated_30.load(std::memory_order_relaxed),
+                                  g_recreated_150.load(std::memory_order_relaxed),
+                                  g_recreated_600.load(std::memory_order_relaxed),
+                                  g_recreated_old.load(std::memory_order_relaxed));
     if (++frames.lines % 150 == 0) {
         frames.Flush();
     }
