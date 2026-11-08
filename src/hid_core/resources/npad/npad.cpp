@@ -150,6 +150,11 @@ void NPad::ControllerUpdate(Kernel::KernelCore& kernel, Core::HID::ControllerTri
         return;
     }
 
+    // A controller callback (SDL motion at startup) can arrive before the applet resource exists.
+    if (applet_resource_holder.applet_resource == nullptr) {
+        return;
+    }
+
     for (std::size_t aruid_index = 0; aruid_index < AruidIndexMax; aruid_index++) {
         if (controller_idx >= controller_data[aruid_index].size()) {
             return;

@@ -60,6 +60,9 @@ enum class ImageFlagBits : u32 {
     /// device memory when the guest memory under it can hold data (Image::BindTiles), and only
     /// the parts written are uploaded.
     SparseTiles = 1 << 23,
+    /// Created again soon after the collector deleted an image of the same address and shape: part
+    /// of a working set that cycles, deleted last when the collector can choose.
+    Nx2Hot = 1 << 24,
 };
 DECLARE_ENUM_FLAG_OPERATORS(ImageFlagBits)
 

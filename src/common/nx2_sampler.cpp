@@ -955,14 +955,14 @@ void NotePresent(long long frame_us, long long fence_us, long long composite_us,
             "t_s,frame_ms,fence_ms,composite_ms,pace_ms,astc_decodes,pipelines_built,pipeline_ms,"
             "sparse_binds,sparse_ms,sparse_call_ms,images_created,images_deleted,gc_ms,"
             "tc_used_mib,tc_expected_mib,tc_critical_mib,gc_mode,del_gc,del_gc_download,del_unmap,"
-            "del_join,created_replace,gc_finish_ms,list_waits,list_wait_ms,recr_30,recr_150,recr_600,recr_old\n";
+            "del_join,created_replace,gc_finish_ms,list_waits,list_wait_ms,recr_30,recr_150,recr_600,recr_old,ab,draws,indirect,dispatches\n";
     }
     if (!frames.file.is_open()) {
         return;
     }
     const StallCounters counters = ReadCounters();
     frames.pending += fmt::format("{:.3f},{:.2f},{:.2f},{:.2f},{:.2f},{},{},{:.1f},{},{:.1f},{:.1f},{},{},{:.1f},"
-                                  "{},{},{},{},{},{},{},{},{},{:.1f},{},{:.1f},{},{},{},{}\n",
+                                  "{},{},{},{},{},{},{},{},{},{:.1f},{},{:.1f},{},{},{},{},{},{},{},{}\n",
                                   std::chrono::duration<double>(now - g_process_start).count(),
                                   frame_us / 1000.0, fence_us / 1000.0, composite_us / 1000.0,
                                   pace_us / 1000.0, counters.astc, counters.pipelines,
@@ -979,7 +979,10 @@ void NotePresent(long long frame_us, long long fence_us, long long composite_us,
                                   g_recreated_30.load(std::memory_order_relaxed),
                                   g_recreated_150.load(std::memory_order_relaxed),
                                   g_recreated_600.load(std::memory_order_relaxed),
-                                  g_recreated_old.load(std::memory_order_relaxed));
+                                  g_recreated_old.load(std::memory_order_relaxed), AbLabel(),
+                                  g_draws.load(std::memory_order_relaxed),
+                                  g_indirect_draws.load(std::memory_order_relaxed),
+                                  g_dispatches.load(std::memory_order_relaxed));
     if (++frames.lines % 150 == 0) {
         frames.Flush();
     }

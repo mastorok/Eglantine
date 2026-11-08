@@ -151,7 +151,12 @@ void TextureCache<P>::RunGarbageCollector() {
     const auto Configure = [&](bool allow_aggressive) {
         high_priority_mode = total_used_memory >= expected_memory;
         aggressive_mode = allow_aggressive && total_used_memory >= critical_memory;
-        ticks_to_destroy = aggressive_mode ? 10ULL : high_priority_mode ? 25ULL : 50ULL;
+        // EDEN_NX2_TC_AGGR_AGE=<frames>: how long an image must be unused to be deleted when the
+        // collector is aggressive (default 10).
+        static const Nx2Sampler::Knob aggressive_age = Nx2Sampler::MakeKnob("TC_AGGR_AGE", 10);
+        ticks_to_destroy = aggressive_mode ? static_cast<u64>((std::max)(1LL, aggressive_age.Get()))
+                           : high_priority_mode ? 25ULL
+                                                : 50ULL;
         Nx2Sampler::g_tc_mode.store(aggressive_mode ? 2 : high_priority_mode ? 1 : 0,
                                     std::memory_order_relaxed);
         // EDEN_NX2_TC_MIN_AGE=<frames>: never evict images used more recently (thrash tests).
@@ -214,7 +219,11 @@ void TextureCache<P>::RunGarbageCollector() {
     const auto Collect = [&] {
         if constexpr (requires(const Image& image) { image.MemoryBlock(); }) {
             std::vector<ImageId> candidates;
-            const size_t limit = num_iterations * 8;
+            // EDEN_NX2_TC_HOT=1: keep the images that cycle (see below), which needs a longer look
+            // at the unused ones to find others to delete instead.
+            static const Nx2Sampler::Knob keep_hot_knob = Nx2Sampler::MakeKnob("TC_HOT", 0);
+            const bool keep_hot = keep_hot_knob.Get() != 0;
+            const size_t limit = num_iterations * (keep_hot ? 64 : 8);
             lru_cache.ForEachItemBelow(frame_tick - ticks_to_destroy, [&](ImageId image_id) {
                 candidates.push_back(image_id);
                 return candidates.size() >= limit;
@@ -247,6 +256,14 @@ void TextureCache<P>::RunGarbageCollector() {
             }
             std::stable_sort(ordered.begin(), ordered.end(),
                              [](const auto& a, const auto& b) { return a.first < b.first; });
+            if (keep_hot) {
+                // Images made again soon after a deletion are the working set that cycles: with
+                // the oldest first they are deleted just before they are wanted again, every
+                // time. The others go first, so part of the cycle stays.
+                std::stable_partition(ordered.begin(), ordered.end(), [this](const auto& entry) {
+                    return False(slot_images[entry.second].flags & ImageFlagBits::Nx2Hot);
+                });
+            }
             for (const auto& [fill, image_id] : ordered) {
                 if (Cleanup(image_id)) {
                     break;
@@ -351,7 +368,14 @@ void TextureCache<P>::TickFrame() {
                 const u64 budget = runtime.GetDeviceMemoryBudget();
                 if (budget > 2_GiB) {
                     const u64 old_critical = critical_memory;
-                    const u64 margin = (std::min)(budget / 8, 1_GiB);
+                    // EDEN_NX2_TC_MARGIN_MIB / EDEN_NX2_TC_SLACK_PCT: the room kept free below the
+                    // budget (default a 1/8 of it, at most 1 GiB) and the share of the allocator's
+                    // block slack that is counted (default 100).
+                    static const Nx2Sampler::Knob margin_knob = Nx2Sampler::MakeKnob("TC_MARGIN_MIB", 0);
+                    static const Nx2Sampler::Knob slack_knob = Nx2Sampler::MakeKnob("TC_SLACK_PCT", 100);
+                    const long long margin_mib = margin_knob.Get();
+                    const u64 margin = margin_mib > 0 ? static_cast<u64>(margin_mib) << 20
+                                                      : (std::min)(budget / 8, 1_GiB);
                     if constexpr (requires { runtime.GetDeviceMemorySlack(); }) {
                         // The usage counted here leaves out the unused part of the allocator's
                         // blocks, which the driver counts and a full heap cannot hand to a new
@@ -359,7 +383,8 @@ void TextureCache<P>::TickFrame() {
                         // its budget for a minute before images stopped fitting). Reserve it
                         // too: at once when it grows, slowly when it shrinks, so evicting images
                         // (which leaves partly used blocks) does not chase the threshold down.
-                        const u64 slack = (std::min)(runtime.GetDeviceMemorySlack(), 1536_MiB);
+                        const u64 slack = (std::min)(runtime.GetDeviceMemorySlack(), 1536_MiB) *
+                                          static_cast<u64>(std::clamp<long long>(slack_knob.Get(), 0, 100)) / 100;
                         slack_margin = slack >= slack_margin
                                            ? slack
                                            : slack_margin - (std::min)(slack_margin - slack, 16_MiB);
@@ -2651,6 +2676,9 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         if (const auto deleted = nx2_deleted_at.find(Nx2ImageKey(gpu_addr, new_info));
             deleted != nx2_deleted_at.end()) {
             const u64 age = frame_tick - deleted->second;
+            if (age < 600) {
+                new_image.flags |= ImageFlagBits::Nx2Hot;
+            }
             auto& counter = age < 30    ? Nx2Sampler::g_recreated_30
                             : age < 150 ? Nx2Sampler::g_recreated_150
                             : age < 600 ? Nx2Sampler::g_recreated_600

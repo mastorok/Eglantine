@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <string>
 
 namespace Nx2Sampler {
@@ -56,12 +57,62 @@ inline std::atomic<std::uint64_t> g_recreated_30{0};    // under 30 frames
 inline std::atomic<std::uint64_t> g_recreated_150{0};   // 30 to 149 frames
 inline std::atomic<std::uint64_t> g_recreated_600{0};   // 150 to 599 frames
 inline std::atomic<std::uint64_t> g_recreated_old{0};   // 600 frames or more
+// Draws, indirect draws and compute dispatches the rasterizer ran (calls, not primitives).
+inline std::atomic<std::uint64_t> g_draws{0};
+inline std::atomic<std::uint64_t> g_indirect_draws{0};
+inline std::atomic<std::uint64_t> g_dispatches{0};
 inline std::atomic<std::uint64_t> g_list_waits{0};      // GPU-written command list reads that waited
 inline std::atomic<std::uint64_t> g_list_wait_us{0};
 inline std::atomic<std::uint64_t> g_tc_used_mib{0};
 inline std::atomic<std::uint64_t> g_tc_expected_mib{0};
 inline std::atomic<std::uint64_t> g_tc_critical_mib{0};
 inline std::atomic<std::uint64_t> g_tc_mode{0}; // collector: 0 idle, 1 high priority, 2 aggressive
+
+/// EDEN_NX2_AB_SECONDS=<n>: from EDEN_NX2_AB_START seconds (default 60) after the first call, the
+/// variant alternates between 0 and 1 every n seconds, so two settings meet the same scene in one
+/// run. The frame log's `ab` column holds 2 before the start, then 0 or 1.
+inline int AbLabel() {
+    static const double period = [] {
+        const char* value = std::getenv("EDEN_NX2_AB_SECONDS");
+        return value != nullptr ? std::atof(value) : 0.0;
+    }();
+    if (period <= 0.0) {
+        return 0;
+    }
+    static const double start = [] {
+        const char* value = std::getenv("EDEN_NX2_AB_START");
+        return value != nullptr ? std::atof(value) : 60.0;
+    }();
+    static const auto begin = std::chrono::steady_clock::now();
+    const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
+    if (now < start) {
+        return 2;
+    }
+    return (static_cast<long long>((now - start) / period) & 1) != 0 ? 1 : 0;
+}
+
+/// A setting read from EDEN_NX2_<name> (variant 0) and EDEN_NX2_<name>_B (variant 1, falls back to
+/// the first); only the variant switches while EDEN_NX2_AB_SECONDS is set.
+struct Knob {
+    long long a{};
+    long long b{};
+
+    [[nodiscard]] long long Get() const {
+        return AbLabel() == 1 ? b : a;
+    }
+};
+
+inline Knob MakeKnob(const char* name, long long fallback) {
+    const std::string base = std::string{"EDEN_NX2_"} + name;
+    Knob knob{fallback, fallback};
+    if (const char* value = std::getenv(base.c_str()); value != nullptr && *value != '\0') {
+        knob.a = knob.b = std::strtoll(value, nullptr, 10);
+    }
+    if (const char* value = std::getenv((base + "_B").c_str()); value != nullptr && *value != '\0') {
+        knob.b = std::strtoll(value, nullptr, 10);
+    }
+    return knob;
+}
 
 /// Adds the lifetime of the object, in microseconds, to `total` (and one to `count`, if given).
 class ScopedMicros {
