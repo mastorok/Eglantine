@@ -23,6 +23,7 @@
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/textures/texture.h"
@@ -1173,13 +1174,6 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
 
 void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
                              u32 count) {
-    // The words may be written by methods still queued for the back (indirect draw arguments
-    // from a culling dispatch), and the caches that may hold newer ones belong to it.
-    {
-        Nx2Sampler::ScopedMicros dma_drain_timer{Nx2Sampler::g_dma_drain_us,
-                                                 &Nx2Sampler::g_dma_drains};
-        split.Drain();
-    }
     const GPUVAddr source = (GPUVAddr{fs.regs[0x154] & 0x1ffffff} << 32) | fs.regs[0x155];
     const u32 ram = fs.regs[0x156];
     const u32 words = std::min<u32>(count, 0x1000);
@@ -1187,10 +1181,51 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
     if (VideoCommon::Nx2Profile::Enabled()) {
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::DmaReadBytes, read_bytes);
     }
-    if (memory_manager.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
-        split.Run([memory = &memory_manager, source, read_bytes] {
-            memory->FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
+    // The words may be written by methods still queued for the back (indirect draw arguments
+    // from a culling dispatch), and the caches that may hold newer ones belong to it. That is a
+    // drain per read: in Ocarina of Time (~0.5 reads per draw) the front and the back then take
+    // turns, each waiting for the other. EDEN_NX2_TRUST_CLEAN=1: a range whose pages an earlier
+    // drained read found untouched by the GPU is read without draining (same bookkeeping and
+    // violation counting as the command list entries, see DmaPusher::Step).
+    static const Nx2Sampler::Knob trust_knob = Nx2Sampler::MakeKnob("TRUST_CLEAN", 0);
+    const auto for_pages = [&](auto&& visit) {
+        for (GPUVAddr page = source & ~GPUVAddr{0xfff}; page < source + read_bytes; page += 0x1000) {
+            const auto device = memory_manager.GpuToCpuAddress(page);
+            if (!device || !visit(*device)) {
+                return false;
+            }
+        }
+        return true;
+    };
+    const bool tracked = Tegra::g_nx2_ampere.load(std::memory_order_relaxed) && read_bytes != 0;
+    if (tracked && trust_knob.Get() != 0 && !Tegra::g_nx2_trust_off.load(std::memory_order_relaxed) &&
+        for_pages([](DAddr device) { return Tegra::Nx2IsCleanPage(device); })) {
+        for_pages([](DAddr device) {
+            Tegra::Nx2MarkTrustedPage(device);
+            return true;
         });
+        Nx2Sampler::g_trust_skips.fetch_add(1, std::memory_order_relaxed);
+        split.PublishIfBackIdle();
+    } else {
+        {
+            Nx2Sampler::ScopedMicros dma_drain_timer{Nx2Sampler::g_dma_drain_us,
+                                                     &Nx2Sampler::g_dma_drains};
+            split.Drain();
+        }
+        const bool dirty =
+            memory_manager.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache);
+        if (dirty) {
+            split.Run([memory = &memory_manager, source, read_bytes] {
+                memory->FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
+            });
+        } else if (tracked && split.Active() &&
+                   for_pages([](DAddr device) { return !Tegra::Nx2IsGpuWritten(device); })) {
+            // Everything queued has run (drained) and no GPU work has written these pages.
+            for_pages([](DAddr device) {
+                Tegra::Nx2MarkCleanPage(device);
+                return true;
+            });
+        }
     }
     for (u32 i = 0; i < words; ++i) {
         const u32 word = memory_manager.Read<u32>(source + u64{i} * sizeof(u32));
