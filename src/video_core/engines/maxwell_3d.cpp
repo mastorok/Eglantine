@@ -1212,9 +1212,9 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                                                      &Nx2Sampler::g_dma_drains};
             split.Drain();
         }
-        const bool dirty =
+        const bool cache_dirty =
             memory_manager.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache);
-        if (dirty) {
+        if (cache_dirty) {
             split.Run([memory = &memory_manager, source, read_bytes] {
                 memory->FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
             });
