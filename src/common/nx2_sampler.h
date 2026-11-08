@@ -43,6 +43,19 @@ inline std::atomic<std::uint64_t> g_sparse_call_us{0};
 inline std::atomic<std::uint64_t> g_images_created{0};
 inline std::atomic<std::uint64_t> g_images_deleted{0};
 inline std::atomic<std::uint64_t> g_gc_us{0};
+// Why images are deleted, and what the collector sees (state, not counters: the last values).
+inline std::atomic<std::uint64_t> g_del_gc{0};          // collector
+inline std::atomic<std::uint64_t> g_del_gc_download{0}; // collector, after downloading the image
+inline std::atomic<std::uint64_t> g_del_unmap{0};       // guest memory unmapped
+inline std::atomic<std::uint64_t> g_del_join{0};        // replaced by an overlapping new image
+inline std::atomic<std::uint64_t> g_created_replace{0}; // new images that replaced overlaps
+inline std::atomic<std::uint64_t> g_gc_finish_us{0};    // GPU waits inside the collector
+inline std::atomic<std::uint64_t> g_list_waits{0};      // GPU-written command list reads that waited
+inline std::atomic<std::uint64_t> g_list_wait_us{0};
+inline std::atomic<std::uint64_t> g_tc_used_mib{0};
+inline std::atomic<std::uint64_t> g_tc_expected_mib{0};
+inline std::atomic<std::uint64_t> g_tc_critical_mib{0};
+inline std::atomic<std::uint64_t> g_tc_mode{0}; // collector: 0 idle, 1 high priority, 2 aggressive
 
 /// Adds the lifetime of the object, in microseconds, to `total` (and one to `count`, if given).
 class ScopedMicros {

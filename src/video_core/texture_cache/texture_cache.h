@@ -139,6 +139,8 @@ void TextureCache<P>::RunGarbageCollector() {
         high_priority_mode = total_used_memory >= expected_memory;
         aggressive_mode = allow_aggressive && total_used_memory >= critical_memory;
         ticks_to_destroy = aggressive_mode ? 10ULL : high_priority_mode ? 25ULL : 50ULL;
+        Nx2Sampler::g_tc_mode.store(aggressive_mode ? 2 : high_priority_mode ? 1 : 0,
+                                    std::memory_order_relaxed);
         // EDEN_NX2_TC_MIN_AGE=<frames>: never evict images used more recently (thrash tests).
         static const u64 min_age = [] {
             const char* value = std::getenv("EDEN_NX2_TC_MIN_AGE");
@@ -166,7 +168,11 @@ void TextureCache<P>::RunGarbageCollector() {
             auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
             const auto copies = FullDownloadCopies(image.info);
             image.DownloadMemory(map, copies);
-            runtime.Finish();
+            {
+                const Nx2Sampler::ScopedMicros finish_time{Nx2Sampler::g_gc_finish_us};
+                runtime.Finish();
+            }
+            Nx2Sampler::g_del_gc_download.fetch_add(1, std::memory_order_relaxed);
             SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span, swizzle_data_buffer);
             ++gc_download_deletes;
         }
@@ -174,6 +180,7 @@ void TextureCache<P>::RunGarbageCollector() {
             UntrackImage(image, image_id);
         }
         ++(True(image.flags & ImageFlagBits::CostlyLoad) ? gc_costly_deletes : gc_deletes);
+        Nx2Sampler::g_del_gc.fetch_add(1, std::memory_order_relaxed);
         UnregisterImage(image_id);
         DeleteImage(image_id, image.scale_tick > frame_tick + 5);
         if (aggressive_mode && total_used_memory < critical_memory) {
@@ -381,6 +388,9 @@ void TextureCache<P>::TickFrame() {
         }
         total_used_memory -= (std::min)(total_used_memory, gpu_sentenced_bytes);
     }
+    Nx2Sampler::g_tc_used_mib.store(total_used_memory >> 20, std::memory_order_relaxed);
+    Nx2Sampler::g_tc_expected_mib.store(expected_memory >> 20, std::memory_order_relaxed);
+    Nx2Sampler::g_tc_critical_mib.store(critical_memory >> 20, std::memory_order_relaxed);
     // Every 600 frames: device memory in use against the collector's thresholds.
     // Skip expensive heap allocation, map construction, and sorting unless debug logging is explicitly enabled.
     static const bool log_tc = std::getenv("EDEN_NX2_TC_LOG") != nullptr;
@@ -1010,6 +1020,7 @@ void TextureCache<P>::UnmapMemory(DAddr cpu_addr, size_t size) {
         }
         UnregisterImage(id);
         DeleteImage(id);
+        Nx2Sampler::g_del_unmap.fetch_add(1, std::memory_order_relaxed);
     }
 }
 
@@ -2624,6 +2635,9 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         }
         ++images_created;
         Nx2Sampler::g_images_created.fetch_add(1, std::memory_order_relaxed);
+        if (!join_copies_to_do.empty() || !join_ignore_textures.empty()) {
+            Nx2Sampler::g_created_replace.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 
     if (!gpu_memory->IsContinuousRange(new_image.gpu_addr, new_image.guest_size_bytes) &&
@@ -2641,6 +2655,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         }
         UnregisterImage(overlap_id);
         DeleteImage(overlap_id);
+        Nx2Sampler::g_del_join.fetch_add(1, std::memory_order_relaxed);
     }
 
     // A new render target that the clear binding it overwrites whole (every channel, the whole
@@ -2787,6 +2802,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         }
         UnregisterImage(copy_object.id);
         DeleteImage(copy_object.id);
+        Nx2Sampler::g_del_join.fetch_add(1, std::memory_order_relaxed);
     }
 
     RegisterImage(new_image_id);

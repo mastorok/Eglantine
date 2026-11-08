@@ -9,6 +9,8 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
+#include <deque>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -464,18 +466,27 @@ struct StallCounters {
     std::uint64_t created;
     std::uint64_t deleted;
     std::uint64_t gc_us;
+    std::uint64_t del_gc;
+    std::uint64_t del_gc_download;
+    std::uint64_t del_unmap;
+    std::uint64_t del_join;
+    std::uint64_t created_replace;
+    std::uint64_t gc_finish_us;
+    std::uint64_t list_waits;
+    std::uint64_t list_wait_us;
 };
 
 StallCounters ReadCounters() {
-    return {g_astc_decodes.load(std::memory_order_relaxed),
-            g_pipelines_built.load(std::memory_order_relaxed),
-            g_pipeline_build_us.load(std::memory_order_relaxed),
-            g_sparse_binds.load(std::memory_order_relaxed),
-            g_sparse_bind_us.load(std::memory_order_relaxed),
-            g_sparse_call_us.load(std::memory_order_relaxed),
-            g_images_created.load(std::memory_order_relaxed),
-            g_images_deleted.load(std::memory_order_relaxed),
-            g_gc_us.load(std::memory_order_relaxed)};
+    constexpr auto relaxed = std::memory_order_relaxed;
+    return {g_astc_decodes.load(relaxed),     g_pipelines_built.load(relaxed),
+            g_pipeline_build_us.load(relaxed), g_sparse_binds.load(relaxed),
+            g_sparse_bind_us.load(relaxed),   g_sparse_call_us.load(relaxed),
+            g_images_created.load(relaxed),   g_images_deleted.load(relaxed),
+            g_gc_us.load(relaxed),            g_del_gc.load(relaxed),
+            g_del_gc_download.load(relaxed),  g_del_unmap.load(relaxed),
+            g_del_join.load(relaxed),         g_created_replace.load(relaxed),
+            g_gc_finish_us.load(relaxed),     g_list_waits.load(relaxed),
+            g_list_wait_us.load(relaxed)};
 }
 
 int StallGroupOf(const std::string& name) {
@@ -580,9 +591,9 @@ void SampleStallRound(const std::vector<StallTarget>& targets, std::vector<Sampl
 }
 
 void ReportStall(unsigned index, double at_seconds, long long gap_ms, unsigned rounds,
-                 const std::vector<StallTarget>& targets, const std::vector<Sample>& samples,
-                 const StallCounters& before, const std::string& threads) {
-    const StallCounters after = ReadCounters();
+                 const std::vector<int>& groups, const std::vector<Sample>& samples,
+                 const StallCounters& before, const StallCounters& after,
+                 const std::string& threads) {
     LOG_INFO(Common,
              "nx2 stall #{} at {:.1f} s: {} ms between presents, {} sampling rounds; ASTC decodes "
              "+{}, pipelines built +{} ({:.1f} ms), sparse binds +{} ({:.1f} ms, of which the bind call {:.1f} ms), images +{} -{}, "
@@ -593,6 +604,18 @@ void ReportStall(unsigned index, double at_seconds, long long gap_ms, unsigned r
              (after.sparse_call_us - before.sparse_call_us) / 1000.0,
              after.created - before.created, after.deleted - before.deleted,
              (after.gc_us - before.gc_us) / 1000.0);
+    LOG_INFO(Common,
+             "nx2 stall #{} cache: deleted by collector {} ({} downloaded, GPU waits {:.1f} ms), by "
+             "unmap {}, replaced {}; new images replacing others {}; command list waits {} ({:.1f} "
+             "ms); texture cache {} MiB of {} / {} MiB, collector mode {}",
+             index, after.del_gc - before.del_gc, after.del_gc_download - before.del_gc_download,
+             (after.gc_finish_us - before.gc_finish_us) / 1000.0, after.del_unmap - before.del_unmap,
+             after.del_join - before.del_join, after.created_replace - before.created_replace,
+             after.list_waits - before.list_waits, (after.list_wait_us - before.list_wait_us) / 1000.0,
+             g_tc_used_mib.load(std::memory_order_relaxed),
+             g_tc_expected_mib.load(std::memory_order_relaxed),
+             g_tc_critical_mib.load(std::memory_order_relaxed),
+             g_tc_mode.load(std::memory_order_relaxed));
     if (!threads.empty()) {
         LOG_INFO(Common, "nx2 stall: threads seen: {}", threads);
     }
@@ -606,18 +629,20 @@ void ReportStall(unsigned index, double at_seconds, long long gap_ms, unsigned r
         std::map<std::string, Entry> signatures;
         unsigned total = 0;
         for (const Sample& sample : samples) {
-            if (sample.depth == 0 || targets[sample.thread].group != static_cast<int>(group)) {
+            if (sample.depth == 0 || groups[sample.thread] != static_cast<int>(group)) {
                 continue;
             }
             ++total;
             std::string signature;
             const std::string* previous = nullptr;
-            for (unsigned i = 0; i < (std::min)(sample.depth, 6U); ++i) {
+            unsigned names = 0;
+            for (unsigned i = 0; i < (std::min)(sample.depth, 14U) && names < 7; ++i) {
                 const std::string& name = symbolizer.Name(sample.frames[i]);
                 if (previous != nullptr && *previous == name) {
                     continue;
                 }
                 previous = &name;
+                ++names;
                 if (!signature.empty()) {
                     signature += " <- ";
                 }
@@ -646,6 +671,58 @@ void ReportStall(unsigned index, double at_seconds, long long gap_ms, unsigned r
     }
 }
 
+// Reports are written by a thread of their own: looking up symbols takes long enough (tens of ms
+// for the first lookups) that the next stall began before the watchdog was back.
+struct StallJob {
+    unsigned index{};
+    double at_seconds{};
+    long long gap_ms{};
+    unsigned rounds{};
+    std::vector<int> groups;
+    std::vector<Sample> samples;
+    StallCounters before{};
+    StallCounters after{};
+    std::string threads;
+};
+
+class StallReporter {
+public:
+    StallReporter() {
+        std::thread{[this] { Run(); }}.detach();
+    }
+
+    void Push(StallJob&& job) {
+        {
+            const std::scoped_lock lock{mutex};
+            if (queue.size() >= 8) {
+                return;
+            }
+            queue.push_back(std::move(job));
+        }
+        wake.notify_one();
+    }
+
+private:
+    void Run() {
+        Common::SetCurrentThreadName("Nx2StallLog");
+        for (;;) {
+            StallJob job;
+            {
+                std::unique_lock lock{mutex};
+                wake.wait(lock, [this] { return !queue.empty(); });
+                job = std::move(queue.front());
+                queue.pop_front();
+            }
+            ReportStall(job.index, job.at_seconds, job.gap_ms, job.rounds, job.groups, job.samples,
+                        job.before, job.after, job.threads);
+        }
+    }
+
+    std::mutex mutex;
+    std::condition_variable wake;
+    std::deque<StallJob> queue;
+};
+
 void StallLoop(unsigned threshold_ms) {
     Common::SetCurrentThreadName("Nx2Stall");
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
@@ -657,7 +734,8 @@ void StallLoop(unsigned threshold_ms) {
     }
     LOG_INFO(Common, "nx2 stall watchdog: stacks are taken when presents are {} ms or more apart",
              threshold_ms);
-    constexpr unsigned MaxReports = 300;
+    static StallReporter* const reporter = new StallReporter; // lives as long as the process
+    constexpr unsigned MaxReports = 400;
     constexpr unsigned MaxRounds = 600;
     std::vector<StallTarget> targets;
     std::vector<Sample> samples;
@@ -668,6 +746,8 @@ void StallLoop(unsigned threshold_ms) {
     unsigned rounds = 0;
     unsigned reports = 0;
     StallCounters before{};
+    std::array<std::pair<long long, StallCounters>, 64> recent{};
+    size_t recent_next = 0;
     for (;;) {
         std::this_thread::sleep_for(std::chrono::milliseconds{stalling ? 2 : 4});
         const long long last = g_last_present_ns.load(std::memory_order_relaxed);
@@ -678,6 +758,8 @@ void StallLoop(unsigned threshold_ms) {
                                   std::chrono::steady_clock::now().time_since_epoch())
                                   .count();
         if (!stalling) {
+            // The counters as they were at the last present, found in what was read while waiting.
+            recent[recent_next++ % recent.size()] = {now, ReadCounters()};
             if (now - last < static_cast<long long>(threshold_ms) * 1'000'000LL ||
                 reports >= MaxReports) {
                 continue;
@@ -693,15 +775,34 @@ void StallLoop(unsigned threshold_ms) {
             listed = true;
             samples.reserve(size_t{MaxRounds} * (targets.size() + 1));
             before = ReadCounters();
+            long long best = 0;
+            for (const auto& [time, counters] : recent) {
+                if (time != 0 && time <= last && time > best) {
+                    best = time;
+                    before = counters;
+                }
+            }
             continue;
         }
         if (last != stall_from) {
             ++reports;
-            const double at_seconds =
+            StallJob job;
+            job.index = reports;
+            job.at_seconds =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - g_process_start)
                     .count();
-            ReportStall(reports, at_seconds, (last - stall_from) / 1'000'000, rounds, targets,
-                        samples, before, threads);
+            job.gap_ms = (last - stall_from) / 1'000'000;
+            job.rounds = rounds;
+            for (const StallTarget& target : targets) {
+                job.groups.push_back(target.group);
+            }
+            job.samples = std::move(samples);
+            samples = {};
+            job.before = before;
+            job.after = ReadCounters();
+            job.threads = std::move(threads);
+            threads = {};
+            reporter->Push(std::move(job));
             stalling = false;
             continue;
         }
@@ -836,20 +937,29 @@ void NotePresent(long long frame_us, long long fence_us, long long composite_us,
         frames.file.open(path, std::ios::out | std::ios::trunc);
         frames.pending =
             "t_s,frame_ms,fence_ms,composite_ms,pace_ms,astc_decodes,pipelines_built,pipeline_ms,"
-            "sparse_binds,sparse_ms,sparse_call_ms,images_created,images_deleted,gc_ms\n";
+            "sparse_binds,sparse_ms,sparse_call_ms,images_created,images_deleted,gc_ms,"
+            "tc_used_mib,tc_expected_mib,tc_critical_mib,gc_mode,del_gc,del_gc_download,del_unmap,"
+            "del_join,created_replace,gc_finish_ms,list_waits,list_wait_ms\n";
     }
     if (!frames.file.is_open()) {
         return;
     }
     const StallCounters counters = ReadCounters();
-    frames.pending += fmt::format("{:.3f},{:.2f},{:.2f},{:.2f},{:.2f},{},{},{:.1f},{},{:.1f},{:.1f},{},{},{:.1f}\n",
+    frames.pending += fmt::format("{:.3f},{:.2f},{:.2f},{:.2f},{:.2f},{},{},{:.1f},{},{:.1f},{:.1f},{},{},{:.1f},"
+                                  "{},{},{},{},{},{},{},{},{},{:.1f},{},{:.1f}\n",
                                   std::chrono::duration<double>(now - g_process_start).count(),
                                   frame_us / 1000.0, fence_us / 1000.0, composite_us / 1000.0,
                                   pace_us / 1000.0, counters.astc, counters.pipelines,
                                   counters.pipeline_us / 1000.0, counters.sparse_binds,
                                   counters.sparse_us / 1000.0, counters.sparse_call_us / 1000.0, counters.created,
-                                  counters.deleted,
-                                  counters.gc_us / 1000.0);
+                                  counters.deleted, counters.gc_us / 1000.0,
+                                  g_tc_used_mib.load(std::memory_order_relaxed),
+                                  g_tc_expected_mib.load(std::memory_order_relaxed),
+                                  g_tc_critical_mib.load(std::memory_order_relaxed),
+                                  g_tc_mode.load(std::memory_order_relaxed), counters.del_gc,
+                                  counters.del_gc_download, counters.del_unmap, counters.del_join,
+                                  counters.created_replace, counters.gc_finish_us / 1000.0,
+                                  counters.list_waits, counters.list_wait_us / 1000.0);
     if (++frames.lines % 150 == 0) {
         frames.Flush();
     }

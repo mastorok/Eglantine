@@ -14,6 +14,7 @@
 #include <vector>
 #include <fmt/ranges.h>
 
+#include "common/nx2_sampler.h"
 #include "common/range_sets.inc"
 #include "video_core/buffer_cache/buffer_cache_base.h"
 #include "video_core/buffer_cache/uniform_stream_reuse.h"
@@ -2030,7 +2031,11 @@ auto BufferCache<P>::Nx2ReadListCopy(DAddr device_addr, std::span<u8> out) -> Nx
             writes = entry.copy_writes;
         }
         // Submitted with the work that wrote the page (Nx2CopyListPages's caller flushes).
-        runtime.WaitSubmittedTick(tick);
+        {
+            const Nx2Sampler::ScopedMicros wait_time{Nx2Sampler::g_list_wait_us,
+                                                     &Nx2Sampler::g_list_waits};
+            runtime.WaitSubmittedTick(tick);
+        }
         std::scoped_lock lock{nx2_list_mutex};
         const auto it = nx2_list_pages.find(page);
         if (it == nx2_list_pages.end() || !current(it->second) || it->second.copy_tick != tick ||
