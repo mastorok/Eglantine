@@ -21,6 +21,7 @@
 #include <string>
 
 #include "common/logging.h"
+#include "common/nx2_sampler.h"
 #include "common/settings.h"
 #include "common/thread.h"
 #include "core/core.h"
@@ -227,6 +228,7 @@ void GpuSplit::Drain() {
     }
     Publish();
     Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
+    Nx2Sampler::ScopedMicros drain_timer{Nx2Sampler::g_drain_us, &Nx2Sampler::g_drains};
     // Everything consumed is not enough: the back submits deferred work (Scheduler::DeferFlush)
     // from its idle hook afterwards, and the caller may use the scheduler once this returns.
     bool hook_asked = false;
@@ -258,6 +260,7 @@ bool GpuSplit::WaitForWriters() {
     }
     wait_target.store(target, std::memory_order_seq_cst);
     Publish();
+    Nx2Sampler::ScopedMicros writer_timer{Nx2Sampler::g_writer_wait_us, &Nx2Sampler::g_writer_waits};
     for (u32 spins = 0;; ++spins) {
         consumed_cache = consumed.load(std::memory_order_acquire);
         if (consumed_cache >= target) {
@@ -380,6 +383,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
         u64 available = published.load(std::memory_order_acquire);
         if (available == read_position) {
             Nx2Profile::Scope scope{Nx2Profile::Zone::SplitWait};
+            Nx2Sampler::ScopedMicros idle_timer{Nx2Sampler::g_back_idle_us, &Nx2Sampler::g_back_idles};
             // The front usually sends more within microseconds: spin briefly before sleeping.
             for (u32 spins = 0; spins < 8192 && available == read_position &&
                                 !hook_requested.load(std::memory_order_relaxed);

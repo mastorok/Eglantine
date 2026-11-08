@@ -57,6 +57,14 @@ inline std::atomic<std::uint64_t> g_recreated_30{0};    // under 30 frames
 inline std::atomic<std::uint64_t> g_recreated_150{0};   // 30 to 149 frames
 inline std::atomic<std::uint64_t> g_recreated_600{0};   // 150 to 599 frames
 inline std::atomic<std::uint64_t> g_recreated_old{0};   // 600 frames or more
+// Waits of the split's front thread for its back thread (writers: before reading a command list
+// entry; drains: everything queued), and the back's waits for work.
+inline std::atomic<std::uint64_t> g_writer_waits{0};
+inline std::atomic<std::uint64_t> g_writer_wait_us{0};
+inline std::atomic<std::uint64_t> g_drains{0};
+inline std::atomic<std::uint64_t> g_drain_us{0};
+inline std::atomic<std::uint64_t> g_back_idles{0};
+inline std::atomic<std::uint64_t> g_back_idle_us{0};
 // Draws, indirect draws and compute dispatches the rasterizer ran (calls, not primitives).
 inline std::atomic<std::uint64_t> g_draws{0};
 inline std::atomic<std::uint64_t> g_indirect_draws{0};
