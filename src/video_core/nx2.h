@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -13,6 +14,7 @@
 #include <vector>
 
 #include "common/common_types.h"
+#include "common/nx2_sampler.h"
 
 namespace Tegra {
 
@@ -28,6 +30,17 @@ inline std::atomic<bool> g_nx2_ampere{false};
 inline constexpr u64 Nx2WrittenPageBits = 12;
 inline std::array<std::atomic<u64>, (u64{1} << (36 - Nx2WrittenPageBits)) / 64> g_nx2_gpu_written_pages{};
 
+// Device pages (same layout) a command list entry was found on after the split's back had run
+// every dispatch and copy queued before it, with no GPU write to them: the front reads such
+// entries without that wait from then on (EDEN_NX2_TRUST_CLEAN, DmaPusher::Step). A page the GPU
+// writes after that is a violation: the entry may have been read stale; it is counted, and enough
+// of them turn the trust off for the session.
+inline std::array<std::atomic<u64>, (u64{1} << (36 - Nx2WrittenPageBits)) / 64> g_nx2_clean_pages{};
+// Of those, the pages the front has read an entry from without waiting (the violations that count).
+inline std::array<std::atomic<u64>, (u64{1} << (36 - Nx2WrittenPageBits)) / 64> g_nx2_trusted_pages{};
+inline std::atomic<bool> g_nx2_trust_off{false};
+inline std::atomic<u64> g_nx2_last_violation_page{0};
+
 inline void Nx2MarkGpuWritten(u64 device_address, u64 size) {
     if (size == 0) {
         return;
@@ -40,9 +53,58 @@ inline void Nx2MarkGpuWritten(u64 device_address, u64 size) {
         const u64 mask = (bits == 64 ? ~u64{0} : (u64{1} << bits) - 1) << first_bit;
         auto& word = g_nx2_gpu_written_pages[page / 64];
         if ((word.load(std::memory_order_relaxed) & mask) != mask) {
-            word.fetch_or(mask, std::memory_order_relaxed);
+            const u64 fresh = mask & ~word.fetch_or(mask, std::memory_order_relaxed);
+            if (fresh != 0) {
+                auto& clean = g_nx2_clean_pages[page / 64];
+                if (const u64 cleared = fresh & clean.load(std::memory_order_relaxed); cleared != 0) {
+                    clean.fetch_and(~cleared, std::memory_order_relaxed);
+                    auto& trusted = g_nx2_trusted_pages[page / 64];
+                    if (const u64 violated = cleared & trusted.load(std::memory_order_relaxed);
+                        violated != 0) {
+                        trusted.fetch_and(~violated, std::memory_order_relaxed);
+                        Nx2Sampler::g_clean_violations.fetch_add(1, std::memory_order_relaxed);
+                        g_nx2_last_violation_page.store(
+                            (page / 64 * 64 + static_cast<u64>(std::countr_zero(violated)))
+                                << Nx2WrittenPageBits,
+                            std::memory_order_relaxed);
+                    }
+                }
+            }
         }
         page += bits;
+    }
+}
+
+[[nodiscard]] inline bool Nx2IsCleanPage(u64 device_address) {
+    const u64 page = device_address >> Nx2WrittenPageBits;
+    if (page >= g_nx2_clean_pages.size() * 64) {
+        return false;
+    }
+    return (g_nx2_clean_pages[page / 64].load(std::memory_order_relaxed) >> (page % 64)) & 1;
+}
+
+/// The front reads an entry on this page without waiting for the writers.
+inline void Nx2MarkTrustedPage(u64 device_address) {
+    const u64 page = device_address >> Nx2WrittenPageBits;
+    if (page >= g_nx2_trusted_pages.size() * 64) {
+        return;
+    }
+    auto& word = g_nx2_trusted_pages[page / 64];
+    const u64 bit = u64{1} << (page % 64);
+    if ((word.load(std::memory_order_relaxed) & bit) == 0) {
+        word.fetch_or(bit, std::memory_order_relaxed);
+    }
+}
+
+inline void Nx2MarkCleanPage(u64 device_address) {
+    const u64 page = device_address >> Nx2WrittenPageBits;
+    if (page >= g_nx2_clean_pages.size() * 64) {
+        return;
+    }
+    auto& word = g_nx2_clean_pages[page / 64];
+    const u64 bit = u64{1} << (page % 64);
+    if ((word.load(std::memory_order_relaxed) & bit) == 0) {
+        word.fetch_or(bit, std::memory_order_relaxed);
     }
 }
 
@@ -82,6 +144,13 @@ inline void Nx2ClearGpuWrittenPages() {
     for (auto& word : g_nx2_command_list_pages) {
         word.store(0, std::memory_order_relaxed);
     }
+    for (auto& word : g_nx2_clean_pages) {
+        word.store(0, std::memory_order_relaxed);
+    }
+    for (auto& word : g_nx2_trusted_pages) {
+        word.store(0, std::memory_order_relaxed);
+    }
+    g_nx2_trust_off.store(false, std::memory_order_relaxed);
     g_nx2_has_command_list_pages.store(false, std::memory_order_relaxed);
 }
 

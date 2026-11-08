@@ -149,6 +149,19 @@ public:
     /// Waits until the back executed the compute and copy work sent so far (not what came after).
     /// Returns whether any of it was still queued.
     bool WaitForWriters();
+    /// Publishes what was sent when the back has run out of work, so it starts at once instead of
+    /// at the next batch boundary (a front that skips WaitForWriters publishes less often).
+    void PublishIfBackIdle() {
+        if (published_local != write_position &&
+            consumed.load(std::memory_order_acquire) == published_local) {
+            Publish();
+        }
+    }
+    /// Whether compute or copy work sent so far is still queued (WaitForWriters would wait).
+    bool WritersPending() {
+        consumed_cache = consumed.load(std::memory_order_acquire);
+        return consumed_cache < std::min(last_writer_position, write_position);
+    }
 
 private:
     enum class Kind : u64 {

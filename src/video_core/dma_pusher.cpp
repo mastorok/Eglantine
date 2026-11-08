@@ -206,10 +206,47 @@ bool DmaPusher::Step() {
         // billions of instances and lost the device loading a race).
         bool gpu_written =
             IsGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
-        if (!gpu_written && VideoCommon::GpuSplit::Get().Active() &&
-            VideoCommon::GpuSplit::Get().WaitForWriters()) {
-            gpu_written =
-                IsGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
+        if (!gpu_written && VideoCommon::GpuSplit::Get().Active()) {
+            // EDEN_NX2_TRUST_CLEAN=1: an entry on pages found untouched by the GPU after a wait is
+            // read without waiting again (the wait blocks the front at each of a frame's ~125
+            // dispatches). If the GPU writes such a page later, the entry may have been read
+            // stale: Nx2MarkGpuWritten counts it, and after EDEN_NX2_TRUST_MAX_VIOLATIONS (4) the
+            // wait is back for the session.
+            static const Nx2Sampler::Knob trust_knob = Nx2Sampler::MakeKnob("TRUST_CLEAN", 0);
+            static const Nx2Sampler::Knob trust_max = Nx2Sampler::MakeKnob("TRUST_MAX_VIOLATIONS", 4);
+            auto& split = VideoCommon::GpuSplit::Get();
+            const size_t entry_bytes = size_t{header.size} * sizeof(u32);
+            bool skip = false;
+            if (trust_knob.Get() != 0 && !Tegra::g_nx2_trust_off.load(std::memory_order_relaxed)) {
+                static std::atomic<u64> reported_violations{};
+                if (const u64 violations =
+                        Nx2Sampler::g_clean_violations.load(std::memory_order_relaxed);
+                    violations != reported_violations.load(std::memory_order_relaxed)) {
+                    reported_violations.store(violations, std::memory_order_relaxed);
+                    LOG_WARNING(HW_GPU,
+                                "nx2 trust: the GPU wrote page {:#x} after an entry on it was read "
+                                "without waiting ({} so far)",
+                                Tegra::g_nx2_last_violation_page.load(std::memory_order_relaxed),
+                                violations);
+                    if (static_cast<long long>(violations) >= trust_max.Get()) {
+                        Tegra::g_nx2_trust_off.store(true, std::memory_order_relaxed);
+                        LOG_WARNING(HW_GPU, "nx2 trust: off for this session");
+                    }
+                }
+                skip = split.WritersPending() && AreCommandPagesClean(dma_state.dma_get, entry_bytes);
+            }
+            if (skip) {
+                MarkCommandPages(dma_state.dma_get, entry_bytes, true);
+                Nx2Sampler::g_trust_skips.fetch_add(1, std::memory_order_relaxed);
+                split.PublishIfBackIdle();
+            } else {
+                if (split.WaitForWriters()) {
+                    gpu_written = IsGpuWrittenCommands(dma_state.dma_get, entry_bytes);
+                }
+                if (!gpu_written) {
+                    MarkCommandPages(dma_state.dma_get, entry_bytes, false);
+                }
+            }
         }
         // The words as submitted, unless this is a resumed entry or the GPU has newer ones the
         // safe read below would flush (with the split, the front can't tell: it reads memory
@@ -668,6 +705,31 @@ bool DmaPusher::IsGpuWrittenCommands(GPUVAddr address, size_t size) {
         }
     }
     return false;
+}
+
+bool DmaPusher::AreCommandPagesClean(GPUVAddr address, size_t size) {
+    if (size == 0) {
+        return false;
+    }
+    for (GPUVAddr page = address & ~GPUVAddr{0xfff}; page < address + size; page += 0x1000) {
+        const auto device = memory_manager.GpuToCpuAddress(page);
+        if (!device || !Tegra::Nx2IsCleanPage(*device)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void DmaPusher::MarkCommandPages(GPUVAddr address, size_t size, bool trusted) {
+    for (GPUVAddr page = address & ~GPUVAddr{0xfff}; page < address + size; page += 0x1000) {
+        if (const auto device = memory_manager.GpuToCpuAddress(page)) {
+            if (trusted) {
+                Tegra::Nx2MarkTrustedPage(*device);
+            } else {
+                Tegra::Nx2MarkCleanPage(*device);
+            }
+        }
+    }
 }
 
 bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count) {

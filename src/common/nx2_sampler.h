@@ -65,6 +65,15 @@ inline std::atomic<std::uint64_t> g_drains{0};
 inline std::atomic<std::uint64_t> g_drain_us{0};
 inline std::atomic<std::uint64_t> g_back_idles{0};
 inline std::atomic<std::uint64_t> g_back_idle_us{0};
+// Of the drains: those of semaphore acquires (the puller) and of the macros' DMA reads.
+inline std::atomic<std::uint64_t> g_sem_drains{0};
+inline std::atomic<std::uint64_t> g_sem_drain_us{0};
+inline std::atomic<std::uint64_t> g_dma_drains{0};
+inline std::atomic<std::uint64_t> g_dma_drain_us{0};
+// Command list entries read without waiting for the writers because their pages had been found
+// untouched by the GPU before (EDEN_NX2_TRUST_CLEAN), and pages that were written after that.
+inline std::atomic<std::uint64_t> g_trust_skips{0};
+inline std::atomic<std::uint64_t> g_clean_violations{0};
 // Draws, indirect draws and compute dispatches the rasterizer ran (calls, not primitives).
 inline std::atomic<std::uint64_t> g_draws{0};
 inline std::atomic<std::uint64_t> g_indirect_draws{0};

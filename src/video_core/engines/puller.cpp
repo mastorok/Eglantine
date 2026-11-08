@@ -7,6 +7,7 @@
 #include <atomic>
 #include <cstdlib>
 
+#include "common/nx2_sampler.h"
 #include "common/assert.h"
 #include "common/logging.h"
 #include "common/settings.h"
@@ -58,6 +59,7 @@ void OnBack(const Func& func) {
 }
 
 void DrainBack() {
+    Nx2Sampler::ScopedMicros sem_drain_timer{Nx2Sampler::g_sem_drain_us, &Nx2Sampler::g_sem_drains};
     VideoCommon::GpuSplit::Get().Drain();
 }
 
