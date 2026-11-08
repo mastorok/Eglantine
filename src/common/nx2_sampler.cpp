@@ -258,7 +258,7 @@ void WalkFrames(CONTEXT context, std::array<DWORD64, MaxDepth>& frames, unsigned
 // here and the thread is resumed as usual.
 unsigned Walk(CONTEXT context, std::array<DWORD64, MaxDepth>& frames) {
     unsigned depth = 0;
-#if defined(_MSC_VER) || defined(__clang__)
+#if defined(_MSC_VER)
     __try {
         WalkFrames(context, frames, depth);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
