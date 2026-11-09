@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -1182,9 +1183,27 @@ void PipelineCache::EvictUnusedPipelines() {
     // Each built pipeline holds ~0.45 MB of driver memory and none was ever destroyed, so it grew
     // with every place a session went (title 1: 1,500 on its title screen alone). One unused for
     // this long is destroyed; it takes 2-3 ms to build again from the driver's pipeline cache.
-    constexpr u64 EvictAfterFrames = 9000;
+    // EDEN_NX2_EVICT_FRAMES overrides the delay (0 = never evict) and EDEN_NX2_EVICT_MIN_PIPELINES
+    // the number of pipelines below which nothing is evicted (default 3000, about 1.3 GB of host
+    // memory): a rebuilt pipeline stalls the GPU thread 2 ms (20 to 120 of them in one frame at a
+    // camera cut = a 40-250 ms freeze and an audio glitch), which costs far more than the memory.
+    static const u64 EvictAfterFrames = [] {
+        u64 frames = 9000;
+        if (const char* value = std::getenv("EDEN_NX2_EVICT_FRAMES")) {
+            frames = std::strtoull(value, nullptr, 10);
+        }
+        return frames;
+    }();
+    static const size_t EvictMinPipelines = [] {
+        size_t count = 3000;
+        if (const char* value = std::getenv("EDEN_NX2_EVICT_MIN_PIPELINES")) {
+            count = static_cast<size_t>(std::strtoull(value, nullptr, 10));
+        }
+        return count;
+    }();
     // Switch 2 titles keep theirs: a rebuilt pipeline translates its shader on the GPU thread.
-    if (frame_count <= EvictAfterFrames || Settings::CurrentProgramIsSwitch2()) {
+    if (EvictAfterFrames == 0 || frame_count <= EvictAfterFrames ||
+        graphics_cache.size() < EvictMinPipelines || Settings::CurrentProgramIsSwitch2()) {
         return;
     }
     const u64 cutoff = frame_count - EvictAfterFrames;
