@@ -888,6 +888,14 @@ void GraphicsPipeline::RecordMeshEmulation(const void* descriptor_data, u32 task
     u64 counts_base{ME::HeaderWords + u64{tasks} * mesh_emulation.payload_words};
     u64 records_base{counts_base + 2 * u64{tasks}};
     const bool fits{records_base + record_words <= scratch_words};
+    static std::atomic<u64> emulated_draws{};
+    if (const u64 index{emulated_draws.fetch_add(1, std::memory_order_relaxed) + 1};
+        index == 1 || index % 5000 == 0) {
+        LOG_INFO(Render_Vulkan,
+                 "Mesh emulation: {} draws so far (this one: {} task workgroups, {} payload words, "
+                 "{} record words)",
+                 index, task_groups, mesh_emulation.payload_words, record_words);
+    }
     if (!fits) {
         static std::atomic_bool logged{};
         if (!logged.exchange(true)) {
