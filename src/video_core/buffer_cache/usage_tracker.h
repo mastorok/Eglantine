@@ -39,13 +39,12 @@ public:
         // Tracking is idempotent until Reset: skip ranges tracked just before. Draws bind the
         // same (often multi-megabyte) storage buffers again and again, and each Track wrote a
         // word per 4 KiB of the range.
-        for (const auto& [recent_offset, recent_size] : recent) {
-            if (recent_offset == offset && recent_size == size) {
-                return;
-            }
+        auto& recent_slot = recent[RecentSlot(offset, size)];
+        if (recent_slot.first == offset && recent_slot.second == size) {
+            return;
         }
         tracked = true;
-        recent[recent_cursor++ % recent.size()] = {offset, size};
+        recent_slot = {offset, size};
         const size_t page = offset >> BUFFER_PAGE_SHIFT;
         const size_t page_end = (offset + size) >> BUFFER_PAGE_SHIFT;
         if (page_end < page || page_end >= pages.size()) {
@@ -112,9 +111,19 @@ private:
 
 private:
     std::vector<u64> pages;
-    /// Ranges tracked last, (offset, size).
-    std::array<std::pair<u64, u64>, 4> recent{{{~u64{0}, 0}, {~u64{0}, 0}, {~u64{0}, 0}, {~u64{0}, 0}}};
-    size_t recent_cursor{};
+    static constexpr size_t RECENT_COUNT = 16;
+
+    static size_t RecentSlot(u64 offset, u64 size) noexcept {
+        return static_cast<size_t>(((offset >> 4) * 0x9E3779B97F4A7C15ULL ^ size * 0xC2B2AE3D27D4EB4FULL) >>
+                                   60);
+    }
+
+    /// Ranges tracked lately, (offset, size), one slot per hash of the range.
+    std::array<std::pair<u64, u64>, RECENT_COUNT> recent = [] {
+        std::array<std::pair<u64, u64>, RECENT_COUNT> empty;
+        empty.fill({~u64{0}, 0});
+        return empty;
+    }();
     bool tracked{};
 };
 

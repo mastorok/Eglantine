@@ -96,6 +96,81 @@ void SwizzleImpl(std::span<u8> output, std::span<const u8> input, u32 width, u32
     }
 }
 
+// Offsets inside a GOB (64 bytes by 8 rows) of every element of a row, for element sizes that
+// divide the GOB's width: the per-element deposit and Switch 2 bit fix-up are done once here.
+template <u32 BYTES_PER_PIXEL>
+struct GobTable {
+    static constexpr u32 ELEMENTS = GOB_SIZE_X / BYTES_PER_PIXEL;
+
+    constexpr GobTable() {
+        for (u32 row = 0; row < GOB_SIZE_Y; ++row) {
+            for (u32 element = 0; element < ELEMENTS; ++element) {
+                const u32 offset =
+                    pdep<SWIZZLE_X_BITS>(element * BYTES_PER_PIXEL) | pdep<SWIZZLE_Y_BITS>(row);
+                plain[row][element] = static_cast<u16>(offset);
+                native[row][element] = static_cast<u16>(NativeGobOffset(offset, true));
+            }
+        }
+    }
+
+    std::array<std::array<u16, ELEMENTS>, GOB_SIZE_Y> plain{};
+    std::array<std::array<u16, ELEMENTS>, GOB_SIZE_Y> native{};
+};
+
+// Same result as SwizzleImpl for element sizes of 1, 2, 4, 8 and 16 bytes (the sizes
+// UnswizzleTexture and SwizzleTexture reduce to). Every GOB base is a multiple of 512 bytes, so the
+// fix-up of bits 5 and 6 only depends on the offset inside the GOB.
+template <bool TO_LINEAR, u32 BYTES_PER_PIXEL>
+void SwizzleGobImpl(std::span<u8> output, std::span<const u8> input, u32 width, u32 height,
+                    u32 depth, u32 block_height, u32 block_depth, u32 stride, bool native_tiling) {
+    static constexpr GobTable<BYTES_PER_PIXEL> table;
+    static constexpr u32 ELEMENTS = GobTable<BYTES_PER_PIXEL>::ELEMENTS;
+
+    const u32 pitch = width * BYTES_PER_PIXEL;
+
+    const u32 gobs_in_x = Common::DivCeilLog2(stride, GOB_SIZE_X_SHIFT);
+    const u32 block_size = gobs_in_x << (GOB_SIZE_SHIFT + block_height + block_depth);
+    const u32 slice_size =
+        Common::DivCeilLog2(height, block_height + GOB_SIZE_Y_SHIFT) * block_size;
+
+    const u32 block_height_mask = (1U << block_height) - 1;
+    const u32 block_depth_mask = (1U << block_depth) - 1;
+    const u32 x_shift = GOB_SIZE_SHIFT + block_height + block_depth;
+
+    for (u32 slice = 0; slice < depth; ++slice) {
+        const u32 offset_z = (slice >> block_depth) * slice_size +
+                             ((slice & block_depth_mask) << (GOB_SIZE_SHIFT + block_height));
+        for (u32 line = 0; line < height; ++line) {
+            const u32 block_y = line >> GOB_SIZE_Y_SHIFT;
+            const u32 offset_y = (block_y >> block_height) * block_size +
+                                 ((block_y & block_height_mask) << GOB_SIZE_SHIFT);
+            const auto& row_offsets =
+                (native_tiling ? table.native : table.plain)[line & (GOB_SIZE_Y - 1)];
+
+            const size_t linear_row = static_cast<size_t>(slice) * pitch * height +
+                                      static_cast<size_t>(line) * pitch;
+
+            u32 column = 0;
+            for (u32 gob = 0; column < width; ++gob) {
+                const u32 gob_base = offset_z + offset_y + (gob << x_shift);
+                const u32 count = (std::min)(ELEMENTS, width - column);
+                for (u32 element = 0; element < count; ++element) {
+                    const u32 swizzled_offset = gob_base + row_offsets[element];
+                    const size_t linear_offset = linear_row + (column + element) * BYTES_PER_PIXEL;
+                    if constexpr (TO_LINEAR) {
+                        std::memcpy(output.data() + swizzled_offset, input.data() + linear_offset,
+                                    BYTES_PER_PIXEL);
+                    } else {
+                        std::memcpy(output.data() + linear_offset, input.data() + swizzled_offset,
+                                    BYTES_PER_PIXEL);
+                    }
+                }
+                column += count;
+            }
+        }
+    }
+}
+
 template <bool TO_LINEAR, u32 BYTES_PER_PIXEL>
 void SwizzleSubrectImpl(std::span<u8> output, std::span<const u8> input, u32 width, u32 height,
                         u32 depth, u32 origin_x, u32 origin_y, u32 extent_x, u32 num_lines,
@@ -167,14 +242,19 @@ void Swizzle(std::span<u8> output, std::span<const u8> input, u32 bytes_per_pixe
     case x:                                                                                        \
         return SwizzleImpl<TO_LINEAR, x>(output, input, width, height, depth, block_height,        \
                                          block_depth, stride_alignment, native_tiling);
-        BPP_CASE(1)
-        BPP_CASE(2)
+#define BPP_GOB_CASE(x)                                                                            \
+    case x:                                                                                        \
+        return SwizzleGobImpl<TO_LINEAR, x>(output, input, width, height, depth, block_height,     \
+                                            block_depth, stride_alignment, native_tiling);
+        BPP_GOB_CASE(1)
+        BPP_GOB_CASE(2)
         BPP_CASE(3)
-        BPP_CASE(4)
+        BPP_GOB_CASE(4)
         BPP_CASE(6)
-        BPP_CASE(8)
+        BPP_GOB_CASE(8)
         BPP_CASE(12)
-        BPP_CASE(16)
+        BPP_GOB_CASE(16)
+#undef BPP_GOB_CASE
 #undef BPP_CASE
     default:
         ASSERT_MSG(false, "Invalid bytes_per_pixel={}", bytes_per_pixel);
