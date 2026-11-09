@@ -273,6 +273,9 @@ public:
         GPUVAddr resume_address; ///< Where the entry that continues the method starts
     };
     void ResolveSplitMethod(GPUVAddr entry_address);
+    /// Applies an engine's method sink early once it holds MaxMethodSinkEntries writes.
+    void LimitMethodSink(Engines::EngineInterface* engine);
+    static constexpr size_t MaxMethodSinkEntries = 16384;
     static constexpr size_t MaxParkedMethods = 16;
 
     // Debug aid: hashes of the words of the last entries as they were parsed.

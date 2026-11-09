@@ -424,10 +424,20 @@ size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_
                         ++batch_count;
                     }
                     if (batch_count > 1) {
-                        subchannel->method_sink.reserve(subchannel->method_sink.size() + batch_count);
-                        for (u32 i = 0; i < batch_count; ++i) {
-                            subchannel->method_sink.emplace_back(dma_state.method + i, commands[index + i].argument);
+                        auto& sink = subchannel->method_sink;
+                        // Grow geometrically: reserving exactly size + batch_count copied the whole
+                        // sink on every batch once it outgrew its capacity (quadratic).
+                        // EDEN_NX2_SINK_EXACT=1 restores the old exact reserve (A/B comparisons).
+                        static const bool exact_reserve{std::getenv("EDEN_NX2_SINK_EXACT") != nullptr};
+                        if (const size_t needed = sink.size() + batch_count; exact_reserve) {
+                            sink.reserve(needed);
+                        } else if (needed > sink.capacity()) {
+                            sink.reserve(std::max(needed, sink.capacity() + sink.capacity() / 2));
                         }
+                        for (u32 i = 0; i < batch_count; ++i) {
+                            sink.emplace_back(dma_state.method + i, commands[index + i].argument);
+                        }
+                        LimitMethodSink(subchannel);
                         dma_state.method += batch_count;
                         dma_state.method_count -= batch_count;
                         index += batch_count;
@@ -549,6 +559,31 @@ bool DmaPusher::WantsSegment() const {
            (engine == Engines::EngineTypes::Maxwell3D && dma_state.method >= MacroRegistersStart);
 }
 
+// State writes wait in the engine's method sink until a method with side effects arrives. A stream
+// that sends very many of them in a row (or never reaches such a method) would let it grow without
+// bound, so past MaxMethodSinkEntries it is applied early: the writes keep their order, only the
+// moment they take effect moves up to before the next side-effecting method.
+void DmaPusher::LimitMethodSink(Engines::EngineInterface* engine) {
+    // EDEN_NX2_SINK_MAX=<entries> changes the limit (0: none, the old behaviour).
+    static const size_t limit{[] {
+        const char* value = std::getenv("EDEN_NX2_SINK_MAX");
+        return value ? static_cast<size_t>(std::strtoull(value, nullptr, 0)) : MaxMethodSinkEntries;
+    }()};
+    if (limit == 0 || engine->method_sink.size() < limit) [[likely]] {
+        return;
+    }
+    static std::atomic<u32> flushes{};
+    const u32 count = flushes.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (count <= 8 || (count & 0x3ff) == 0) {
+        LOG_INFO(HW_GPU,
+                 "Method sink reached {} entries (subchannel {}, engine type {}, method {:#x}); "
+                 "applying it early (#{})",
+                 engine->method_sink.size(), dma_state.subchannel,
+                 static_cast<u32>(subchannel_type[dma_state.subchannel]), dma_state.method, count);
+    }
+    engine->ConsumeSink(system);
+}
+
 void DmaPusher::CallMethod(u32 argument) {
     if (g_semaphore_watch != 0) [[unlikely]] {
         WatchArgument(dma_state.method, argument);
@@ -601,6 +636,7 @@ void DmaPusher::CallMethod(u32 argument) {
         }
         if (!subchannel->execution_mask[dma_state.method]) {
             subchannel->method_sink.emplace_back(dma_state.method, argument);
+            LimitMethodSink(subchannel);
         } else {
             VideoCommon::Nx2Profile::Scope method_scope{VideoCommon::Nx2Profile::Zone::Method};
             subchannel->ConsumeSink(system);

@@ -43,6 +43,10 @@ public:
         INSERT_PADDING_BYTES_NOINIT(0x48);
     } regs{};
 private:
-    void ConsumeSinkImpl(Core::System& system) override {}
+    // Nothing here acts on state writes (every method only logs), but they still go through the
+    // method sink: drop them, or the sink keeps every write of the session.
+    void ConsumeSinkImpl(Core::System& system) override {
+        method_sink.clear();
+    }
 };
 }
