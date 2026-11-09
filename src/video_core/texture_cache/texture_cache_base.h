@@ -182,6 +182,8 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     /// Large 3D images are uploaded by slab (see UploadsBySlab) from this size on.
     static constexpr u32 VolumeSlabMinSize = 32U << 20;
     static constexpr size_t LargeScratchCapacity = 64U << 20;
+    /// Guest memory a frame's SparseVolume refreshes read (zero scan and upload).
+    static constexpr u64 SparseVolumeBytesPerFrame = 24U << 20;
 
     /// Splits large 2D image uploads into smaller chunks, avoiding multi-hundred MiB staging buffers.
     bool UploadInChunks(Image& image);
@@ -201,6 +203,22 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
 
     /// Uploads the image's dirty slabs. False when it needs a full upload instead.
     bool UploadWrittenSlabs(Image& image);
+
+    /// Large light volumes that the guest maps and writes in part only get device memory by slab
+    /// (SparseVolume images, EDEN_NX2_SPARSE_VOLUMES): decides for a new image, and logs what the
+    /// guest maps under it (EDEN_NX2_VOLUME_CENSUS=1 scans for zero slabs too).
+    void DecideSparseVolume(GPUVAddr gpu_addr, ImageInfo& info);
+
+    /// SparseVolume images: records the slabs a write of [cpu_addr, +size) touches.
+    void MarkSparseVolumeWritten(ImageId image_id, Image& image, DAddr cpu_addr, size_t size);
+
+    /// SparseVolume images: binds device memory under the slabs that are mapped and hold data,
+    /// and uploads them (a few MiB of guest memory a frame).
+    void RefreshSparseVolume(Image& image);
+
+    u64 sparse_volume_budget{}; ///< Guest bytes SparseVolume refreshes may still read this frame
+    std::vector<u8> sparse_volume_scratch;
+    u32 volume_census_logged{};
 
     /// SparseTiles images: notes a written range, uploaded with the next refresh.
     void MarkRangeWritten(Image& image, DAddr cpu_addr, size_t size);

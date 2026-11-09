@@ -347,6 +347,11 @@ public:
         return IsSparseBindingSupported() && features.features.sparseResidencyImage2D;
     }
 
+    /// 3D images whose memory can be bound in parts, on the graphics queue.
+    bool IsSparseResidencyImage3DSupported() const {
+        return IsSparseBindingSupported() && features.features.sparseResidencyImage3D;
+    }
+
     /// Whether a sparse image may bind the same memory to several of its blocks.
     bool IsSparseResidencyAliasedSupported() const {
         return IsSparseResidencyImage2DSupported() && features.features.sparseResidencyAliased;

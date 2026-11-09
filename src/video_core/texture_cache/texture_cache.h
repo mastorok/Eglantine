@@ -50,6 +50,27 @@ using VideoCore::Surface::SurfaceType;
 using namespace Common::Literals;
 
 /// Identifies an image by address and shape, to tell when one is created again after a deletion.
+/// Whether every byte is zero (the slabs of a light volume nobody wrote).
+inline bool IsZeroBlock(std::span<const u8> data) noexcept {
+    const u8* bytes = data.data();
+    size_t count = data.size();
+    while (count >= 32) {
+        u64 words[4];
+        std::memcpy(words, bytes, sizeof(words));
+        if ((words[0] | words[1] | words[2] | words[3]) != 0) {
+            return false;
+        }
+        bytes += 32;
+        count -= 32;
+    }
+    while (count-- != 0) {
+        if (*bytes++ != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 inline u64 Nx2ImageKey(GPUVAddr gpu_addr, const ImageInfo& info) {
     u64 hash = 0xCBF29CE484222325ULL;
     const auto mix = [&hash](u64 value) { hash = (hash ^ value) * 0x100000001B3ULL; };
@@ -531,6 +552,7 @@ void TextureCache<P>::TickFrame() {
         const Nx2Sampler::ScopedMicros gc_time{Nx2Sampler::g_gc_us};
         RunGarbageCollector();
     }
+    sparse_volume_budget = SparseVolumeBytesPerFrame;
     sentenced_images.Tick();
     sentenced_image_index = (sentenced_image_index + 1) % TICKS_TO_DESTROY;
     sentenced_image_bytes[sentenced_image_index] = 0;
@@ -965,6 +987,10 @@ void TextureCache<P>::WriteMemory(DAddr cpu_addr, size_t size) {
         }
         if (True(image.flags & ImageFlagBits::SparseTiles)) {
             MarkRangeWritten(image, cpu_addr, size);
+            return;
+        }
+        if (True(image.flags & ImageFlagBits::SparseVolume)) {
+            MarkSparseVolumeWritten(image_id, image, cpu_addr, size);
             return;
         }
         if (UploadsBySlab(image)) {
@@ -1771,6 +1797,10 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
         RefreshSparseTiles(image);
         return;
     }
+    if (True(image.flags & ImageFlagBits::SparseVolume)) {
+        RefreshSparseVolume(image);
+        return;
+    }
     if (IsVolumeCandidate(image.info)) {
         // For a 3D image dirty_layers holds slabs; a full upload (below) when they cannot be used.
         if (!image.dirty_layers.empty() && UploadsBySlab(image) && UploadWrittenSlabs(image)) {
@@ -2012,6 +2042,248 @@ bool TextureCache<P>::UploadWrittenSlabs(Image& image) {
     slab_bytes_skipped += image.guest_size_bytes - read_bytes;
     largest_upload = (std::max<u64>)(largest_upload, read_bytes);
     return true;
+}
+
+template <class P>
+void TextureCache<P>::DecideSparseVolume(GPUVAddr gpu_addr, ImageInfo& info) {
+    constexpr u64 MinBytes = u64{128} << 20;
+    if (!IsVolumeCandidate(info) || !IsPixelFormatBCn(info.format)) {
+        return;
+    }
+    const u64 guest_size = CalculateGuestSizeInBytes(info);
+    if (guest_size < MinBytes) {
+        return;
+    }
+    // EDEN_NX2_SPARSE_VOLUMES=1: volumes of which at most half the slabs have mapped pages get
+    // device memory by slab; =2: every large volume does (empty slabs are skipped when read).
+    static const long long mode = [] {
+        const char* value = std::getenv("EDEN_NX2_SPARSE_VOLUMES");
+        return value != nullptr ? std::strtoll(value, nullptr, 10) : 0LL;
+    }();
+    // EDEN_NX2_VOLUME_CENSUS=1: also reads the mapped slabs to count the ones that are all zero.
+    static const long long census = [] {
+        const char* value = std::getenv("EDEN_NX2_VOLUME_CENSUS");
+        return value != nullptr ? std::strtoll(value, nullptr, 10) : 0LL;
+    }();
+    const VolumeSlabs slabs = GetVolumeSlabs(info);
+    const auto segments = gpu_memory->GetSubmappedRange(gpu_addr, guest_size);
+    u64 mapped_bytes{};
+    std::vector<bool> slab_mapped(slabs.slab_bytes != 0 ? slabs.count : 0, false);
+    for (const auto& [segment_addr, segment_size] : segments) {
+        mapped_bytes += segment_size;
+        if (slabs.slab_bytes == 0 || segment_size == 0 || segment_addr < gpu_addr) {
+            continue;
+        }
+        const u64 first = (segment_addr - gpu_addr) / slabs.slab_bytes;
+        const u64 last = (std::min<u64>)((segment_addr - gpu_addr + segment_size - 1) / slabs.slab_bytes,
+                                         u64{slabs.count} - 1);
+        for (u64 slab = first; slab <= last && slab < slab_mapped.size(); ++slab) {
+            slab_mapped[slab] = true;
+        }
+    }
+    u32 mapped_slabs{};
+    u32 data_slabs{};
+    for (u32 slab = 0; slab < slab_mapped.size(); ++slab) {
+        if (!slab_mapped[slab]) {
+            continue;
+        }
+        ++mapped_slabs;
+        if (census >= 1 && slabs.slab_bytes <= (u64{64} << 20)) {
+            sparse_volume_scratch.resize(slabs.slab_bytes);
+            gpu_memory->ReadBlockUnsafe(gpu_addr + u64{slab} * slabs.slab_bytes,
+                                        sparse_volume_scratch.data(), slabs.slab_bytes);
+            if (!IsZeroBlock(sparse_volume_scratch)) {
+                ++data_slabs;
+            }
+        }
+    }
+    bool use = false;
+    if constexpr (requires { runtime.CanUseSparseVolumes(); }) {
+        use = mode != 0 && slabs.slab_bytes != 0 && runtime.CanUseSparseVolumes() &&
+              (mode >= 2 || u64{mapped_slabs} * 2 <= slabs.count);
+    }
+    info.sparse_volume = use;
+    if (volume_census_logged++ < 256) {
+        LOG_INFO(HW_GPU,
+                 "Volume census {:#x}: {}x{}x{} format {}, {} MiB; {} MiB mapped in {} segments; "
+                 "{} of {} slabs ({} KiB, {} slices) have mapped pages{}; {}",
+                 gpu_addr, info.size.width, info.size.height, info.size.depth,
+                 static_cast<u32>(info.format), guest_size >> 20, mapped_bytes >> 20, segments.size(),
+                 mapped_slabs, slabs.count, slabs.slab_bytes >> 10, slabs.slab_depth,
+                 census >= 1 ? fmt::format(", {} of them hold data", data_slabs) : std::string{},
+                 use ? "device memory by slab" : "whole image");
+    }
+}
+
+template <class P>
+void TextureCache<P>::MarkSparseVolumeWritten(ImageId image_id, Image& image, DAddr cpu_addr,
+                                              size_t size) {
+    if (True(image.flags & ImageFlagBits::CpuModified) && image.dirty_layers.empty()) {
+        return; // all of it is dirty already
+    }
+    const VolumeSlabs slabs = GetVolumeSlabs(image.info);
+    if (slabs.slab_bytes == 0) {
+        image.dirty_layers.clear();
+        image.flags |= ImageFlagBits::CpuModified;
+        return;
+    }
+    if (False(image.flags & ImageFlagBits::CpuModified)) {
+        image.flags |= ImageFlagBits::CpuModified;
+        image.dirty_layers.assign(Common::DivCeil(slabs.count, 64U), 0);
+    }
+    const auto mark = [&](u64 begin, u64 end) {
+        if (end <= begin) {
+            return;
+        }
+        const u32 last = static_cast<u32>((std::min<u64>)((end - 1) / slabs.slab_bytes, slabs.count - 1));
+        for (u32 slab = static_cast<u32>(begin / slabs.slab_bytes); slab <= last; ++slab) {
+            image.dirty_layers[slab / 64] |= u64{1} << (slab % 64);
+        }
+    };
+    const auto views = sparse_views.find(image_id);
+    if (views == sparse_views.end()) {
+        // Mapped in one piece: offsets follow the device address.
+        const DAddr begin = (std::max<DAddr>)(cpu_addr, image.cpu_addr) - image.cpu_addr;
+        const DAddr end = (std::min<DAddr>)(cpu_addr + size, image.cpu_addr + image.guest_size_bytes) -
+                          image.cpu_addr;
+        mark(begin, end);
+        return;
+    }
+    for (const auto map_id : views->second) {
+        const auto& map = slot_map_views[map_id];
+        const DAddr begin = (std::max<DAddr>)(cpu_addr, map.cpu_addr);
+        const DAddr end = (std::min<DAddr>)(cpu_addr + size, map.cpu_addr + map.size);
+        if (end <= begin) {
+            continue;
+        }
+        const u64 offset = map.gpu_addr - image.gpu_addr + (begin - map.cpu_addr);
+        mark(offset, offset + (end - begin));
+    }
+}
+
+template <class P>
+void TextureCache<P>::RefreshSparseVolume(Image& image) {
+    if constexpr (requires { &Image::BindVolumeSlabs; }) {
+        const VolumeSlabs slabs = GetVolumeSlabs(image.info);
+        if (slabs.slab_bytes == 0) {
+            runtime.TransitionImageLayout(image);
+            return;
+        }
+        const size_t words = Common::DivCeil(slabs.count, 64U);
+        // The slabs to bring up to date: the ones written since the last refresh, or all of them
+        // for a new image.
+        std::vector<u64> pending = image.dirty_layers;
+        if (pending.size() < words) {
+            pending.assign(words, ~u64{0});
+            if (slabs.count % 64 != 0) {
+                pending.back() = (u64{1} << (slabs.count % 64)) - 1;
+            }
+        }
+        std::vector<bool> mapped(slabs.count, false);
+        for (const auto& [segment_addr, segment_size] :
+             gpu_memory->GetSubmappedRange(image.gpu_addr, image.guest_size_bytes)) {
+            if (segment_size == 0 || segment_addr < image.gpu_addr) {
+                continue;
+            }
+            const u64 first = (segment_addr - image.gpu_addr) / slabs.slab_bytes;
+            const u64 last = (std::min<u64>)(
+                (segment_addr - image.gpu_addr + segment_size - 1) / slabs.slab_bytes,
+                u64{slabs.count} - 1);
+            for (u64 slab = first; slab <= last && slab < mapped.size(); ++slab) {
+                mapped[slab] = true;
+            }
+        }
+        std::vector<u32> chunk;
+        u32 zero_skipped{};
+        for (u32 slab = 0; slab < slabs.count; ++slab) {
+            const u64 bit = u64{1} << (slab % 64);
+            if ((pending[slab / 64] & bit) == 0) {
+                continue;
+            }
+            if (!mapped[slab]) {
+                pending[slab / 64] &= ~bit; // nothing there: reads zero
+                continue;
+            }
+            if (sparse_volume_budget == 0) {
+                break; // the rest next frame
+            }
+            if (!image.IsVolumeSlabBound(slab, slabs.slab_depth)) {
+                // A slab with no data needs no memory (an unbound block reads zero).
+                sparse_volume_scratch.resize(slabs.slab_bytes);
+                gpu_memory->ReadBlockUnsafe(image.gpu_addr + u64{slab} * slabs.slab_bytes,
+                                            sparse_volume_scratch.data(), slabs.slab_bytes);
+                sparse_volume_budget -= (std::min)(sparse_volume_budget, slabs.slab_bytes);
+                if (IsZeroBlock(sparse_volume_scratch)) {
+                    pending[slab / 64] &= ~bit;
+                    ++zero_skipped;
+                    continue;
+                }
+            }
+            sparse_volume_budget -= (std::min)(sparse_volume_budget, slabs.slab_bytes);
+            pending[slab / 64] &= ~bit;
+            chunk.push_back(slab);
+        }
+        if (!chunk.empty()) {
+            const u64 before = ImageMemoryBytes(image);
+            const bool bound = image.BindVolumeSlabs(chunk, slabs.slab_depth);
+            if (True(image.flags & ImageFlagBits::Registered)) {
+                total_used_memory += ImageMemoryBytes(image) - before;
+            }
+            if (!bound) {
+                LOG_WARNING(HW_GPU, "Volume {:#x}: no device memory for {} slabs, retried later",
+                            image.gpu_addr, chunk.size());
+                for (const u32 slab : chunk) {
+                    pending[slab / 64] |= u64{1} << (slab % 64);
+                }
+                chunk.clear();
+            }
+        }
+        if (!chunk.empty()) {
+            std::vector<std::pair<u64, u64>> ranges;
+            ranges.reserve(chunk.size());
+            for (const u32 slab : chunk) {
+                ranges.emplace_back(u64{slab} * slabs.slab_bytes, u64{slab + 1} * slabs.slab_bytes);
+            }
+            const UnswizzlePlan plan = PlanUnswizzleVolumeSlabs(image.gpu_addr, image.info, ranges);
+            if (plan.layout_valid && !plan.copies.empty()) {
+                auto staging = runtime.UploadStagingBuffer(plan.total_host_bytes);
+                ExecuteUnswizzlePlan(*gpu_memory, plan, staging.mapped_span);
+                image.UploadMemory(staging, plan.copies);
+                runtime.InsertUploadMemoryBarrier();
+                const u64 read_bytes = u64{chunk.size()} * slabs.slab_bytes;
+                ++images_uploaded;
+                ++slab_uploads;
+                uploaded_bytes += read_bytes;
+                slab_bytes_uploaded += read_bytes;
+                slab_bytes_skipped += u64{image.guest_size_bytes} - (std::min<u64>)(image.guest_size_bytes, read_bytes);
+                largest_upload = (std::max<u64>)(largest_upload, read_bytes);
+            } else {
+                runtime.TransitionImageLayout(image);
+            }
+        } else {
+            runtime.TransitionImageLayout(image);
+        }
+        if (zero_skipped != 0 || !chunk.empty()) {
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 200) {
+                LOG_INFO(HW_GPU,
+                         "Sparse volume {:#x} {}x{}x{}: {} slabs uploaded, {} empty skipped, {} MiB "
+                         "of device memory bound",
+                         image.gpu_addr, image.info.size.width, image.info.size.height,
+                         image.info.size.depth, chunk.size(), zero_skipped,
+                         ImageMemoryBytes(image) >> 20);
+            }
+        }
+        const bool more = std::any_of(pending.begin(), pending.end(), [](u64 word) { return word != 0; });
+        if (more) {
+            image.dirty_layers = std::move(pending);
+            image.flags |= ImageFlagBits::CpuModified;
+        } else {
+            image.dirty_layers.clear();
+        }
+    } else {
+        runtime.TransitionImageLayout(image);
+    }
 }
 
 template <class P>
@@ -2424,6 +2696,13 @@ u64 TextureCache<P>::GetScaledImageSizeBytes(const ImageBase& image) {
 
 template <class P>
 u64 TextureCache<P>::ImageMemoryBytes(const Image& image) const {
+    if (True(image.flags & ImageFlagBits::SparseVolume)) {
+        // Only the slabs BindVolumeSlabs has given memory.
+        if constexpr (requires { image.SparseBoundBytes(); }) {
+            return image.SparseBoundBytes();
+        }
+        return 0;
+    }
     if (True(image.flags & ImageFlagBits::Unbacked)) {
         // No device memory but what BindLayers gave a SparseLayers image: at its full size (GBs
         // for title 1's sparse terrain images), deleting it would look to the collector like
@@ -2798,6 +3077,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             }
         }
     }
+    DecideSparseVolume(gpu_addr, new_info);
     const ImageId new_image_id = slot_images.insert(runtime, new_info, gpu_addr, cpu_addr);
     Image& new_image = slot_images[new_image_id];
 
@@ -2834,7 +3114,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
     }
 
     if (!gpu_memory->IsContinuousRange(new_image.gpu_addr, new_image.guest_size_bytes) &&
-        new_info.is_sparse) {
+        (new_info.is_sparse || True(new_image.flags & ImageFlagBits::SparseVolume))) {
         new_image.flags |= ImageFlagBits::Sparse;
     }
 

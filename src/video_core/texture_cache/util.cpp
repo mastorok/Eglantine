@@ -1303,7 +1303,7 @@ VolumeSlabGeometry MakeVolumeSlabGeometry(const ImageInfo& info) {
 
 VolumeSlabs GetVolumeSlabs(const ImageInfo& info) {
     const VolumeSlabGeometry g = MakeVolumeSlabGeometry(info);
-    return g.valid ? VolumeSlabs{g.slab_bytes, g.slabs} : VolumeSlabs{};
+    return g.valid ? VolumeSlabs{g.slab_bytes, g.slabs, g.slab_depth} : VolumeSlabs{};
 }
 
 UnswizzlePlan PlanUnswizzleVolumeSlabs(GPUVAddr gpu_addr, const ImageInfo& info,

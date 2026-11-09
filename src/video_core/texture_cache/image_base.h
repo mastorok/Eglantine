@@ -63,6 +63,10 @@ enum class ImageFlagBits : u32 {
     /// Created again soon after the collector deleted an image of the same address and shape: part
     /// of a working set that cycles, deleted last when the collector can choose.
     Nx2Hot = 1 << 24,
+    /// A large single-level 3D image (a light volume) of which the guest maps and writes only some
+    /// slabs: unbacked, each slab written gets device memory (Image::BindVolumeSlabs) and only
+    /// those are uploaded. Registered and tracked by mapped segment (as Sparse).
+    SparseVolume = 1 << 25,
 };
 DECLARE_ENUM_FLAG_OPERATORS(ImageFlagBits)
 

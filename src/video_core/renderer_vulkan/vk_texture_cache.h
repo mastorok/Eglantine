@@ -144,6 +144,12 @@ public:
         return true;
     }
 
+    /// Whether large light volumes can get device memory by slab (Image::BindVolumeSlabs).
+    bool CanUseSparseVolumes() const noexcept {
+        return device.CanUseUnbackedSparseImages() && device.IsSparseResidencyImage3DSupported() &&
+               device.IsOptimalBcnSupported();
+    }
+
     void AccelerateImageUpload(Image&, const StagingBufferRef&,
                                std::span<const VideoCommon::SwizzleParameters>,
                                u32 z_start, u32 z_count);
@@ -482,6 +488,13 @@ public:
     /// levels in it) device memory where they have none yet. False if that failed.
     bool BindTiles(std::span<const VideoCommon::LevelRect> rects);
 
+    /// SparseVolume images: gives the slabs (of `slab_depth` slices) device memory where they
+    /// have none yet. False if that failed (nothing is left bound by the call).
+    bool BindVolumeSlabs(std::span<const u32> slabs, u32 slab_depth);
+
+    /// SparseVolume images: whether every slice of the slab has device memory.
+    bool IsVolumeSlabBound(u32 slab, u32 slab_depth) const;
+
     /// SparseTiles images: the host sparse block, in texels, and the first level of the mip tail.
     u32 SparseTileWidth() const noexcept {
         return sparse_layers.tile_width;
@@ -544,6 +557,9 @@ private:
             levels = other.levels;
             tile_width = other.tile_width;
             tile_height = other.tile_height;
+            tile_depth = other.tile_depth;
+            volume_granules = std::move(other.volume_granules);
+            other.volume_granules.clear();
             layer_bytes = other.layer_bytes;
             layer_memory = std::move(other.layer_memory);
             other.layer_memory.clear();
@@ -571,6 +587,10 @@ private:
                     allocator->FreeSparseMemory(allocation);
                 }
             }
+            for (const VmaAllocation allocation : volume_granules) {
+                allocator->FreeSparseMemory(allocation);
+            }
+            volume_granules.clear();
             allocator->FreeSparseMemory(tail_memory);
             allocator->FreeSparseMemory(zero_block);
             zero_block = VK_NULL_HANDLE;
@@ -587,6 +607,10 @@ private:
         u32 levels{};      ///< Host levels
         u32 tile_width{};  ///< Sparse block, in texels
         u32 tile_height{};
+        u32 tile_depth{};  ///< SparseVolume: the sparse block's depth, in slices
+        /// SparseVolume: memory of each run of tile_depth slices (all the blocks across), null
+        /// until bound
+        std::vector<VmaAllocation> volume_granules;
         VkDeviceSize layer_bytes{}; ///< One layer's levels before the mip tail, and its own tail
         std::vector<VmaAllocation> layer_memory; ///< Per layer, null until bound
         /// SparseTiles: per level before the mip tail, per sparse block (rows), null until bound
@@ -606,6 +630,9 @@ private:
 
     /// Reads the image's sparse requirements; false when it can't be bound by sparse block.
     bool InitSparseTiles();
+
+    /// Reads the image's sparse requirements; false when it can't be bound by slice.
+    bool InitSparseVolume();
 
     /// Binds one zeroed block to every block of a SparseTiles image (and memory to its mip tail).
     bool BindZeroBlock();

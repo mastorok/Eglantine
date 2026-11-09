@@ -2652,11 +2652,15 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
                                AstcHostFormat(runtime_.device, info),
                                UsesSparseLayers(runtime_.device, info, gpu_addr_) ||
                                    UsesSparseTiles(runtime_.device, info, gpu_addr_) ||
-                                   IsUnwrittenSparse(runtime_.device, info, gpu_addr_),
+                                   IsUnwrittenSparse(runtime_.device, info, gpu_addr_) ||
+                                   info.sparse_volume,
                                UsesSparseTiles(runtime_.device, info, gpu_addr_) &&
                                    SparseTilesModeOf(runtime_.device) == SparseTilesMode::Aliased)),
       aspect_mask(ImageAspectMask(info.format)) {
-    if (original_image.IsUnbacked()) {
+    if (original_image.IsUnbacked() && info.sparse_volume && InitSparseVolume()) {
+        // Device memory by slab, bound as slabs are written (not Unbacked: it takes uploads).
+        flags |= VideoCommon::ImageFlagBits::SparseVolume;
+    } else if (original_image.IsUnbacked()) {
         flags |= VideoCommon::ImageFlagBits::Unbacked;
         const ImageInfo host_info = TrimmedHostInfo(runtime_.device, info, host_level_offset);
         if (UsesSparseLayers(runtime_.device, info, gpu_addr_) && InitSparseLayers()) {
@@ -3257,6 +3261,174 @@ bool Image::InitSparseTiles() {
     LOG_INFO(Render_Vulkan, "Sparse tiled image {:#x}: {}x{} {} levels, block {}x{}, mip tail from {}{}",
              gpu_addr, s.width, s.height, s.levels, s.tile_width, s.tile_height, s.tail_level,
              s.zero_block != VK_NULL_HANDLE ? ", empty blocks share a zeroed one" : "");
+    return true;
+}
+
+bool Image::InitSparseVolume() {
+    const Device& device = runtime->device;
+    const VkImage handle = *original_image;
+    const auto requirements = device.GetLogical().GetImageSparseMemoryRequirements(handle);
+    const auto it = std::ranges::find_if(requirements, [](const auto& r) {
+        return (r.formatProperties.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) != 0;
+    });
+    if (it == requirements.end()) {
+        return false;
+    }
+    SparseLayerMemory& s = sparse_layers;
+    s.requirements = device.GetLogical().GetImageMemoryRequirements(handle);
+    const VkExtent3D granularity = it->formatProperties.imageGranularity;
+    // One level, so the mip tail must start after it.
+    if (granularity.width == 0 || granularity.height == 0 || granularity.depth == 0 ||
+        s.requirements.alignment == 0 || it->imageMipTailFirstLod < 1) {
+        return false;
+    }
+    s.allocator = &runtime->memory_allocator;
+    s.sparse = *it;
+    s.width = info.size.width;
+    s.height = info.size.height;
+    s.levels = 1;
+    s.tile_width = granularity.width;
+    s.tile_height = granularity.height;
+    s.tile_depth = granularity.depth;
+    s.volume_granules.assign(Common::DivCeil(info.size.depth, granularity.depth), VK_NULL_HANDLE);
+    static std::atomic<u32> logged{};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+        LOG_INFO(Render_Vulkan,
+                 "Sparse volume {:#x}: {}x{}x{}, block {}x{}x{} texels, {} KiB, {} MiB if all "
+                 "bound",
+                 gpu_addr, s.width, s.height, info.size.depth, s.tile_width, s.tile_height,
+                 s.tile_depth, s.requirements.alignment >> 10, s.requirements.size >> 20);
+    }
+    return true;
+}
+
+bool Image::IsVolumeSlabBound(u32 slab, u32 slab_depth) const {
+    const SparseLayerMemory& s = sparse_layers;
+    if (s.volume_granules.empty() || slab_depth == 0 || s.tile_depth == 0) {
+        return false;
+    }
+    const u32 depth = info.size.depth;
+    const u32 z_begin = slab * slab_depth;
+    if (z_begin >= depth) {
+        return true;
+    }
+    const u32 z_end = (std::min)(z_begin + slab_depth, depth);
+    for (u32 granule = z_begin / s.tile_depth; granule <= (z_end - 1) / s.tile_depth; ++granule) {
+        if (granule >= s.volume_granules.size() || s.volume_granules[granule] == VK_NULL_HANDLE) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool Image::BindVolumeSlabs(std::span<const u32> slabs, u32 slab_depth) {
+    SparseLayerMemory& s = sparse_layers;
+    if (s.allocator == nullptr || s.volume_granules.empty() || slab_depth == 0 ||
+        s.tile_depth == 0) {
+        return false;
+    }
+    const Device& device = runtime->device;
+    const u32 depth = info.size.depth;
+    const u64 tile = s.requirements.alignment;
+    const u64 tiles_x = Common::DivCeil(s.width, s.tile_width);
+    const u64 tiles_y = Common::DivCeil(s.height, s.tile_height);
+    const VkDeviceSize granule_bytes = tiles_x * tiles_y * tile;
+    std::vector<VkSparseImageMemoryBind> image_binds;
+    std::vector<u32> fresh; // Runs of slices given memory by this call
+    // A failed bind leaves the image as it was, so the next call tries again.
+    const auto roll_back = [&] {
+        for (const u32 granule : fresh) {
+            s.allocator->FreeSparseMemory(s.volume_granules[granule]);
+            s.volume_granules[granule] = VK_NULL_HANDLE;
+            s.bound_bytes -= granule_bytes;
+        }
+    };
+    for (const u32 slab : slabs) {
+        const u32 z_begin = slab * slab_depth;
+        if (z_begin >= depth) {
+            continue;
+        }
+        const u32 z_end = (std::min)(z_begin + slab_depth, depth);
+        for (u32 granule = z_begin / s.tile_depth; granule <= (z_end - 1) / s.tile_depth;
+             ++granule) {
+            if (granule >= s.volume_granules.size() ||
+                s.volume_granules[granule] != VK_NULL_HANDLE) {
+                continue;
+            }
+            const VkMemoryRequirements requirements{
+                .size = granule_bytes,
+                .alignment = tile,
+                .memoryTypeBits = s.requirements.memoryTypeBits,
+            };
+            VkDeviceMemory memory{};
+            VkDeviceSize offset{};
+            const VmaAllocation allocation =
+                s.allocator->AllocateSparseMemory(requirements, memory, offset);
+            if (allocation == VK_NULL_HANDLE) {
+                LOG_WARNING(Render_Vulkan, "Sparse volume {:#x}: out of device memory", gpu_addr);
+                roll_back();
+                return false;
+            }
+            s.volume_granules[granule] = allocation;
+            s.bound_bytes += granule_bytes;
+            fresh.push_back(granule);
+            const u32 z = granule * s.tile_depth;
+            image_binds.push_back(VkSparseImageMemoryBind{
+                .subresource{
+                    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .mipLevel = 0,
+                    .arrayLayer = 0,
+                },
+                .offset{0, 0, static_cast<s32>(z)},
+                .extent{s.width, s.height, (std::min)(s.tile_depth, depth - z)},
+                .memory = memory,
+                .memoryOffset = offset,
+                .flags = 0,
+            });
+        }
+    }
+    if (image_binds.empty()) {
+        return true;
+    }
+    const VkSparseImageMemoryBindInfo image_bind_info{
+        .image = *original_image,
+        .bindCount = static_cast<u32>(image_binds.size()),
+        .pBinds = image_binds.data(),
+    };
+    const VkBindSparseInfo bind_info{
+        .sType = VK_STRUCTURE_TYPE_BIND_SPARSE_INFO,
+        .pNext = nullptr,
+        .waitSemaphoreCount = 0,
+        .pWaitSemaphores = nullptr,
+        .bufferBindCount = 0,
+        .pBufferBinds = nullptr,
+        .imageOpaqueBindCount = 0,
+        .pImageOpaqueBinds = nullptr,
+        .imageBindCount = 1,
+        .pImageBinds = &image_bind_info,
+        .signalSemaphoreCount = 0,
+        .pSignalSemaphores = nullptr,
+    };
+    // Bound before the command buffer that uploads the slabs is submitted (as BindTiles).
+    const Nx2Sampler::ScopedMicros bind_time{Nx2Sampler::g_sparse_bind_us, &Nx2Sampler::g_sparse_binds};
+    vk::Fence fence = device.GetLogical().CreateFence(VkFenceCreateInfo{
+        .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+    });
+    VkResult result;
+    {
+        std::scoped_lock lock{scheduler->submit_mutex};
+        result = device.GetGraphicsQueue().BindSparse(bind_info, *fence);
+    }
+    bind_time.Split(Nx2Sampler::g_sparse_call_us);
+    if (result != VK_SUCCESS) {
+        LOG_ERROR(Render_Vulkan, "Sparse volume {:#x}: binding failed ({})", gpu_addr,
+                  static_cast<int>(result));
+        roll_back();
+        return false;
+    }
+    fence.Wait();
     return true;
 }
 

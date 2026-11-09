@@ -107,6 +107,7 @@ struct UnswizzlePlan {
 struct VolumeSlabs {
     u64 slab_bytes{0};
     u32 count{0};
+    u32 slab_depth{0}; ///< Slices in a full slab
 };
 [[nodiscard]] VolumeSlabs GetVolumeSlabs(const ImageInfo& info);
 
