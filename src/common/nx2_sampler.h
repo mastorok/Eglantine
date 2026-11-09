@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -34,7 +35,11 @@ struct GuestSample {
     std::uint64_t pc{};
     std::uint64_t lr{};
     std::uint64_t sp{};
+    std::uint64_t fp{};
     std::uint64_t thread_id{}; ///< Guest thread running on the core
+    /// Return addresses along the frame pointer chain (filled by the sampler), innermost first.
+    std::array<std::uint64_t, 10> chain{};
+    std::uint32_t chain_depth{};
 };
 
 /// Registered by the kernel: reads the guest state of core `core`. Called with that core's host
@@ -46,6 +51,17 @@ void SetGuestProbe(std::function<bool(unsigned core, GuestSample&)> probe);
 /// Registered by the kernel: reads guest memory. The profile of the guest cores then also keeps the
 /// code around their hottest addresses (<out>.guest_code.txt), to read without the game's files.
 void SetGuestMemoryReader(std::function<bool(std::uint64_t address, void* data, std::size_t size)> reader);
+
+/// Called by the kernel when a guest thread is created (svcCreateThread). With EDEN_NX2_SAMPLE,
+/// the thread table (<out>.guest_threads.txt) lists them: entry point, argument, priority, core.
+void NoteGuestThread(std::uint64_t id, std::uint64_t creator, std::uint64_t entry,
+                     std::uint64_t arg, std::int32_t priority, std::int32_t core, std::uint64_t tls);
+
+/// The guest thread whose service request the calling host thread is handling (nvdrv ioctls).
+void SetClientThread(std::uint64_t id);
+
+/// A GPFIFO submission with `entries` pushbuffer entries, credited to the client thread.
+void NoteGpuSubmit(std::uint32_t entries);
 
 /// Samples the named threads for `seconds` now (blocking), writes the report to `out` (and
 /// the folded stacks to `out`.folded) and returns the report.

@@ -6,6 +6,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "common/logging.h"
+#include "common/nx2_sampler.h"
 #include "common/scope_exit.h"
 #include "common/string_util.h"
 #include "core/core.h"
@@ -62,6 +63,7 @@ void NVDRV::ServiceError(HLERequestContext& ctx, NvResult result) {
 
 void NVDRV::Ioctl1(HLERequestContext& ctx) {
     IPC::RequestParser rp{ctx};
+    Nx2Sampler::SetClientThread(ctx.GetThread().GetThreadId());
     const auto fd = rp.Pop<DeviceFD>();
     const auto command = rp.PopRaw<Ioctl>();
     LOG_DEBUG(Service_NVDRV, "called fd={}, ioctl={:#08x}", fd, command.raw);
@@ -88,6 +90,7 @@ void NVDRV::Ioctl1(HLERequestContext& ctx) {
 
 void NVDRV::Ioctl2(HLERequestContext& ctx) {
     IPC::RequestParser rp{ctx};
+    Nx2Sampler::SetClientThread(ctx.GetThread().GetThreadId());
     const auto fd = rp.Pop<DeviceFD>();
     const auto command = rp.PopRaw<Ioctl>();
     LOG_DEBUG(Service_NVDRV, "called fd={}, ioctl={:#08x}", fd, command.raw);
@@ -115,6 +118,7 @@ void NVDRV::Ioctl2(HLERequestContext& ctx) {
 
 void NVDRV::Ioctl3(HLERequestContext& ctx) {
     IPC::RequestParser rp{ctx};
+    Nx2Sampler::SetClientThread(ctx.GetThread().GetThreadId());
     const auto fd = rp.Pop<DeviceFD>();
     const auto command = rp.PopRaw<Ioctl>();
     LOG_DEBUG(Service_NVDRV, "called fd={}, ioctl={:#08x}", fd, command.raw);

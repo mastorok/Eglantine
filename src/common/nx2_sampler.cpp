@@ -23,6 +23,7 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -53,6 +54,59 @@ struct Sample {
 std::mutex g_guest_probe_mutex;
 std::function<bool(unsigned, GuestSample&)> g_guest_probe;
 std::function<bool(std::uint64_t, void*, std::size_t)> g_guest_reader;
+
+/// Reads guest memory through the reader the kernel registered (false without one).
+bool ReadGuest(std::uint64_t address, void* data, std::size_t size) {
+    const std::scoped_lock reader_lock{g_guest_probe_mutex};
+    return g_guest_reader && g_guest_reader(address, data, size);
+}
+
+// Guest threads created by the game (NoteGuestThread) and the GPU submissions of each guest thread
+// (NoteGpuSubmit); only kept when EDEN_NX2_SAMPLE is set.
+struct GuestThreadInfo {
+    std::uint64_t creator;
+    std::uint64_t entry;
+    std::uint64_t arg;
+    std::int32_t priority;
+    std::int32_t core;
+    std::uint64_t tls;
+    std::chrono::steady_clock::time_point created;
+};
+struct SubmitCount {
+    std::uint64_t submits{};
+    std::uint64_t entries{};
+};
+std::atomic<bool> g_thread_stats{false};
+std::mutex g_threads_mutex;
+std::map<std::uint64_t, GuestThreadInfo> g_guest_threads;
+std::map<std::uint64_t, SubmitCount> g_gpu_submits;
+thread_local std::uint64_t t_client_thread = 0;
+
+/// Return addresses along the frame pointer chain of a guest sample (AArch64 frame records:
+/// [fp] = caller's fp, [fp + 8] = return address). Games built without frame pointers give a short
+/// or nonsensical chain, which the stack checks cut off. The caller holds g_guest_probe_mutex.
+void UnwindGuest(GuestSample& guest) {
+    constexpr std::uint64_t MaxStackSpan = std::uint64_t{16} << 20;
+    guest.chain_depth = 0;
+    if (!g_guest_reader) {
+        return;
+    }
+    std::uint64_t fp = guest.fp;
+    while (guest.chain_depth < guest.chain.size()) {
+        if ((fp & 0xf) != 0 || fp - guest.sp > MaxStackSpan) {
+            break;
+        }
+        std::array<std::uint64_t, 2> record{};
+        if (!g_guest_reader(fp, record.data(), sizeof(record)) || record[1] == 0) {
+            break;
+        }
+        guest.chain[guest.chain_depth++] = record[1];
+        if (record[0] <= fp) {
+            break;
+        }
+        fp = record[0];
+    }
+}
 
 /// The emulated core of a "CPUCore_<n>" host thread, or -1.
 int GuestCoreOf(const std::string& name) {
@@ -442,6 +496,7 @@ void GuestReport(const std::vector<Target>& targets, const std::vector<Sample>& 
         // per 32 bytes, "<address>: <bytes>"), for a disassembler.
         code += fmt::format("=== {}\n", targets[thread].name);
         std::set<std::uint64_t> dumped;
+        std::map<std::uint64_t, unsigned> callees; // bl targets of the hot blocks, by their samples
         for (const auto& [count, block] : top(by_block, 24)) {
             const std::uint64_t start = block >= 0x80 ? block - 0x80 : 0;
             if (!dumped.insert(start).second) {
@@ -460,6 +515,36 @@ void GuestReport(const std::vector<Target>& targets, const std::vector<Sample>& 
             code += fmt::format("# block {:#x}: {} samples\n", block, count);
             for (size_t offset = 0; offset < bytes.size(); offset += 32) {
                 code += fmt::format("{:#x}: ", start + offset);
+                for (size_t i = 0; i < 32; ++i) {
+                    code += fmt::format("{:02x}", bytes[offset + i]);
+                }
+                code += '\n';
+            }
+            for (size_t offset = 0; offset + 4 <= bytes.size(); offset += 4) {
+                std::uint32_t word{};
+                std::memcpy(&word, bytes.data() + offset, sizeof(word));
+                if ((word & 0xfc000000U) == 0x94000000U) { // bl
+                    const std::int64_t delta = static_cast<std::int32_t>(word << 6) >> 6;
+                    callees[static_cast<std::uint64_t>(static_cast<std::int64_t>(start + offset) +
+                                                       delta * 4)] += count;
+                }
+            }
+        }
+        // The functions the hot blocks call: their first 192 bytes, to tell locks, copies and
+        // decompressors from the game's own code.
+        for (const auto& [weight, target] : top(callees, 16)) {
+            bool covered = false;
+            for (const std::uint64_t start : dumped) {
+                covered = covered || (target >= start && target < start + 512);
+            }
+            std::array<unsigned char, 192> bytes{};
+            if (covered || !ReadGuest(target, bytes.data(), bytes.size())) {
+                continue;
+            }
+            code += fmt::format("# callee {:#x}: called from the hot blocks ({} samples)\n", target,
+                                weight);
+            for (size_t offset = 0; offset < bytes.size(); offset += 32) {
+                code += fmt::format("{:#x}: ", target + offset);
                 for (size_t i = 0; i < 32; ++i) {
                     code += fmt::format("{:02x}", bytes[offset + i]);
                 }
@@ -1000,6 +1085,251 @@ struct FrameLog {
     bool opened{};
 };
 
+/// The printable runs (4 characters or more) of a buffer, quoted, for thread names.
+std::string PrintableRuns(const unsigned char* data, size_t size, unsigned limit) {
+    std::string text;
+    unsigned found = 0;
+    size_t i = 0;
+    while (i < size && found < limit) {
+        size_t j = i;
+        while (j < size && data[j] >= 0x20 && data[j] < 0x7f) {
+            ++j;
+        }
+        if (j - i >= 4) {
+            text += fmt::format("{}\"{}\"", found != 0 ? ", " : "",
+                                std::string(reinterpret_cast<const char*>(data) + i,
+                                            (std::min)(j - i, size_t{48})));
+            ++found;
+        }
+        i = j + 1;
+    }
+    return text;
+}
+
+void DumpGuestCode(std::string& code, std::uint64_t start, size_t size, const std::string& title) {
+    std::vector<unsigned char> bytes(size);
+    if (!ReadGuest(start, bytes.data(), bytes.size())) {
+        return;
+    }
+    code += fmt::format("# {}\n", title);
+    for (size_t offset = 0; offset < size; offset += 32) {
+        code += fmt::format("{:#x}: ", start + offset);
+        for (size_t i = 0; i < 32 && offset + i < size; ++i) {
+            code += fmt::format("{:02x}", bytes[offset + i]);
+        }
+        code += '\n';
+    }
+}
+
+// <path>.guest_threads.txt: the guest threads of the game (not the emulated cores): when each was
+// created and from where, what its ThreadType holds (names, code pointers), how many GPU
+// submissions it made, and where it spent its samples (code blocks, call chains, return
+// addresses). <path>.guest_threads_code.txt has the code around the hottest places of the busiest
+// threads and around their most frequent return addresses.
+void GuestThreadReport(const std::vector<Target>& targets, const std::vector<Sample>& samples,
+                       const std::string& path,
+                       const std::map<std::uint64_t, SubmitCount>& submits_before) {
+    struct Agg {
+        unsigned count{};
+        std::map<int, unsigned> cores;
+        std::map<std::uint64_t, unsigned> blocks;
+        std::map<std::vector<std::uint64_t>, unsigned> stacks;
+        std::map<std::uint64_t, unsigned> inclusive;
+    };
+    std::map<std::uint64_t, Agg> threads;
+    std::vector<unsigned> per_target(targets.size());
+    unsigned total = 0;
+    for (const Sample& sample : samples) {
+        if (!sample.has_guest || sample.thread >= targets.size()) {
+            continue;
+        }
+        ++per_target[sample.thread];
+        ++total;
+        Agg& agg = threads[sample.guest.thread_id];
+        ++agg.count;
+        ++agg.cores[GuestCoreOf(targets[sample.thread].name)];
+        const std::uint64_t block = sample.guest.pc & ~std::uint64_t{0xff};
+        ++agg.blocks[block];
+        std::vector<std::uint64_t> stack{block};
+        std::set<std::uint64_t> seen;
+        for (std::uint32_t i = 0; i < sample.guest.chain_depth; ++i) {
+            if (i < 6) {
+                stack.push_back(sample.guest.chain[i]);
+            }
+            if (seen.insert(sample.guest.chain[i]).second) {
+                ++agg.inclusive[sample.guest.chain[i]];
+            }
+        }
+        ++agg.stacks[stack];
+    }
+    if (total == 0) {
+        return;
+    }
+    const unsigned window = *std::max_element(per_target.begin(), per_target.end());
+    std::map<std::uint64_t, GuestThreadInfo> registry;
+    std::map<std::uint64_t, SubmitCount> submits;
+    {
+        const std::scoped_lock threads_lock{g_threads_mutex};
+        registry = g_guest_threads;
+        submits = g_gpu_submits;
+    }
+    for (auto& [id, count] : submits) {
+        if (const auto it = submits_before.find(id); it != submits_before.end()) {
+            count.submits -= it->second.submits;
+            count.entries -= it->second.entries;
+        }
+    }
+    const auto top = [](const auto& counts, size_t limit) {
+        std::vector<std::pair<unsigned, typename std::decay_t<decltype(counts)>::key_type>> sorted;
+        for (const auto& [key, value] : counts) {
+            sorted.emplace_back(value, key);
+        }
+        std::sort(sorted.rbegin(), sorted.rend());
+        sorted.resize((std::min)(limit, sorted.size()));
+        return sorted;
+    };
+    std::vector<std::pair<unsigned, std::uint64_t>> order;
+    for (const auto& [id, agg] : threads) {
+        order.emplace_back(agg.count, id);
+    }
+    std::sort(order.rbegin(), order.rend());
+    std::set<std::uint64_t> shown;
+    for (size_t i = 0; i < (std::min)(size_t{24}, order.size()); ++i) {
+        shown.insert(order[i].second);
+    }
+    for (const auto& [id, count] : submits) {
+        if (count.submits != 0) {
+            shown.insert(id);
+        }
+    }
+
+    std::string text = fmt::format(
+        "{} guest samples over {} cores; a window is {} samples, so 1.00 below is one core "
+        "busy for the whole window\n\n",
+        total, targets.size(), window);
+    text += "-- guest threads created by the game (id: creator, created at, entry, arg, priority, "
+            "core | samples, GPU submits in the window)\n";
+    for (const auto& [id, info] : registry) {
+        const auto found = threads.find(id);
+        const auto sub = submits.find(id);
+        text += fmt::format(
+            "  thread {:>4}: by {:>4}, at {:7.2f} s, entry {:#x}, arg {:#x}, prio {:>2}, core {} | "
+            "{} samples, {} submits\n",
+            id, info.creator,
+            std::chrono::duration<double>(info.created - g_process_start).count(), info.entry,
+            info.arg, info.priority, info.core, found != threads.end() ? found->second.count : 0U,
+            sub != submits.end() ? sub->second.submits : 0U);
+    }
+    text += "\n-- GPU submissions in the window (thread id: submits, pushbuffer entries)\n";
+    for (const auto& [id, count] : submits) {
+        if (count.submits != 0) {
+            text += fmt::format("  thread {:>4}: {} submits, {} entries\n", id, count.submits,
+                                count.entries);
+        }
+    }
+
+    std::string code;
+    unsigned code_threads = 0;
+    for (const auto& entry : order) {
+        const std::uint64_t id = entry.second;
+        if (shown.find(id) == shown.end()) {
+            continue;
+        }
+        const Agg& agg = threads[id];
+        const bool dump_code = code_threads++ < 8;
+        if (dump_code) {
+            code += fmt::format("=== thread {}\n", id);
+        }
+        text += fmt::format("\n=== guest thread {}: {} samples = {:.2f} of a core ({:.1f}% of the "
+                            "guest samples)\n",
+                            id, agg.count, static_cast<double>(agg.count) / (std::max)(window, 1U),
+                            100.0 * agg.count / total);
+        text += "  cores:";
+        for (const auto& [core, n] : agg.cores) {
+            text += fmt::format(" CPUCore_{} {}", core, n);
+        }
+        text += '\n';
+        if (const auto sub = submits.find(id); sub != submits.end() && sub->second.submits != 0) {
+            text += fmt::format("  GPU submits in the window: {} ({} entries)\n", sub->second.submits,
+                                sub->second.entries);
+        }
+        if (const auto it = registry.find(id); it != registry.end()) {
+            const GuestThreadInfo& info = it->second;
+            text += fmt::format("  created by thread {} with entry {:#x}, arg {:#x}, priority {}, "
+                                "core {}, tls {:#x}\n",
+                                info.creator, info.entry, info.arg, info.priority, info.core,
+                                info.tls);
+            // The argument of a Nintendo thread is its ThreadType (name, function, stack...).
+            std::array<unsigned char, 0x200> type{};
+            if (ReadGuest(info.arg, type.data(), type.size())) {
+                text += fmt::format("  arg strings: {}\n",
+                                    PrintableRuns(type.data(), type.size(), 6));
+                text += "  arg words:";
+                unsigned printed = 0;
+                for (size_t offset = 0; offset + 8 <= type.size() && printed < 40; offset += 8) {
+                    std::uint64_t value{};
+                    std::memcpy(&value, type.data() + offset, sizeof(value));
+                    if (value >= 0x10000 && value < (std::uint64_t{1} << 40)) {
+                        text += fmt::format(" +{:#x}={:#x}", offset, value);
+                        ++printed;
+                    }
+                }
+                text += '\n';
+            }
+            std::uint64_t type_pointer{};
+            std::array<unsigned char, 0x200> tls_type{};
+            if (info.tls != 0 && ReadGuest(info.tls + 0x1f8, &type_pointer, sizeof(type_pointer)) &&
+                type_pointer != info.arg && ReadGuest(type_pointer, tls_type.data(), tls_type.size())) {
+                text += fmt::format("  TLS ThreadType {:#x} strings: {}\n", type_pointer,
+                                    PrintableRuns(tls_type.data(), tls_type.size(), 6));
+            }
+            if (dump_code) {
+                DumpGuestCode(code, info.entry & ~std::uint64_t{0x1f}, 128,
+                              fmt::format("thread {} entry {:#x}", id, info.entry));
+            }
+        } else {
+            text += "  not created by svcCreateThread while the sampler ran (main thread?)\n";
+        }
+        text += "  -- 256-byte blocks of guest code (address: samples)\n";
+        for (const auto& [n, block] : top(agg.blocks, 12)) {
+            text += fmt::format("    {:#014x} {:>7} {:5.1f}%\n", block, n, 100.0 * n / agg.count);
+        }
+        text += "  -- call chains (code block <- return addresses, innermost first)\n";
+        for (const auto& [n, stack] : top(agg.stacks, 12)) {
+            text += fmt::format("    {:>7} {:5.1f}%  {:#x}", n, 100.0 * n / agg.count, stack[0]);
+            for (size_t i = 1; i < stack.size(); ++i) {
+                text += fmt::format(" <- {:#x}", stack[i]);
+            }
+            text += '\n';
+        }
+        text += "  -- return addresses in the chains (address: samples that had it)\n";
+        const auto inclusive = top(agg.inclusive, 24);
+        for (const auto& [n, address] : inclusive) {
+            text += fmt::format("    {:#014x} {:>7} {:5.1f}%\n", address, n, 100.0 * n / agg.count);
+        }
+        if (dump_code) {
+            for (const auto& [n, block] : top(agg.blocks, 4)) {
+                DumpGuestCode(code, block >= 0x80 ? block - 0x80 : 0, 512,
+                              fmt::format("block {:#x}: {} samples", block, n));
+            }
+            for (size_t i = 0; i < (std::min)(size_t{16}, inclusive.size()); ++i) {
+                const std::uint64_t address = inclusive[i].second;
+                DumpGuestCode(code, (address - 96) & ~std::uint64_t{0x1f}, 192,
+                              fmt::format("return address {:#x}: {} samples", address,
+                                          inclusive[i].first));
+            }
+        }
+    }
+    if (std::FILE* const file = std::fopen((path + ".guest_threads.txt").c_str(), "w")) {
+        std::fputs(text.c_str(), file);
+        std::fclose(file);
+    }
+    if (std::FILE* const file = std::fopen((path + ".guest_threads_code.txt").c_str(), "w")) {
+        std::fputs(code.c_str(), file);
+        std::fclose(file);
+    }
+}
+
 std::string SampleThreads(const std::vector<std::string>& patterns, double seconds,
                           const std::string& out) {
     // EDEN_NX2_SAMPLE_BEEP=0 silences the tones that mark the start (two rising) and the end (one
@@ -1040,8 +1370,17 @@ std::string SampleThreads(const std::vector<std::string>& patterns, double secon
     // without a call still running; it never waits for the paused thread.
     const auto guest_probe = [](unsigned core, GuestSample& out) {
         const std::scoped_lock probe_lock{g_guest_probe_mutex};
-        return g_guest_probe && g_guest_probe(core, out);
+        if (!g_guest_probe || !g_guest_probe(core, out)) {
+            return false;
+        }
+        UnwindGuest(out);
+        return true;
     };
+    std::map<std::uint64_t, SubmitCount> submits_before;
+    {
+        const std::scoped_lock threads_lock{g_threads_mutex};
+        submits_before = g_gpu_submits;
+    }
     std::vector<int> guest_core(targets.size(), -1);
     for (unsigned i = 0; i < targets.size(); ++i) {
         guest_core[i] = GuestCoreOf(targets[i].name);
@@ -1070,6 +1409,7 @@ std::string SampleThreads(const std::vector<std::string>& patterns, double secon
     }
     std::string text = Report(targets, samples, out.c_str());
     GuestReport(targets, samples, out);
+    GuestThreadReport(targets, samples, out, submits_before);
     std::fprintf(stderr, "nx2 sampler: %zu samples written to %s\n", samples.size(), out.c_str());
     LOG_INFO(Common, "nx2 sampler: {} samples written to {}", samples.size(), out);
     for (const auto& target : targets) {
@@ -1085,6 +1425,30 @@ std::string SampleThreads(const std::vector<std::string>& patterns, double secon
 
 std::string Sample(const char* names, double seconds, const std::string& out) {
     return SampleThreads(SplitNames(names), seconds, out);
+}
+
+void NoteGuestThread(std::uint64_t id, std::uint64_t creator, std::uint64_t entry,
+                     std::uint64_t arg, std::int32_t priority, std::int32_t core, std::uint64_t tls) {
+    if (!g_thread_stats.load(std::memory_order_relaxed)) {
+        return;
+    }
+    const std::scoped_lock threads_lock{g_threads_mutex};
+    g_guest_threads[id] = GuestThreadInfo{creator, entry, arg, priority, core, tls,
+                                          std::chrono::steady_clock::now()};
+}
+
+void SetClientThread(std::uint64_t id) {
+    t_client_thread = id;
+}
+
+void NoteGpuSubmit(std::uint32_t entries) {
+    if (!g_thread_stats.load(std::memory_order_relaxed)) {
+        return;
+    }
+    const std::scoped_lock threads_lock{g_threads_mutex};
+    SubmitCount& count = g_gpu_submits[t_client_thread];
+    ++count.submits;
+    count.entries += entries;
 }
 
 void SetGuestProbe(std::function<bool(unsigned, GuestSample&)> probe) {
@@ -1109,6 +1473,7 @@ void StartFromEnvironment() {
     if (names == nullptr || *names == '\0') {
         return;
     }
+    g_thread_stats.store(true, std::memory_order_relaxed);
     const char* out = std::getenv("EDEN_NX2_SAMPLE_OUT");
     // EDEN_NX2_SAMPLE_TRIGGER=<file>: the measurement starts when that file appears (it is
     // deleted at once), instead of EDEN_NX2_SAMPLE_START seconds after the launch, so a player
@@ -1211,6 +1576,10 @@ void NotePresent(long long frame_us, long long fence_us, long long composite_us,
 namespace Nx2Sampler {
 void SetGuestProbe(std::function<bool(unsigned, GuestSample&)>) {}
 void SetGuestMemoryReader(std::function<bool(std::uint64_t, void*, std::size_t)>) {}
+void NoteGuestThread(std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::int32_t,
+                     std::int32_t, std::uint64_t) {}
+void SetClientThread(std::uint64_t) {}
+void NoteGpuSubmit(std::uint32_t) {}
 void StartFromEnvironment() {}
 std::string Sample(const char*, double, const std::string&) {
     return "the sampler is Windows only";

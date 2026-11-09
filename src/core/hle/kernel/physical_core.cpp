@@ -37,6 +37,7 @@ bool PhysicalCore::SampleGuest(Nx2Sampler::GuestSample& out) const {
     out.pc = context.pc;
     out.lr = context.lr;
     out.sp = context.sp;
+    out.fp = context.fp;
     out.thread_id = m_current_thread->GetThreadId();
     return true;
 }

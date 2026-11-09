@@ -11,6 +11,7 @@
 #include <vector>
 #include "common/assert.h"
 #include "common/logging.h"
+#include "common/nx2_sampler.h"
 #include "core/core.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/service/nvdrv/core/container.h"
@@ -412,6 +413,8 @@ NvResult nvhost_gpu::SubmitGPFIFOImpl(IoctlSubmitGpfifo& params, Tegra::CommandL
               params.num_entries, params.flags.raw);
 
     auto& gpu = system.GPU();
+
+    Nx2Sampler::NoteGpuSubmit(static_cast<u32>(entries.command_lists.size()));
 
     std::scoped_lock lock(channel_mutex);
 

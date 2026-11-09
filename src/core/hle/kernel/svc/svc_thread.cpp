@@ -7,6 +7,7 @@
 #include <chrono>
 #include <thread>
 
+#include "common/nx2_sampler.h"
 #include "common/scope_exit.h"
 #include "core/core.h"
 #include "core/core_timing.h"
@@ -95,6 +96,10 @@ Result CreateThread(Core::System& system, Handle* out_handle, u64 entry_point, u
 
     // Pass the thread handle to the thread local region.
     process.GetMemory().Write32(GetInteger(thread->GetTlsAddress()) + 0x110, *out_handle);
+
+    Nx2Sampler::NoteGuestThread(thread->GetThreadId(), GetCurrentThread(kernel).GetThreadId(),
+                                entry_point, arg, priority, core_id,
+                                GetInteger(thread->GetTlsAddress()));
 
     R_SUCCEED();
 }

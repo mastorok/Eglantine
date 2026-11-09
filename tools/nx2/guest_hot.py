@@ -9,6 +9,13 @@ addresses) and <profil.txt>.guest_code.txt (the code around the hottest blocks).
 core, the hottest blocks as "module+offset" (module bases from the journal's "Module <name> loaded
 at 0x..." lines) followed by the disassembly of each block with the sample count of every address
 that was hit.
+
+  guest_hot.py <profil.txt> --journal journal.txt --threads
+      the thread table (<profil.txt>.guest_threads.txt: creation, GPU submits, blocks, call chains)
+      with every guest address written as module+offset.
+  guest_hot.py <profil.txt> --journal journal.txt --segments [code|threads] [--filter text]
+      disassembles every captured code segment (callees of the hot blocks, code around the return
+      addresses and entry points of the busiest threads) whose title or thread contains `text`.
 """
 import argparse
 import re
@@ -76,6 +83,35 @@ def parse_code(path):
     return code
 
 
+def parse_segments(path):
+    """[(section, title, start, bytes)] of a guest_code / guest_threads_code file."""
+    segments, section, title, start, chunks = [], None, None, None, []
+
+    def close():
+        if title is not None and chunks:
+            segments.append((section, title, start, b"".join(chunks)))
+
+    for line in Path(path).read_text().splitlines():
+        if line.startswith("=== "):
+            close()
+            section, title, chunks = line[4:].strip(), None, []
+        elif line.startswith("# "):
+            close()
+            title, start, chunks = line[2:].strip(), None, []
+        elif title is not None and re.match(r"0x[0-9a-f]+: [0-9a-f]+$", line):
+            addr, data = line.split(": ")
+            if start is None:
+                start = int(addr, 16)
+            chunks.append(bytes.fromhex(data))
+    close()
+    return segments
+
+
+def relocate(text, mods):
+    """Every 0x... address of at least 8 digits as module+offset."""
+    return re.sub(r"0x[0-9a-f]{8,}", lambda m: where(int(m.group(0), 16), mods), text)
+
+
 def disassemble(objdump, base, data):
     """Assembles the words as .inst directives (so every word keeps its place) and disassembles."""
     clang = "clang"
@@ -101,8 +137,25 @@ def main():
     ap.add_argument("--clang", default="clang")
     ap.add_argument("--core")
     ap.add_argument("--blocks", type=int, default=8)
+    ap.add_argument("--threads", action="store_true")
+    ap.add_argument("--segments", nargs="?", const="code", choices=["code", "threads"])
+    ap.add_argument("--filter", default="")
     args = ap.parse_args()
     mods = modules(args.journal)
+    if args.threads:
+        print(relocate(Path(args.profile + ".guest_threads.txt").read_text(), mods))
+        return 0
+    if args.segments:
+        suffix = ".guest_code.txt" if args.segments == "code" else ".guest_threads_code.txt"
+        for section, title, start, data in parse_segments(args.profile + suffix):
+            if args.filter not in f"{section} {title}":
+                continue
+            print("=" * 100)
+            print(relocate(f"{section}: {title} (starts {start:#x})", mods))
+            for line in disassemble(args.objdump, start, data).splitlines():
+                if re.match(r"\s*[0-9a-f]+:\s", line):
+                    print(relocate(line, mods))
+        return 0
     guest = parse_guest(args.profile + ".guest.txt")
     code = parse_code(args.profile + ".guest_code.txt")
     for core, info in guest.items():
