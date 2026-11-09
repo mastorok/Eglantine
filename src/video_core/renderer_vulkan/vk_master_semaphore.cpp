@@ -4,9 +4,11 @@
 // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
 #include <thread>
 
 #include <ranges>
+#include "common/logging.h"
 #include "common/settings.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -103,9 +105,46 @@ void MasterSemaphore::Wait(u64 tick) {
         return;
     }
 
-    // If none of the above is hit, fallback to a regular wait
+    // If none of the above is hit, fallback to a regular wait. It runs in slices so that a long one
+    // (the multi-second stalls with the GPU idle) can say what the queue looked like.
     try {
-        while (!semaphore.Wait(tick)) {
+        const auto begin = std::chrono::steady_clock::now();
+        const auto since_epoch = [](std::chrono::steady_clock::time_point point) {
+            return static_cast<s64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                        point.time_since_epoch())
+                                        .count());
+        };
+        static std::atomic<u32> logged{};
+        auto next_report = begin + std::chrono::milliseconds{500};
+        while (!semaphore.Wait(tick, 100'000'000)) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now < next_report || logged.load(std::memory_order_relaxed) >= 300) {
+                continue;
+            }
+            next_report = now + std::chrono::milliseconds{1000};
+            logged.fetch_add(1, std::memory_order_relaxed);
+            const s64 now_ns = since_epoch(now);
+            const s64 begin_ns = submit_begin_ns.load(std::memory_order_relaxed);
+            const s64 end_ns = submit_end_ns.load(std::memory_order_relaxed);
+            LOG_WARNING(Render_Vulkan,
+                        "Waiting {} ms for GPU tick {}: semaphore counter {}, known {}, current {}; "
+                        "last queue submission was tick {}, {} ms ago, {} (queue submissions: {}, "
+                        "longest {} us)",
+                        std::chrono::duration_cast<std::chrono::milliseconds>(now - begin).count(),
+                        tick, semaphore.GetCounter(), KnownGpuTick(), CurrentTick(),
+                        submit_tick.load(std::memory_order_relaxed), (now_ns - begin_ns) / 1'000'000,
+                        begin_ns > end_ns ? "still inside the driver"
+                                          : "returned after its call",
+                        submit_count.load(std::memory_order_relaxed),
+                        submit_max_us.load(std::memory_order_relaxed));
+        }
+        const auto total = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::steady_clock::now() - begin)
+                               .count();
+        if (total >= 500 && logged.load(std::memory_order_relaxed) < 300) {
+            logged.fetch_add(1, std::memory_order_relaxed);
+            LOG_WARNING(Render_Vulkan, "GPU tick {} reached after {} ms (counter {}, current {})", tick,
+                        total, semaphore.GetCounter(), CurrentTick());
         }
     } catch (const vk::Exception& exception) {
         // The throw ends the process; say why first (a device loss reached nothing else here).
@@ -119,12 +158,34 @@ void MasterSemaphore::Wait(u64 tick) {
 VkResult MasterSemaphore::SubmitQueue(vk::CommandBuffer& cmdbuf, vk::CommandBuffer& upload_cmdbuf,
                                       VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
                                       u64 host_tick) {
-    if (semaphore) {
-        return SubmitQueueTimeline(cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore,
-                                   host_tick);
-    } else {
-        return SubmitQueueFence(cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore, host_tick);
+    const auto begin = std::chrono::steady_clock::now();
+    const auto since_epoch = [](std::chrono::steady_clock::time_point point) {
+        return static_cast<s64>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(point.time_since_epoch()).count());
+    };
+    submit_tick.store(host_tick, std::memory_order_relaxed);
+    submit_begin_ns.store(since_epoch(begin), std::memory_order_release);
+    const VkResult result =
+        semaphore ? SubmitQueueTimeline(cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore,
+                                        host_tick)
+                  : SubmitQueueFence(cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore,
+                                     host_tick);
+    const auto end = std::chrono::steady_clock::now();
+    submit_end_ns.store(since_epoch(end), std::memory_order_release);
+    submit_count.fetch_add(1, std::memory_order_relaxed);
+    const u64 micros =
+        static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(end - begin).count());
+    if (micros > submit_max_us.load(std::memory_order_relaxed)) {
+        submit_max_us.store(micros, std::memory_order_relaxed);
     }
+    if (micros >= 50'000) {
+        static std::atomic<u32> slow_logged{};
+        if (slow_logged.fetch_add(1, std::memory_order_relaxed) < 100) {
+            LOG_WARNING(Render_Vulkan, "vkQueueSubmit for tick {} took {} ms", host_tick,
+                        micros / 1000);
+        }
+    }
+    return result;
 }
 
 static constexpr VkPipelineStageFlags wait_stage_mask = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |

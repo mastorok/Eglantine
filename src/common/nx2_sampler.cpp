@@ -464,8 +464,8 @@ std::string Report(const std::vector<Target>& targets, const std::vector<Sample>
 const auto g_process_start = std::chrono::steady_clock::now();
 std::atomic<long long> g_last_present_ns{0};
 
-constexpr std::array<const char*, 6> StallGroups{"GPU",     "GPUBack", "VulkanWorker",
-                                                 "CPUCores", "Workers", "Service"};
+constexpr std::array<const char*, 7> StallGroups{"GPU",     "GPUBack", "VulkanWorker", "CPUCores",
+                                                 "Workers", "Service", "Others"};
 
 struct StallTarget {
     HANDLE handle;
@@ -525,7 +525,12 @@ int StallGroupOf(const std::string& name) {
     if (name.starts_with("Service") || name.starts_with("HLE") || name.starts_with("Hle")) {
         return 5;
     }
-    return -1;
+    // EDEN_NX2_STALL_OTHERS=1: every other thread too, the graphics driver's among them.
+    static const bool others = [] {
+        const char* value = std::getenv("EDEN_NX2_STALL_OTHERS");
+        return value != nullptr && *value != '\0' && *value != '0';
+    }();
+    return others ? 6 : -1;
 }
 
 void CloseStallTargets(std::vector<StallTarget>& targets) {
@@ -678,7 +683,7 @@ void ReportStall(unsigned index, double at_seconds, long long gap_ms, unsigned r
             addresses[signature] = entry.address;
         }
         std::sort(ranked.rbegin(), ranked.rend());
-        const size_t shown = group <= 2 ? 3 : 2;
+        const size_t shown = group <= 2 ? 3 : group == 6 ? 8 : 2;
         for (size_t i = 0; i < (std::min)(shown, ranked.size()); ++i) {
             LOG_INFO(Common, "  {} {:.0f}% of {}: {}  [{}]", StallGroups[group],
                      100.0 * ranked[i].first / total, total, ranked[i].second,

@@ -10,6 +10,8 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <mutex>
+#include <set>
 #include <span>
 #include <thread>
 #include <vector>
@@ -1304,6 +1306,52 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         if ((env.ShaderStage() == Shader::Stage::Task ||
              env.ShaderStage() == Shader::Stage::Mesh) &&
             !device.IsExtMeshShaderSupported()) {
+            // EDEN_NX2_MESH_PROBE=1: describe each skipped program once (what an emulation
+            // through compute shaders would have to hold), then skip it as before.
+            static const bool mesh_probe = std::getenv("EDEN_NX2_MESH_PROBE") != nullptr;
+            static std::mutex probe_mutex;
+            static std::set<u64> probed;
+            if (mesh_probe) {
+                bool first{};
+                {
+                    const std::scoped_lock probe_lock{probe_mutex};
+                    first = probed.insert(key.unique_hashes[index]).second;
+                }
+                if (first) {
+                    try {
+                        const u32 probe_offset{
+                            static_cast<u32>(env.StartAddress() + sizeof(Shader::ProgramHeader))};
+                        Shader::Maxwell::Flow::CFG probe_cfg(env, pools.flow_block, probe_offset,
+                                                             index == 0);
+                        programs[index] =
+                            TranslateProgram(pools.inst, pools.block, env, probe_cfg, host_info);
+                        const Shader::IR::Program& mesh_program{programs[index]};
+                        const Shader::Info& probe_info{mesh_program.info};
+                        LOG_INFO(
+                            Render_Vulkan,
+                            "mesh probe {:016x}: {} workgroup {} payload {} words, vertices {}, "
+                            "primitives {}, topology {}, vertex lines {}, primitive lines {}, "
+                            "shared {} B, local {} B, cbufs {}, ssbos {}, textures {}, images {}, "
+                            "global memory {}, derivatives {}, subgroup shuffles {}, "
+                            "pixel stage {:016x}",
+                            key.unique_hashes[index],
+                            env.ShaderStage() == Shader::Stage::Task ? "task" : "mesh",
+                            mesh_program.workgroup_size[0], mesh_program.mesh.payload_words,
+                            mesh_program.mesh.max_vertices, mesh_program.mesh.max_primitives,
+                            mesh_program.mesh.topology, mesh_program.mesh.vertex_lines.size(),
+                            mesh_program.mesh.primitive_lines.size(),
+                            mesh_program.shared_memory_size, mesh_program.local_memory_size,
+                            probe_info.constant_buffer_descriptors.size(),
+                            probe_info.storage_buffers_descriptors.size(),
+                            probe_info.texture_descriptors.size(), probe_info.image_descriptors.size(),
+                            probe_info.uses_global_memory, probe_info.uses_derivatives,
+                            probe_info.uses_subgroup_shuffles, key.unique_hashes[5]);
+                    } catch (const std::exception& exception) {
+                        LOG_WARNING(Render_Vulkan, "mesh probe {:016x} failed: {}",
+                                    key.unique_hashes[index], exception.what());
+                    }
+                }
+            }
             return nullptr;
         }
 

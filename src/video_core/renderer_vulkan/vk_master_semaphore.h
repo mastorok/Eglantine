@@ -82,6 +82,14 @@ private:
     std::deque<vk::Fence> free_queue; ///< Holds available fences for submission.
     std::jthread debug_thread;        ///< Debug thread to workaround validation layer bugs.
     std::jthread wait_thread;         ///< Helper thread that waits for submitted fences.
+
+    // Diagnostics for the multi-second waits (steady clock nanoseconds): the last queue
+    // submission, so a long wait can say whether the driver was still inside it.
+    std::atomic<s64> submit_begin_ns{0};
+    std::atomic<s64> submit_end_ns{0};
+    std::atomic<u64> submit_tick{0};
+    std::atomic<u64> submit_max_us{0};
+    std::atomic<u32> submit_count{0};
 };
 
 } // namespace Vulkan

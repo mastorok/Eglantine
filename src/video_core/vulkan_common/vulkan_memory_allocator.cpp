@@ -6,7 +6,9 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
+#include <chrono>
 #include <limits>
 #include <optional>
 #include <type_traits>
@@ -85,6 +87,30 @@ namespace {
         }
         return VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
     }
+
+// Logs the images whose creation took long (the driver can wait for the GPU while it makes room).
+class SlowImageLog {
+public:
+    explicit SlowImageLog(const VkImageCreateInfo& ci_)
+        : ci{ci_}, begin{std::chrono::steady_clock::now()} {}
+
+    ~SlowImageLog() {
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - begin)
+                            .count();
+        static std::atomic<u32> logged{};
+        if (ms >= 25 && logged.fetch_add(1, std::memory_order_relaxed) < 150) {
+            LOG_WARNING(Render_Vulkan,
+                        "Creating an image {}x{}x{} ({} levels, {} layers, format {}) took {} ms",
+                        ci.extent.width, ci.extent.height, ci.extent.depth, ci.mipLevels,
+                        ci.arrayLayers, static_cast<u32>(ci.format), ms);
+        }
+    }
+
+private:
+    const VkImageCreateInfo& ci;
+    std::chrono::steady_clock::time_point begin;
+};
 } // namespace
 
 //MemoryCommit is now VMA-backed
@@ -208,6 +234,7 @@ MemoryAllocator::~MemoryAllocator() = default;
 
 vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicated) const
 {
+    const SlowImageLog slow_log{ci};
     const VmaAllocationCreateInfo alloc_ci = {
             // Best fit: images freed by the thousand leave holes in the blocks, which new ones
             // should fill before VMA takes another block.
