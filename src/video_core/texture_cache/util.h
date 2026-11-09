@@ -79,6 +79,7 @@ struct UnswizzleRowRun {
     u32 tile_rows;
     Extent3D block;
     u32 run_alignment;
+    u32 depth = 1; ///< Slices of the run (volumes: whole slabs)
 };
 
 struct UnswizzlePlan {
@@ -92,6 +93,26 @@ struct UnswizzlePlan {
 /// Plans the unswizzle copies and runs for a 2D block-linear image overlapping `dirty_ranges`.
 /// Computes destination offsets and required buffer size without reading guest memory or copying.
 [[nodiscard]] UnswizzlePlan PlanUnswizzleImageRows(
+    GPUVAddr gpu_addr, const ImageInfo& info,
+    std::span<const std::pair<u64, u64>> dirty_ranges);
+
+/// Single-level, single-layer, single-sample 3D images: the ones uploaded by slab.
+[[nodiscard]] inline bool IsVolumeCandidate(const ImageInfo& info) noexcept {
+    return info.type == ImageType::e3D && info.resources.levels == 1 &&
+           info.resources.layers == 1 && info.num_samples == 1;
+}
+
+/// The slabs (one block deep, contiguous in guest memory) of a single-level, single-layer 3D
+/// block-linear image, or slab_bytes 0 when its layout is not one this handles.
+struct VolumeSlabs {
+    u64 slab_bytes{0};
+    u32 count{0};
+};
+[[nodiscard]] VolumeSlabs GetVolumeSlabs(const ImageInfo& info);
+
+/// Plans the unswizzle of the slabs of a 3D block-linear image that the guest byte ranges
+/// [begin, end) (from the image's start) touch: one run and copy per run of consecutive slabs.
+[[nodiscard]] UnswizzlePlan PlanUnswizzleVolumeSlabs(
     GPUVAddr gpu_addr, const ImageInfo& info,
     std::span<const std::pair<u64, u64>> dirty_ranges);
 

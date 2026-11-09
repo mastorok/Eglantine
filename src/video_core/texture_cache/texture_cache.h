@@ -478,7 +478,14 @@ void TextureCache<P>::TickFrame() {
                  async_decodes_queued, astc_opaque_images, astc_alpha_images);
         LOG_INFO(HW_GPU, "Texture cache last 600 frames: {} uploads from guest memory, {} MiB (largest {} MiB, {} by layer)",
                  images_uploaded, uploaded_bytes >> 20, largest_upload >> 20, layer_uploads);
+        if (slab_uploads != 0) {
+            LOG_INFO(HW_GPU,
+                     "Texture cache last 600 frames: {} of those uploaded only the written slabs "
+                     "of a 3D image: {} MiB read, {} MiB not read",
+                     slab_uploads, slab_bytes_uploaded >> 20, slab_bytes_skipped >> 20);
+        }
         images_uploaded = uploaded_bytes = largest_upload = layer_uploads = 0;
+        slab_uploads = slab_bytes_uploaded = slab_bytes_skipped = 0;
         astc_opaque_images = astc_alpha_images = 0;
         std::vector<std::pair<u32, u64>> shapes;
         for (const auto& [key, value] : created_shapes) shapes.emplace_back(value.first, key);
@@ -958,6 +965,10 @@ void TextureCache<P>::WriteMemory(DAddr cpu_addr, size_t size) {
         }
         if (True(image.flags & ImageFlagBits::SparseTiles)) {
             MarkRangeWritten(image, cpu_addr, size);
+            return;
+        }
+        if (UploadsBySlab(image)) {
+            MarkSlabsWritten(image, cpu_addr, size);
             return;
         }
         if (UploadsByLayer(image)) {
@@ -1760,7 +1771,13 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
         RefreshSparseTiles(image);
         return;
     }
-    if (!image.dirty_layers.empty() && UploadWrittenLayers(image)) {
+    if (IsVolumeCandidate(image.info)) {
+        // For a 3D image dirty_layers holds slabs; a full upload (below) when they cannot be used.
+        if (!image.dirty_layers.empty() && UploadsBySlab(image) && UploadWrittenSlabs(image)) {
+            runtime.InsertUploadMemoryBarrier();
+            return;
+        }
+    } else if (!image.dirty_layers.empty() && UploadWrittenLayers(image)) {
         runtime.InsertUploadMemoryBarrier();
         return;
     }
@@ -1906,6 +1923,95 @@ void TextureCache<P>::MarkLayersWritten(Image& image, DAddr cpu_addr, size_t siz
     for (u32 layer = static_cast<u32>(begin / stride); layer <= last; ++layer) {
         image.dirty_layers[layer / 64] |= u64{1} << (layer % 64);
     }
+}
+
+template <class P>
+bool TextureCache<P>::UploadsBySlab(const ImageBase& image) const noexcept {
+    static const bool disabled = std::getenv("EDEN_NX2_NO_VOLUME_SLABS") != nullptr;
+    constexpr ImageFlagBits excluded =
+        ImageFlagBits::Unbacked | ImageFlagBits::Sparse | ImageFlagBits::Remapped |
+        ImageFlagBits::Converted | ImageFlagBits::AcceleratedUpload | ImageFlagBits::TrimmedLevels |
+        ImageFlagBits::UnwrittenSparse | ImageFlagBits::SparseLayers | ImageFlagBits::SparseTiles |
+        ImageFlagBits::GpuModified | ImageFlagBits::AsynchronousDecode | ImageFlagBits::IsDecoding;
+    return !disabled && IsVolumeCandidate(image.info) &&
+           image.guest_size_bytes >= VolumeSlabMinSize && False(image.flags & excluded) &&
+           image.aliased_images.empty();
+}
+
+template <class P>
+void TextureCache<P>::MarkSlabsWritten(Image& image, DAddr cpu_addr, size_t size) {
+    if (True(image.flags & ImageFlagBits::CpuModified) && image.dirty_layers.empty()) {
+        return; // all of it is dirty already
+    }
+    const VolumeSlabs slabs = GetVolumeSlabs(image.info);
+    if (slabs.slab_bytes == 0) {
+        // A layout the slabs do not cover: the whole image.
+        image.dirty_layers.clear();
+        image.flags |= ImageFlagBits::CpuModified;
+        return;
+    }
+    if (False(image.flags & ImageFlagBits::CpuModified)) {
+        image.flags |= ImageFlagBits::CpuModified;
+        image.dirty_layers.assign(Common::DivCeil(slabs.count, 64U), 0);
+    }
+    const DAddr begin = (std::max<DAddr>)(cpu_addr, image.cpu_addr) - image.cpu_addr;
+    const DAddr end = (std::min<DAddr>)(cpu_addr + size, image.cpu_addr + image.guest_size_bytes) -
+                      image.cpu_addr;
+    if (end <= begin) {
+        return;
+    }
+    const u32 last = static_cast<u32>((std::min<u64>)((end - 1) / slabs.slab_bytes, slabs.count - 1));
+    for (u32 slab = static_cast<u32>(begin / slabs.slab_bytes); slab <= last; ++slab) {
+        image.dirty_layers[slab / 64] |= u64{1} << (slab % 64);
+    }
+}
+
+template <class P>
+bool TextureCache<P>::UploadWrittenSlabs(Image& image) {
+    const VolumeSlabs slabs = GetVolumeSlabs(image.info);
+    if (slabs.slab_bytes == 0 || image.dirty_layers.size() * 64 < slabs.count) {
+        return false;
+    }
+    std::vector<std::pair<u64, u64>> ranges;
+    u32 dirty_slabs = 0;
+    for (u32 slab = 0; slab < slabs.count; ++slab) {
+        if (((image.dirty_layers[slab / 64] >> (slab % 64)) & 1) == 0) {
+            continue;
+        }
+        ++dirty_slabs;
+        ranges.emplace_back(u64{slab} * slabs.slab_bytes, u64{slab + 1} * slabs.slab_bytes);
+    }
+    if (dirty_slabs == 0) {
+        image.dirty_layers.clear();
+        return true; // written outside the image's data
+    }
+    // Most of it written: one pass over the whole image is simpler (and can be done by the GPU).
+    if (u64{dirty_slabs} * 4 > u64{slabs.count} * 3) {
+        return false;
+    }
+    const UnswizzlePlan plan = PlanUnswizzleVolumeSlabs(image.gpu_addr, image.info, ranges);
+    if (!plan.layout_valid || plan.copies.empty()) {
+        return false;
+    }
+    static const bool log_slabs = std::getenv("EDEN_NX2_TC_LOG") != nullptr;
+    const u64 read_bytes = u64{dirty_slabs} * slabs.slab_bytes;
+    if (log_slabs && (slab_uploads_logged++ < 64 || slab_uploads_logged % 50 == 0)) {
+        LOG_INFO(HW_GPU, "Volume {:#x} {}x{}x{}: uploading {} of {} slabs ({} of {} MiB)",
+                 image.gpu_addr, image.info.size.width, image.info.size.height,
+                 image.info.size.depth, dirty_slabs, slabs.count, read_bytes >> 20,
+                 image.guest_size_bytes >> 20);
+    }
+    auto staging = runtime.UploadStagingBuffer(plan.total_host_bytes);
+    ExecuteUnswizzlePlan(*gpu_memory, plan, staging.mapped_span);
+    image.UploadMemory(staging, plan.copies);
+    image.dirty_layers.clear();
+    ++images_uploaded;
+    ++slab_uploads;
+    uploaded_bytes += read_bytes;
+    slab_bytes_uploaded += read_bytes;
+    slab_bytes_skipped += image.guest_size_bytes - read_bytes;
+    largest_upload = (std::max<u64>)(largest_upload, read_bytes);
+    return true;
 }
 
 template <class P>

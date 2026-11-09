@@ -1256,6 +1256,124 @@ UnswizzlePlan PlanUnswizzleImageRows(
     return plan;
 }
 
+namespace {
+struct VolumeSlabGeometry {
+    bool valid{false};
+    u64 slab_bytes{0};
+    u32 slabs{0};
+    u32 slab_depth{0}; ///< Slices in a full slab
+    u32 bpp_log2{0};
+    Extent2D tile_size{};
+    Extent3D num_tiles{};
+    Extent3D block{};
+    u32 stride_alignment{0};
+};
+
+VolumeSlabGeometry MakeVolumeSlabGeometry(const ImageInfo& info) {
+    VolumeSlabGeometry g;
+    if (info.type != ImageType::e3D || info.resources.levels != 1 || info.resources.layers != 1 ||
+        info.num_samples != 1 || info.size.depth < 2) {
+        return g;
+    }
+    g.bpp_log2 = BytesPerBlockLog2(info.format);
+    g.tile_size = DefaultBlockSize(info.format);
+    const LevelInfo level_info = MakeLevelInfo(info);
+    const std::array level_sizes = CalculateLevelSizes(level_info, 1);
+    g.num_tiles = AdjustTileSize(info.size, g.tile_size);
+    g.block = AdjustMipBlockSize(g.num_tiles, level_info.block, 0, level_info.num_levels);
+    const Extent2D gob = GobSize(g.bpp_log2, info.block.height, info.tile_width_spacing);
+    g.stride_alignment = StrideAlignment(g.num_tiles, info.block, gob, g.bpp_log2);
+    g.slab_depth = 1U << g.block.depth;
+    g.slabs = Common::DivCeil(g.num_tiles.depth, g.slab_depth);
+    // The layout UnswizzleTexture reads: a slab is the blocks of one block-deep layer of slices.
+    const u32 stride = Common::AlignUpLog2(g.num_tiles.width, g.stride_alignment) << g.bpp_log2;
+    const u32 gobs_in_x = Common::DivCeilLog2(stride, GOB_SIZE_X_SHIFT);
+    const u64 block_size = u64{gobs_in_x} << (GOB_SIZE_SHIFT + g.block.height + g.block.depth);
+    g.slab_bytes =
+        u64{Common::DivCeilLog2(g.num_tiles.height, g.block.height + GOB_SIZE_Y_SHIFT)} *
+        block_size;
+    if (g.slab_bytes == 0 || g.slabs == 0 || g.slab_bytes * g.slabs != level_sizes[0]) {
+        g.valid = false;
+        return g;
+    }
+    g.valid = true;
+    return g;
+}
+} // namespace
+
+VolumeSlabs GetVolumeSlabs(const ImageInfo& info) {
+    const VolumeSlabGeometry g = MakeVolumeSlabGeometry(info);
+    return g.valid ? VolumeSlabs{g.slab_bytes, g.slabs} : VolumeSlabs{};
+}
+
+UnswizzlePlan PlanUnswizzleVolumeSlabs(GPUVAddr gpu_addr, const ImageInfo& info,
+                                       std::span<const std::pair<u64, u64>> dirty_ranges) {
+    UnswizzlePlan plan;
+    const VolumeSlabGeometry g = MakeVolumeSlabGeometry(info);
+    if (!g.valid || dirty_ranges.empty()) {
+        plan.layout_valid = false;
+        return plan;
+    }
+    plan.bpp_log2 = g.bpp_log2;
+    std::vector<bool> dirty(g.slabs, false);
+    for (const auto& [begin, end] : dirty_ranges) {
+        if (end <= begin) {
+            continue;
+        }
+        const u64 last = (std::min<u64>)((end - 1) / g.slab_bytes, g.slabs - 1);
+        for (u64 slab = begin / g.slab_bytes; slab <= last; ++slab) {
+            dirty[slab] = true;
+        }
+    }
+    const u32 row_length = g.num_tiles.width * g.tile_size.width;
+    const u32 image_height = g.num_tiles.height * g.tile_size.height;
+    const size_t slice_host_bytes = (size_t{g.num_tiles.width} * g.num_tiles.height) << g.bpp_log2;
+    size_t host_offset = 0;
+    for (u32 first = 0; first < g.slabs;) {
+        if (!dirty[first]) {
+            ++first;
+            continue;
+        }
+        u32 last = first;
+        while (last < g.slabs && dirty[last]) {
+            ++last;
+        }
+        const u32 z_begin = first * g.slab_depth;
+        const u32 z_end = (std::min)(last * g.slab_depth, info.size.depth);
+        const u32 depth = z_end - z_begin;
+        const size_t host_bytes = slice_host_bytes * depth;
+        plan.runs.push_back(UnswizzleRowRun{
+            .src_addr = gpu_addr + u64{first} * g.slab_bytes,
+            .guest_bytes = static_cast<size_t>(g.slab_bytes) * (last - first),
+            .host_offset = host_offset,
+            .host_bytes = host_bytes,
+            .run_tiles = g.num_tiles.width,
+            .tile_rows = g.num_tiles.height,
+            .block = g.block,
+            .run_alignment = g.stride_alignment,
+            .depth = depth,
+        });
+        plan.copies.push_back(BufferImageCopy{
+            .buffer_offset = host_offset,
+            .buffer_size = host_bytes,
+            .buffer_row_length = row_length,
+            .buffer_image_height = image_height,
+            .image_subresource =
+                {
+                    .base_level = 0,
+                    .base_layer = 0,
+                    .num_layers = 1,
+                },
+            .image_offset = {0, 0, static_cast<s32>(z_begin)},
+            .image_extent = {info.size.width, info.size.height, depth},
+        });
+        host_offset += host_bytes;
+        first = last;
+    }
+    plan.total_host_bytes = host_offset;
+    return plan;
+}
+
 void ExecuteUnswizzlePlan(Tegra::MemoryManager& gpu_memory, const UnswizzlePlan& plan,
                          std::span<u8> output) {
     std::vector<u8> run;
@@ -1263,7 +1381,7 @@ void ExecuteUnswizzlePlan(Tegra::MemoryManager& gpu_memory, const UnswizzlePlan&
         run.resize(r.guest_bytes);
         gpu_memory.ReadBlockUnsafe(r.src_addr, run.data(), r.guest_bytes);
         Tegra::Texture::UnswizzleTexture(output.subspan(r.host_offset, r.host_bytes),
-                                         run, 1U << plan.bpp_log2, r.run_tiles, r.tile_rows, 1,
+                                         run, 1U << plan.bpp_log2, r.run_tiles, r.tile_rows, r.depth,
                                          r.block.height, r.block.depth, r.run_alignment,
                                          gpu_memory.UsesNativeTiling());
     }

@@ -135,6 +135,10 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 uploaded_bytes{};    ///< Guest bytes those uploads read
     u64 largest_upload{};    ///< Largest of them
     u64 layer_uploads{};     ///< Of them, uploads of only the written layers
+    u64 slab_uploads{};      ///< Of them, uploads of only the written slabs of a 3D image
+    u64 slab_bytes_uploaded{}; ///< Guest bytes those read
+    u64 slab_bytes_skipped{};  ///< Guest bytes a whole upload of those images would have read more
+    u64 slab_uploads_logged{}; ///< Slab uploads logged so far (EDEN_NX2_TC_LOG)
     bool native_thresholds_applied{};
     u64 native_critical_memory{};
     u64 native_expected_memory{};
@@ -175,6 +179,8 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     using BufferType = typename P::BufferType;
 
     static constexpr u32 LayerUploadMinSize = 64U << 20;
+    /// Large 3D images are uploaded by slab (see UploadsBySlab) from this size on.
+    static constexpr u32 VolumeSlabMinSize = 32U << 20;
     static constexpr size_t LargeScratchCapacity = 64U << 20;
 
     /// Splits large 2D image uploads into smaller chunks, avoiding multi-hundred MiB staging buffers.
@@ -185,6 +191,16 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
 
     /// Records the layers a write of [cpu_addr, +size) touches.
     void MarkLayersWritten(Image& image, DAddr cpu_addr, size_t size);
+
+    /// Large single-level 3D images (light volumes of title 2) that games rewrite a few slabs at a
+    /// time: a refresh can unswizzle only the slabs written since the last upload.
+    [[nodiscard]] bool UploadsBySlab(const ImageBase& image) const noexcept;
+
+    /// Records the slabs (dirty_layers bits) a write of [cpu_addr, +size) touches.
+    void MarkSlabsWritten(Image& image, DAddr cpu_addr, size_t size);
+
+    /// Uploads the image's dirty slabs. False when it needs a full upload instead.
+    bool UploadWrittenSlabs(Image& image);
 
     /// SparseTiles images: notes a written range, uploaded with the next refresh.
     void MarkRangeWritten(Image& image, DAddr cpu_addr, size_t size);
