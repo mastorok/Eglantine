@@ -16,6 +16,7 @@
 
 #include "common/assert.h"
 #include "common/logging.h"
+#include "common/nx2_sampler.h"
 #include "common/scope_exit.h"
 #include "common/thread.h"
 #include "common/thread_worker.h"
@@ -131,6 +132,7 @@ struct KernelCore::Impl {
     }
 
     void Shutdown(KernelCore& kernel) {
+        Nx2Sampler::SetGuestProbe({});
         is_shutting_down.store(true, std::memory_order_relaxed);
         SCOPE_EXIT {
             is_shutting_down.store(false, std::memory_order_relaxed);
@@ -243,6 +245,17 @@ struct KernelCore::Impl {
 
             schedulers[i]->Initialize(system.Kernel(), main_thread, idle_thread, core);
         }
+        // EDEN_NX2_SAMPLE: the profile of a CPUCore_<n> thread also lists its guest addresses.
+        Nx2Sampler::SetGuestProbe([this](unsigned core, Nx2Sampler::GuestSample& out) {
+            return core < cores.size() && cores[core].has_value() && cores[core]->SampleGuest(out);
+        });
+        Nx2Sampler::SetGuestMemoryReader([this](std::uint64_t address, void* data, std::size_t size) {
+            auto& memory = system.ApplicationMemory();
+            if (!memory.IsValidVirtualAddressRange(address, size)) {
+                return false;
+            }
+            return memory.ReadBlockUnsafe(address, data, size);
+        });
     }
 
     // Creates the default system resource limit

@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include "common/nx2_sampler.h"
 #include <cstddef>
 #include <memory>
 #include <mutex>
@@ -46,6 +47,11 @@ public:
 
     // Copy floating point status registers to the target thread.
     void CloneFpuStatus(KThread* dst) const;
+
+    // Guest registers of the thread running on this core, for the sampling profiler. The core's
+    // host thread must be paused (the state is not locked); false when nothing is running or the
+    // core's lock is taken.
+    bool SampleGuest(Nx2Sampler::GuestSample& out) const;
 
     // Log backtrace of current processor state.
     void LogBacktrace(KernelCore& kernel);

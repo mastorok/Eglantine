@@ -6,7 +6,9 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstddef>
 #include <cstdlib>
+#include <functional>
 #include <string>
 
 namespace Nx2Sampler {
@@ -26,6 +28,24 @@ namespace Nx2Sampler {
 //
 // EDEN_NX2_FRAME_LOG=1: one line per present in <log dir>/nx2_frames.csv.
 void StartFromEnvironment();
+
+/// The guest state of one emulated core, read while its host thread is paused by the sampler.
+struct GuestSample {
+    std::uint64_t pc{};
+    std::uint64_t lr{};
+    std::uint64_t sp{};
+    std::uint64_t thread_id{}; ///< Guest thread running on the core
+};
+
+/// Registered by the kernel: reads the guest state of core `core`. Called with that core's host
+/// thread paused, so it must not wait for any lock; false when the core has nothing to report.
+/// With it, the profile of a CPUCore_N thread also lists the guest addresses its time went to
+/// (<out>.guest.txt, see EDEN_NX2_SAMPLE).
+void SetGuestProbe(std::function<bool(unsigned core, GuestSample&)> probe);
+
+/// Registered by the kernel: reads guest memory. The profile of the guest cores then also keeps the
+/// code around their hottest addresses (<out>.guest_code.txt), to read without the game's files.
+void SetGuestMemoryReader(std::function<bool(std::uint64_t address, void* data, std::size_t size)> reader);
 
 /// Samples the named threads for `seconds` now (blocking), writes the report to `out` (and
 /// the folded stacks to `out`.folded) and returns the report.

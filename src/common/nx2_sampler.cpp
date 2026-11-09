@@ -17,6 +17,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <set>
@@ -45,7 +46,22 @@ struct Sample {
     unsigned thread;
     unsigned depth;
     std::array<DWORD64, MaxDepth> frames;
+    bool has_guest;   ///< `guest` was read (an emulated core's thread, probe registered)
+    GuestSample guest;
 };
+
+std::mutex g_guest_probe_mutex;
+std::function<bool(unsigned, GuestSample&)> g_guest_probe;
+std::function<bool(std::uint64_t, void*, std::size_t)> g_guest_reader;
+
+/// The emulated core of a "CPUCore_<n>" host thread, or -1.
+int GuestCoreOf(const std::string& name) {
+    static constexpr char prefix[] = "CPUCore_";
+    if (name.compare(0, sizeof(prefix) - 1, prefix) != 0 || name.size() == sizeof(prefix) - 1) {
+        return -1;
+    }
+    return std::atoi(name.c_str() + sizeof(prefix) - 1);
+}
 
 struct Target {
     HANDLE handle;
@@ -356,6 +372,138 @@ struct Symbolizer {
     SymGetLineFn from_line{};
     std::unordered_map<DWORD64, std::string> cache;
 };
+
+// <path>.guest.txt: for each emulated core, where its guest threads were (guest addresses at the
+// moment the host thread was paused). The PC is the one the JIT last stored, i.e. the start of the
+// block being run or of the last block entered, so a hot loop shows as a few addresses. Turn an
+// address into a module offset with the module bases of the log ("Module main loaded at ...").
+void GuestReport(const std::vector<Target>& targets, const std::vector<Sample>& samples,
+                 const std::string& path) {
+    struct Agg {
+        unsigned count{};
+        unsigned in_jit{};
+        std::map<std::uint64_t, unsigned> callers;
+        std::map<std::uint64_t, unsigned> threads;
+    };
+    Symbolizer& symbolizer = Symbolizer::Shared();
+    const std::scoped_lock symbol_lock{symbolizer.mutex};
+    std::string text;
+    std::string code;
+    for (unsigned thread = 0; thread < targets.size(); ++thread) {
+        std::map<std::uint64_t, Agg> by_pc;
+        std::map<std::uint64_t, unsigned> by_block;
+        std::map<std::uint64_t, unsigned> by_thread;
+        unsigned total = 0;
+        unsigned with_guest = 0;
+        unsigned in_jit = 0;
+        for (const Sample& sample : samples) {
+            if (sample.thread != thread || sample.depth == 0) {
+                continue;
+            }
+            ++total;
+            if (!sample.has_guest) {
+                continue;
+            }
+            ++with_guest;
+            const bool jit = symbolizer.Name(sample.frames[0]) == "(jit)";
+            in_jit += jit ? 1 : 0;
+            Agg& agg = by_pc[sample.guest.pc];
+            ++agg.count;
+            agg.in_jit += jit ? 1 : 0;
+            ++agg.callers[sample.guest.lr];
+            ++agg.threads[sample.guest.thread_id];
+            ++by_block[sample.guest.pc & ~std::uint64_t{0xff}];
+            ++by_thread[sample.guest.thread_id];
+        }
+        if (with_guest == 0) {
+            continue;
+        }
+        text += fmt::format("=== {}: {} samples, {} with a guest state, {} of them in JIT code ({:.1f}%)\n",
+                            targets[thread].name, total, with_guest, in_jit,
+                            100.0 * in_jit / (std::max)(with_guest, 1U));
+        const auto top = [](const auto& counts, size_t limit) {
+            std::vector<std::pair<unsigned, std::uint64_t>> sorted;
+            for (const auto& [key, value] : counts) {
+                sorted.emplace_back(value, key);
+            }
+            std::sort(sorted.rbegin(), sorted.rend());
+            sorted.resize((std::min)(limit, sorted.size()));
+            return sorted;
+        };
+        text += "-- guest threads (id: samples)\n";
+        for (const auto& [count, id] : top(by_thread, 8)) {
+            text += fmt::format("  {:>8} {:5.1f}%  thread {}\n", count, 100.0 * count / with_guest, id);
+        }
+        text += "-- 256-byte blocks of guest code (address: samples)\n";
+        for (const auto& [count, block] : top(by_block, 40)) {
+            text += fmt::format("  {:#014x} {:>8} {:5.1f}%\n", block, count, 100.0 * count / with_guest);
+        }
+        // The code of the hottest blocks, 512 bytes from 128 bytes before each (one line of hex
+        // per 32 bytes, "<address>: <bytes>"), for a disassembler.
+        code += fmt::format("=== {}\n", targets[thread].name);
+        std::set<std::uint64_t> dumped;
+        for (const auto& [count, block] : top(by_block, 24)) {
+            const std::uint64_t start = block >= 0x80 ? block - 0x80 : 0;
+            if (!dumped.insert(start).second) {
+                continue;
+            }
+            std::array<unsigned char, 512> bytes{};
+            bool ok = false;
+            {
+                const std::scoped_lock reader_lock{g_guest_probe_mutex};
+                ok = g_guest_reader && g_guest_reader(start, bytes.data(), bytes.size());
+            }
+            if (!ok) {
+                code += fmt::format("# {:#x}: unreadable\n", start);
+                continue;
+            }
+            code += fmt::format("# block {:#x}: {} samples\n", block, count);
+            for (size_t offset = 0; offset < bytes.size(); offset += 32) {
+                code += fmt::format("{:#x}: ", start + offset);
+                for (size_t i = 0; i < 32; ++i) {
+                    code += fmt::format("{:02x}", bytes[offset + i]);
+                }
+                code += '\n';
+            }
+        }
+        text += "-- guest addresses (address: samples, in JIT; most frequent LR; most frequent thread)\n";
+        std::vector<std::pair<unsigned, std::uint64_t>> pcs;
+        for (const auto& [pc, agg] : by_pc) {
+            pcs.emplace_back(agg.count, pc);
+        }
+        std::sort(pcs.rbegin(), pcs.rend());
+        pcs.resize((std::min)(size_t{100}, pcs.size()));
+        for (const auto& [count, pc] : pcs) {
+            const Agg& agg = by_pc[pc];
+            const auto best = [](const std::map<std::uint64_t, unsigned>& counts) {
+                std::uint64_t key = 0;
+                unsigned most = 0;
+                for (const auto& [k, v] : counts) {
+                    if (v > most) {
+                        most = v;
+                        key = k;
+                    }
+                }
+                return key;
+            };
+            text += fmt::format("  {:#014x} {:>8} {:5.1f}%  jit {:>6}  lr {:#014x}  thread {}\n", pc, count,
+                                100.0 * count / with_guest, agg.in_jit, best(agg.callers),
+                                best(agg.threads));
+        }
+        text += "\n";
+    }
+    if (text.empty()) {
+        return;
+    }
+    if (std::FILE* const file = std::fopen((path + ".guest.txt").c_str(), "w")) {
+        std::fputs(text.c_str(), file);
+        std::fclose(file);
+    }
+    if (std::FILE* const file = std::fopen((path + ".guest_code.txt").c_str(), "w")) {
+        std::fputs(code.c_str(), file);
+        std::fclose(file);
+    }
+}
 
 std::string Report(const std::vector<Target>& targets, const std::vector<Sample>& samples,
                    const char* path) {
@@ -887,6 +1035,17 @@ std::string SampleThreads(const std::vector<std::string>& patterns, double secon
     }
     std::vector<Sample> samples;
     samples.reserve(static_cast<size_t>(seconds * 1100.0) * targets.size() + 16);
+    // The guest core of each target (CPUCore_<n>), for the guest addresses of .guest.txt. The probe
+    // is called under its mutex, so the kernel can take it away (SetGuestProbe({})) at shutdown
+    // without a call still running; it never waits for the paused thread.
+    const auto guest_probe = [](unsigned core, GuestSample& out) {
+        const std::scoped_lock probe_lock{g_guest_probe_mutex};
+        return g_guest_probe && g_guest_probe(core, out);
+    };
+    std::vector<int> guest_core(targets.size(), -1);
+    for (unsigned i = 0; i < targets.size(); ++i) {
+        guest_core[i] = GuestCoreOf(targets[i].name);
+    }
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::duration<double>(seconds);
     while (std::chrono::steady_clock::now() < deadline &&
            samples.size() + targets.size() <= samples.capacity()) {
@@ -901,12 +1060,16 @@ std::string SampleThreads(const std::vector<std::string>& patterns, double secon
                 Sample& sample = samples.emplace_back();
                 sample.thread = i;
                 sample.depth = Walk(context, sample.frames);
+                if (guest_core[i] >= 0) {
+                    sample.has_guest = guest_probe(static_cast<unsigned>(guest_core[i]), sample.guest);
+                }
             }
             ResumeThread(handle);
         }
         Sleep(1);
     }
     std::string text = Report(targets, samples, out.c_str());
+    GuestReport(targets, samples, out);
     std::fprintf(stderr, "nx2 sampler: %zu samples written to %s\n", samples.size(), out.c_str());
     LOG_INFO(Common, "nx2 sampler: {} samples written to {}", samples.size(), out);
     for (const auto& target : targets) {
@@ -922,6 +1085,19 @@ std::string SampleThreads(const std::vector<std::string>& patterns, double secon
 
 std::string Sample(const char* names, double seconds, const std::string& out) {
     return SampleThreads(SplitNames(names), seconds, out);
+}
+
+void SetGuestProbe(std::function<bool(unsigned, GuestSample&)> probe) {
+    const std::scoped_lock probe_lock{g_guest_probe_mutex};
+    g_guest_probe = std::move(probe);
+    if (!g_guest_probe) {
+        g_guest_reader = nullptr;
+    }
+}
+
+void SetGuestMemoryReader(std::function<bool(std::uint64_t, void*, std::size_t)> reader) {
+    const std::scoped_lock probe_lock{g_guest_probe_mutex};
+    g_guest_reader = std::move(reader);
 }
 
 void StartFromEnvironment() {
@@ -1020,6 +1196,8 @@ void NotePresent(long long frame_us, long long fence_us, long long composite_us,
 #else
 
 namespace Nx2Sampler {
+void SetGuestProbe(std::function<bool(unsigned, GuestSample&)>) {}
+void SetGuestMemoryReader(std::function<bool(std::uint64_t, void*, std::size_t)>) {}
 void StartFromEnvironment() {}
 std::string Sample(const char*, double, const std::string&) {
     return "the sampler is Windows only";

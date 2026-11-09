@@ -26,6 +26,21 @@ PhysicalCore::PhysicalCore(KernelCore& kernel, std::size_t core_index)
 }
 PhysicalCore::~PhysicalCore() = default;
 
+bool PhysicalCore::SampleGuest(Nx2Sampler::GuestSample& out) const {
+    // The sampler pauses this core's host thread, which may be holding the lock: never wait for it.
+    std::unique_lock lock{const_cast<std::mutex&>(m_guard), std::try_to_lock};
+    if (!lock.owns_lock() || m_arm_interface == nullptr || m_current_thread == nullptr) {
+        return false;
+    }
+    Svc::ThreadContext context{};
+    m_arm_interface->GetContext(context);
+    out.pc = context.pc;
+    out.lr = context.lr;
+    out.sp = context.sp;
+    out.thread_id = m_current_thread->GetThreadId();
+    return true;
+}
+
 void PhysicalCore::RunThread(KernelCore& kernel, Kernel::KThread* thread) {
     auto* process = thread->GetOwnerProcess();
     auto& system = kernel.System();
