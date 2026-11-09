@@ -1,0 +1,67 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#version 450
+
+// Task and mesh programs emulated with compute shaders (MeshEmulation in shader_info.h). After the
+// task workgroups have written their mesh group counts, this turns the counts into the first mesh
+// group of each task (exclusive sums), and writes the arguments of the indirect dispatch of the
+// mesh workgroups and of the indirect draw that follows. One workgroup does all of it.
+
+layout(local_size_x = 256) in;
+layout(std430, set = 1, binding = 0) buffer Scratch { uint words[]; };
+
+// Word indices, see MeshEmulation.
+const uint ParamCountsBase = 1;
+const uint ParamOffsetsBase = 2;
+const uint ParamTaskCount = 4;
+const uint ParamMaxGroups = 5;
+const uint ParamVerticesPerGroup = 6;
+const uint ParamDirectGroups = 7;
+const uint DispatchIndirectWord = 8;
+const uint DrawIndirectWord = 11;
+
+shared uint chunk_sums[256];
+shared uint total_groups;
+
+void main() {
+    const uint thread = gl_LocalInvocationID.x;
+    const uint tasks = words[ParamTaskCount];
+    const uint counts = words[ParamCountsBase];
+    const uint offsets = words[ParamOffsetsBase];
+    const uint chunk = (tasks + 255) / 256;
+    const uint begin = min(thread * chunk, tasks);
+    const uint end = min(begin + chunk, tasks);
+    uint sum = 0;
+    for (uint i = begin; i < end; ++i) {
+        sum += words[counts + i];
+    }
+    chunk_sums[thread] = sum;
+    barrier();
+    if (thread == 0) {
+        uint running = 0;
+        for (uint i = 0; i < 256; ++i) {
+            const uint value = chunk_sums[i];
+            chunk_sums[i] = running;
+            running += value;
+        }
+        total_groups = running;
+    }
+    barrier();
+    uint running = chunk_sums[thread];
+    for (uint i = begin; i < end; ++i) {
+        words[offsets + i] = running;
+        running += words[counts + i];
+    }
+    if (thread == 0) {
+        const uint total = min(tasks == 0 ? words[ParamDirectGroups] : total_groups,
+                               words[ParamMaxGroups]);
+        words[DispatchIndirectWord] = total;
+        words[DispatchIndirectWord + 1] = 1;
+        words[DispatchIndirectWord + 2] = 1;
+        words[DrawIndirectWord] = total * words[ParamVerticesPerGroup];
+        words[DrawIndirectWord + 1] = 1;
+        words[DrawIndirectWord + 2] = 0;
+        words[DrawIndirectWord + 3] = 0;
+    }
+}

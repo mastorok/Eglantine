@@ -315,6 +315,7 @@ constexpr u32 ParamRecordsBase{3};  ///< first word of the mesh records
 constexpr u32 ParamTaskCount{4};    ///< task workgroups of the draw, 0 without a task program
 constexpr u32 ParamMaxGroups{5};    ///< mesh records that fit
 constexpr u32 ParamVerticesPerGroup{6}; ///< vertices the draw issues per mesh workgroup
+constexpr u32 ParamDirectGroups{7}; ///< mesh workgroups of a draw without a task program
 constexpr u32 ParamWords{8};
 constexpr u32 DispatchIndirectWord{8};
 constexpr u32 DrawIndirectWord{11};
