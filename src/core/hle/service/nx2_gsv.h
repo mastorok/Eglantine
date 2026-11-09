@@ -1738,9 +1738,18 @@ private:
         // previous frame's fence instead and let the game prepare frame N+1 meanwhile (waiting
         // for this frame there cost 8-56 ms of every 34-105 ms frame, or never finished).
         // EDEN_NX2_FRAMES_AHEAD=1 always waits for the previous frame, =0 always for this one.
+        // =2 waits for the previous frame only, even with that one still on the GPU (a frame of
+        // overlap between the game and the GPU threads whenever they are the slower side), and
+        // =auto is the default behaviour without the per-title overrides below.
         static const int frames_ahead_setting = [] {
             const char* value = std::getenv("EDEN_NX2_FRAMES_AHEAD");
-            return value == nullptr ? -1 : value[0] == '1' ? 1 : 0;
+            if (value == nullptr) {
+                return -1;
+            }
+            if (value[0] == 'a' || value[0] == 'A') {
+                return -2;
+            }
+            return value[0] == '1' ? 1 : value[0] == '2' ? 2 : 0;
         }();
         // Donkey Kong Bananza's channels wait on each other every frame, so it always ran a frame
         // ahead, where it rewrote memory the GPU thread hadn't read yet (misread commands, then
@@ -1751,12 +1760,19 @@ private:
         constexpr u64 OcarinaOfTimeProgramId = 0x0400486024DEC000ULL;
         int frames_ahead = frames_ahead_setting;
         const u64 app_program_id = system.GetApplicationProcessProgramID();
-        if (frames_ahead == -1 && (app_program_id == DonkeyKongBananzaProgramId ||
-                                   app_program_id == OcarinaOfTimeProgramId)) {
+        if (frames_ahead == -2) {
+            frames_ahead = -1;
+        } else if (frames_ahead == -1 && (app_program_id == DonkeyKongBananzaProgramId ||
+                                          app_program_id == OcarinaOfTimeProgramId)) {
             frames_ahead = 0;
         }
+        if (m_presents == 1) {
+            LOG_INFO(Service, "nx2:vi2 frames ahead mode {} (EDEN_NX2_FRAMES_AHEAD: {})",
+                     frames_ahead, frames_ahead_setting);
+        }
         const auto entered = std::chrono::steady_clock::now();
-        if (frames_ahead == 1 || (frames_ahead == -1 && !WaitForFrame(~w[22], w[24], true))) {
+        if (frames_ahead == 1 || frames_ahead == 2 ||
+            (frames_ahead == -1 && !WaitForFrame(~w[22], w[24], true))) {
             LOG_DEBUG(Service, "nx2:vi2 present #{} fence ({}, {:#x}), waiting for ({}, {:#x}); now {:#x}",
                       m_presents, ~w[22], w[24], m_previous_fence_id, m_previous_fence_value,
                       ~w[22] < 192 ? system.Host1x().GetSyncpointManager().GetGuestSyncpointValue(~w[22]) : 0U);
