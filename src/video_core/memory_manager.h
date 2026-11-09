@@ -189,6 +189,20 @@ private:
 
     size_t MaxContinuousRangeUncached(GPUVAddr gpu_addr, size_t size) const;
 
+    /// The walk behind MaxContinuousRange; `expected` carries the device address the next page must
+    /// have across calls, so a range can be walked in pieces.
+    size_t WalkContinuous(GPUVAddr gpu_addr, size_t size, std::optional<DAddr>& expected) const;
+
+    /// MaxContinuousRange for ranges of several chunks: whole chunks known to be one device range
+    /// are added in one step instead of page by page.
+    size_t MaxContinuousRangeChunked(GPUVAddr gpu_addr, size_t size) const;
+
+    /// Word describing one chunk (valid tag, one-device-range flag, device page of its start).
+    u64 ChunkSummary(size_t chunk) const;
+
+    /// Forgets the summaries of the chunks a page table change touched.
+    void InvalidateChunks(GPUVAddr gpu_addr, size_t size);
+
     void ReadBlockImpl(GPUVAddr gpu_src_addr, void* dest_buffer, std::size_t size, VideoCommon::CacheType which, bool unsafe) const;
     void WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size, VideoCommon::CacheType which, bool unsafe);
 
@@ -255,6 +269,18 @@ private:
     mutable std::mutex guard;
     /// Bumped after each page table change; MaxContinuousRange answers are kept until then.
     std::atomic<u64> map_serial{};
+
+    /// Per 2 MiB chunk of the GPU address space: a version bumped by every page table change under
+    /// it, and the summary of the chunk computed under one version (see ChunkSummary).
+    static constexpr u64 chunk_bits = 21;
+    static constexpr size_t chunk_size = size_t{1} << chunk_bits;
+    // Summary word: bits 0-22 the version tag (never 0), bit 23 set when the whole chunk is mapped
+    // as one device range, bits 24+ the device page where that range starts.
+    static constexpr u64 ChunkTagMask = (u64{1} << 23) - 1;
+    static constexpr u64 ChunkOneRange = u64{1} << 23;
+    static constexpr u64 ChunkDeviceShift = 24;
+    mutable std::vector<std::atomic<u32>> chunk_version;
+    mutable std::vector<std::atomic<u64>> chunk_summary;
 
     static constexpr size_t continuous_bits = 64;
 

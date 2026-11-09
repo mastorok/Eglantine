@@ -6,6 +6,8 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
+#include <optional>
 #include <vector>
 
 #include "common/alignment.h"
@@ -57,6 +59,21 @@ MemoryManager::MemoryManager(Core::System& system_, MaxwellDeviceMemoryManager& 
     big_entries.resize(big_page_table_size / 32, 0);
     big_page_continuous.resize(big_page_table_size / continuous_bits, 0);
     entries.resize(page_table_size / 32, 0);
+
+    // 6 MiB for a 40-bit address space; larger spaces go without (the page walk stays).
+    if (address_space_bits > chunk_bits && address_space_bits - chunk_bits <= 22) {
+        const size_t chunk_count = size_t{1} << (address_space_bits - chunk_bits);
+        std::vector<std::atomic<u32>> versions(chunk_count);
+        std::vector<std::atomic<u64>> summaries(chunk_count);
+        for (auto& version : versions) {
+            version.store(0, std::memory_order_relaxed);
+        }
+        for (auto& summary : summaries) {
+            summary.store(0, std::memory_order_relaxed);
+        }
+        chunk_version = std::move(versions);
+        chunk_summary = std::move(summaries);
+    }
 }
 
 MemoryManager::MemoryManager(Core::System& system_, u64 address_space_bits_, GPUVAddr split_address_, u64 big_page_bits_, u64 page_bits_)
@@ -159,6 +176,7 @@ GPUVAddr MemoryManager::PageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr de
     }
     flush_modified();
     kind_map.Map(gpu_addr, gpu_addr + size, kind);
+    InvalidateChunks(gpu_addr, size);
     map_serial.fetch_add(1, std::memory_order_release);
     return gpu_addr;
 }
@@ -215,6 +233,7 @@ GPUVAddr MemoryManager::BigPageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr
         std::unique_lock<std::mutex> lock(guard);
         kind_map.Map(gpu_addr, gpu_addr + size, kind);
     }
+    InvalidateChunks(gpu_addr, size);
     map_serial.fetch_add(1, std::memory_order_release);
     return gpu_addr;
 }
@@ -608,13 +627,106 @@ size_t MemoryManager::MaxContinuousRange(GPUVAddr gpu_addr, size_t size) const {
         entry.serial == serial) {
         return entry.result;
     }
-    const size_t result = MaxContinuousRangeUncached(gpu_addr, size);
+    size_t result;
+    static const int mode = [] {
+        // EDEN_NX2_MCR: 0 walks every page, 1 (default) adds whole chunks in one step, 2 does
+        // both and logs the first answers that differ.
+        const char* value = std::getenv("EDEN_NX2_MCR");
+        return value ? std::atoi(value) : 1;
+    }();
+    if (mode != 0 && size >= 2 * chunk_size && !chunk_summary.empty()) {
+        result = MaxContinuousRangeChunked(gpu_addr, size);
+        if (mode == 2) {
+            const size_t reference = MaxContinuousRangeUncached(gpu_addr, size);
+            static std::atomic<u32> reported{};
+            if (reference != result && reported.fetch_add(1) < 16) {
+                LOG_ERROR(HW_GPU, "MaxContinuousRange({:#x}, {:#x}): chunked {:#x}, walk {:#x}",
+                          gpu_addr, size, result, reference);
+            }
+            result = reference;
+        }
+    } else {
+        result = MaxContinuousRangeUncached(gpu_addr, size);
+    }
     entry = {unique_identifier + 1, gpu_addr, size, serial, result};
     return result;
 }
 
+size_t MemoryManager::MaxContinuousRangeChunked(GPUVAddr gpu_addr, size_t size) const {
+    std::optional<DAddr> expected{};
+    size_t total = 0;
+    GPUVAddr current = gpu_addr;
+    size_t remaining = size;
+    while (remaining > 0) {
+        const size_t chunk = current >> chunk_bits;
+        const size_t to_chunk_end = chunk_size - (current & (chunk_size - 1));
+        const size_t span = (std::min)(remaining, to_chunk_end);
+        size_t covered = 0;
+        bool whole = false;
+        if (span == chunk_size && chunk < chunk_summary.size()) {
+            const u64 summary = ChunkSummary(chunk);
+            if ((summary & ChunkOneRange) != 0) {
+                const DAddr start = static_cast<DAddr>(summary >> ChunkDeviceShift) << cpu_page_bits;
+                if (!expected || *expected == start) {
+                    expected = start + chunk_size;
+                    covered = chunk_size;
+                    whole = true;
+                }
+            }
+        }
+        if (!whole) {
+            covered = WalkContinuous(current, span, expected);
+        }
+        total += covered;
+        if (covered < span) {
+            break;
+        }
+        current += span;
+        remaining -= span;
+    }
+    return total;
+}
+
+u64 MemoryManager::ChunkSummary(size_t chunk) const {
+    const u32 version = chunk_version[chunk].load(std::memory_order_acquire);
+    const u64 tag = version % ChunkTagMask + 1;
+    const u64 known = chunk_summary[chunk].load(std::memory_order_relaxed);
+    if ((known & ChunkTagMask) == tag) {
+        return known;
+    }
+    u64 fresh = tag;
+    const GPUVAddr base = static_cast<GPUVAddr>(chunk) << chunk_bits;
+    std::optional<DAddr> expected{};
+    if (WalkContinuous(base, chunk_size, expected) == chunk_size) {
+        if (const auto device = GpuToCpuAddress(base)) {
+            fresh |= ChunkOneRange | (static_cast<u64>(*device >> cpu_page_bits) << ChunkDeviceShift);
+        }
+    }
+    // A page table change since the version was read leaves a summary nobody will match.
+    if (chunk_version[chunk].load(std::memory_order_acquire) == version) {
+        chunk_summary[chunk].store(fresh, std::memory_order_relaxed);
+    }
+    return fresh;
+}
+
+void MemoryManager::InvalidateChunks(GPUVAddr gpu_addr, size_t size) {
+    if (chunk_version.empty() || size == 0) {
+        return;
+    }
+    const size_t first = gpu_addr >> chunk_bits;
+    const size_t last = (std::min)((gpu_addr + size - 1) >> chunk_bits, chunk_version.size() - 1);
+    for (size_t chunk = first; chunk <= last; ++chunk) {
+        chunk_version[chunk].fetch_add(1, std::memory_order_release);
+    }
+}
+
 size_t MemoryManager::MaxContinuousRangeUncached(GPUVAddr gpu_addr, size_t size) const {
-    std::optional<DAddr> old_page_addr{};
+    std::optional<DAddr> expected{};
+    return WalkContinuous(gpu_addr, size, expected);
+}
+
+size_t MemoryManager::WalkContinuous(GPUVAddr gpu_addr, size_t size,
+                                     std::optional<DAddr>& old_page_addr) const {
     size_t range_so_far = 0;
     bool result{false};
     auto fail = [&]([[maybe_unused]] std::size_t page_index, [[maybe_unused]] std::size_t offset,
