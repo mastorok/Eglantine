@@ -3,9 +3,10 @@
 
 #include <cstdlib>
 
-#include "video_core/host_shaders/mesh_emulation_prefix_comp_spv.h"
 #include "video_core/renderer_vulkan/vk_mesh_emulation.h"
 #include "video_core/vulkan_common/vulkan_device.h"
+
+#include "video_core/host_shaders/mesh_emulation_prefix_comp_spv.h"
 
 namespace Vulkan {
 
