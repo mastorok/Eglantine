@@ -1818,28 +1818,45 @@ void EmitContext::DefineMesh(const IR::Program& program) {
     if (stage != Stage::Task && stage != Stage::Mesh) {
         return;
     }
-    AddExtension("SPV_EXT_mesh_shader");
-    AddCapability(spv::Capability::MeshShadingEXT);
     mesh_info = program.mesh;
     mesh_threads = program.workgroup_size[0];
+    mesh_compute = profile.emulate_mesh_with_compute;
     // The task's output region, which its mesh workgroups read as their input region.
     const Id payload_type{TypeArray(U32[1], Const(mesh_info.payload_words))};
-    mesh_payload = DefineVariable(*this, payload_type, std::nullopt,
-                                  spv::StorageClass::TaskPayloadWorkgroupEXT);
+    if (mesh_compute) {
+        mesh_payload =
+            DefineVariable(*this, payload_type, std::nullopt, spv::StorageClass::Workgroup);
+        mesh_payload_u32 = TypePointer(spv::StorageClass::Workgroup, U32[1]);
+        const Id scratch_array{TypeRuntimeArray(U32[1])};
+        Decorate(scratch_array, spv::Decoration::ArrayStride, 4U);
+        const Id scratch_struct{TypeStruct(scratch_array)};
+        Decorate(scratch_struct, spv::Decoration::Block);
+        MemberDecorate(scratch_struct, 0, spv::Decoration::Offset, 0U);
+        const Id scratch_pointer{TypePointer(spv::StorageClass::StorageBuffer, scratch_struct)};
+        mesh_scratch_u32 = TypePointer(spv::StorageClass::StorageBuffer, U32[1]);
+        mesh_scratch = AddGlobalVariable(scratch_pointer, spv::StorageClass::StorageBuffer);
+        Decorate(mesh_scratch, spv::Decoration::DescriptorSet, MeshEmulation::ScratchSet);
+        Decorate(mesh_scratch, spv::Decoration::Binding, MeshEmulation::ScratchBinding);
+        Name(mesh_scratch, "mesh_scratch");
+        if (profile.supported_spirv >= 0x00010400) {
+            interfaces.push_back(mesh_scratch);
+        }
+    } else {
+        AddExtension("SPV_EXT_mesh_shader");
+        AddCapability(spv::Capability::MeshShadingEXT);
+        mesh_payload = DefineVariable(*this, payload_type, std::nullopt,
+                                      spv::StorageClass::TaskPayloadWorkgroupEXT);
+        mesh_payload_u32 = TypePointer(spv::StorageClass::TaskPayloadWorkgroupEXT, U32[1]);
+    }
     Name(mesh_payload, "task_payload");
-    mesh_payload_u32 = TypePointer(spv::StorageClass::TaskPayloadWorkgroupEXT, U32[1]);
     if (stage == Stage::Task) {
         return;
     }
     // Output attribute region: groups of 32 vertices, then groups of 32 primitives, one 32-word
     // line per attribute. The map region keeps one map byte per word.
-    const u32 vertex_lines{static_cast<u32>(mesh_info.vertex_lines.size())};
-    const u32 primitive_lines{static_cast<u32>(mesh_info.primitive_lines.size())};
-    mesh_primitive_base = Common::DivCeil(mesh_info.max_vertices, 32U) * vertex_lines * 32;
-    mesh_attribute_words = (std::max)(
-        mesh_primitive_base + Common::DivCeil(mesh_info.max_primitives, 32U) * primitive_lines * 32,
-        1U);
-    mesh_map_bytes = 4 + mesh_info.PrimitiveVertices() * mesh_info.max_primitives;
+    mesh_primitive_base = mesh_info.PrimitiveBase();
+    mesh_attribute_words = mesh_info.AttributeWords();
+    mesh_map_bytes = mesh_info.MapBytes();
     mesh_shared_u32 = TypePointer(spv::StorageClass::Workgroup, U32[1]);
     mesh_attributes = DefineVariable(*this, TypeArray(U32[1], Const(mesh_attribute_words)),
                                      std::nullopt, spv::StorageClass::Workgroup);
@@ -1850,6 +1867,12 @@ void EmitContext::DefineMesh(const IR::Program& program) {
     mesh_primitive_count =
         DefineVariable(*this, U32[1], std::nullopt, spv::StorageClass::Workgroup);
     Name(mesh_primitive_count, "isbe_primitive_count");
+    if (mesh_compute) {
+        // No outputs: the epilogue leaves the regions in the scratch buffer for the vertex stage.
+        mesh_group_index = DefineVariable(*this, U32[1], std::nullopt, spv::StorageClass::Private);
+        Name(mesh_group_index, "mesh_group_index");
+        return;
+    }
 
     const Id vertex_count{Const(mesh_info.max_vertices)};
     const Id primitive_count{Const(mesh_info.max_primitives)};

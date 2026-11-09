@@ -395,6 +395,13 @@ public:
     std::vector<MeshLineTarget> mesh_primitive_targets;
     std::array<Id, 2> mesh_outputs_marker{};
     std::array<Id, 4> mesh_tasks_marker{};
+    // Profile::emulate_mesh_with_compute: the program is a compute shader. The task payload and the
+    // mesh regions stay in workgroup memory, and the scratch buffer of the draw
+    // (MeshEmulation) takes the payload, the group counts and the mesh records.
+    bool mesh_compute{};
+    Id mesh_scratch{};       ///< storage buffer variable, runtime array of words
+    Id mesh_scratch_u32{};   ///< pointer type to one scratch word
+    Id mesh_group_index{};   ///< Private u32: index of the mesh workgroup within its task
 
     Id load_const_func_u8{};
     Id load_const_func_u16{};
