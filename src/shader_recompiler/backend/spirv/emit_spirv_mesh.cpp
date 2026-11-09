@@ -31,7 +31,8 @@ Id LocalInvocation(EmitContext& ctx) {
 
 // Mesh emulated with compute (EmitContext::mesh_compute): the draw's scratch buffer.
 Id ScratchWord(EmitContext& ctx, Id index) {
-    return ctx.OpAccessChain(ctx.mesh_scratch_u32, ctx.mesh_scratch, ctx.u32_zero_value, index);
+    return ctx.OpAccessChain(ctx.mesh_scratch_u32, ctx.mesh_scratch, ctx.u32_zero_value, index,
+                             ctx.u32_zero_value);
 }
 
 Id ScratchParam(EmitContext& ctx, u32 param) {

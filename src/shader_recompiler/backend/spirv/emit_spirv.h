@@ -34,6 +34,15 @@ constexpr u32 RESCALING_LAYOUT_DOWN_FACTOR_OFFSET = offsetof(RescalingLayout, do
 constexpr u32 RENDERAREA_LAYOUT_OFFSET = offsetof(RenderAreaLayout, render_area);
 
 [[nodiscard]] std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_info, IR::Program& program, Bindings& bindings);
+/// True when EmitMeshEmulationVertexShader can stand in for the mesh program's outputs.
+[[nodiscard]] bool CanEmulateMeshVertex(const MeshInfo& mesh);
+
+/// The vertex shader of a mesh program emulated with compute (Profile::emulate_mesh_with_compute):
+/// reads the records the task and mesh compute shaders left in the scratch buffer.
+[[nodiscard]] std::vector<u32> EmitMeshEmulationVertexShader(const Profile& profile,
+                                                             const RuntimeInfo& runtime_info,
+                                                             const MeshInfo& mesh);
+
 [[nodiscard]] inline std::vector<u32> EmitSPIRV(const Profile& profile, IR::Program& program) {
     Bindings binding;
     return EmitSPIRV(profile, {}, program, binding);

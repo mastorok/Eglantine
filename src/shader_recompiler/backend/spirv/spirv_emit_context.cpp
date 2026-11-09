@@ -1827,7 +1827,11 @@ void EmitContext::DefineMesh(const IR::Program& program) {
         mesh_payload =
             DefineVariable(*this, payload_type, std::nullopt, spv::StorageClass::Workgroup);
         mesh_payload_u32 = TypePointer(spv::StorageClass::Workgroup, U32[1]);
-        const Id scratch_array{TypeRuntimeArray(U32[1])};
+        // Words wrapped in a one-member struct: a bare u32 runtime array is the type the storage
+        // buffer definitions decorate (a type can only have one ArrayStride).
+        const Id scratch_word{TypeStruct(U32[1])};
+        MemberDecorate(scratch_word, 0, spv::Decoration::Offset, 0U);
+        const Id scratch_array{TypeRuntimeArray(scratch_word)};
         Decorate(scratch_array, spv::Decoration::ArrayStride, 4U);
         const Id scratch_struct{TypeStruct(scratch_array)};
         Decorate(scratch_struct, spv::Decoration::Block);
