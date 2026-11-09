@@ -110,6 +110,13 @@ namespace Vulkan {
         /// images would otherwise leave holes in the shared blocks).
         vk::Image CreateImage(const VkImageCreateInfo &ci, bool dedicated = false) const;
 
+        /// True for images CreateImage never backs (nothing bound: reads return zero). Switch 2
+        /// titles: more than 2^28 texels (their sparse virtual textures). Other titles: only when
+        /// that is also more than 1 GiB (Metroid Prime 4's 768x768x736 BC1/BC6H light volumes are
+        /// 217-434 MB, real data that must not read as black). EDEN_NX2_HUGE_BYTES=<bytes> sets
+        /// the byte limit for every title (0: the texel rule alone).
+        static bool IsHugeImage(const VkImageCreateInfo &ci);
+
         /// A sparse resident image with nothing bound (reads return zero, writes are dropped), or
         /// a null image when the device can't make one.
         /// aliased: its sparse blocks may share memory (VK_IMAGE_CREATE_SPARSE_ALIASED_BIT).

@@ -9,6 +9,7 @@
 #include <atomic>
 #include <bit>
 #include <chrono>
+#include <cstdlib>
 #include <limits>
 #include <optional>
 #include <type_traits>
@@ -232,6 +233,69 @@ MemoryAllocator::MemoryAllocator(const Device &device_)
 
 MemoryAllocator::~MemoryAllocator() = default;
 
+namespace {
+
+// Bits per texel of a format (block formats averaged over their block); 32 for formats not listed.
+[[nodiscard]] u32 BitsPerTexel(VkFormat format) {
+    const u32 f = static_cast<u32>(format);
+    if (f >= 157 && f <= 184) { // ASTC: 128 bits per block
+        static constexpr std::array<u32, 14> texels_per_block{16, 20, 25, 30, 36, 40, 48,
+                                                              64, 50, 60, 80, 100, 120, 144};
+        return (std::max)(1U, 128 / texels_per_block[(f - 157) / 2]);
+    }
+    if ((f >= 131 && f <= 134) || f == 139 || f == 140) { // BC1, BC4
+        return 4;
+    }
+    if (f >= 135 && f <= 146) { // BC2, BC3, BC5, BC6H, BC7
+        return 8;
+    }
+    if (f >= 147 && f <= 156) { // ETC2, EAC
+        return (f == 151 || f == 152 || f == 155 || f == 156) ? 8 : 4;
+    }
+    if (f >= 9 && f <= 15) { // R8
+        return 8;
+    }
+    if ((f >= 16 && f <= 22) || (f >= 70 && f <= 76) || f == 124) { // R8G8, R16, D16
+        return 16;
+    }
+    if ((f >= 91 && f <= 97) || (f >= 101 && f <= 103)) { // R16G16B16A16, R32G32
+        return 64;
+    }
+    if (f >= 107 && f <= 109) { // R32G32B32A32
+        return 128;
+    }
+    return 32;
+}
+
+// Device memory an image needs, roughly (mip chains counted as a third more).
+[[nodiscard]] u64 EstimatedImageBytes(const VkImageCreateInfo& ci) {
+    const u64 texels = u64{ci.extent.width} * ci.extent.height * ci.extent.depth * ci.arrayLayers *
+                       static_cast<u64>(ci.samples);
+    const u64 bytes = texels * BitsPerTexel(ci.format) / 8;
+    return ci.mipLevels > 1 ? bytes + bytes / 3 : bytes;
+}
+
+} // Anonymous namespace
+
+bool MemoryAllocator::IsHugeImage(const VkImageCreateInfo& ci) {
+    const u64 texels = u64{ci.extent.width} * ci.extent.height * ci.extent.depth * ci.arrayLayers;
+    if (texels <= (u64{1} << 28)) {
+        return false;
+    }
+    static const std::optional<u64> byte_limit{[]() -> std::optional<u64> {
+        const char* value = std::getenv("EDEN_NX2_HUGE_BYTES");
+        if (value == nullptr) {
+            return std::nullopt;
+        }
+        return static_cast<u64>(std::strtoull(value, nullptr, 0));
+    }()};
+    if (!byte_limit && Settings::CurrentProgramIsSwitch2()) {
+        return true;
+    }
+    const u64 limit = byte_limit.value_or(u64{1} << 30);
+    return limit == 0 || EstimatedImageBytes(ci) > limit;
+}
+
 vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicated) const
 {
     const SlowImageLog slow_log{ci};
@@ -257,8 +321,19 @@ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicat
     // Images this large (title 1's sparse texture arrays reach 4.5G texels, ~23 GB) are never
     // backed: VMA would quietly place them in system memory once VRAM is full. They take the
     // unbacked sparse fallback below.
-    const u64 texels = u64{ci.extent.width} * ci.extent.height * ci.extent.depth * ci.arrayLayers;
-    const bool huge = texels > (u64{1} << 28);
+    const bool huge = IsHugeImage(ci);
+    if (!huge && u64{ci.extent.width} * ci.extent.height * ci.extent.depth * ci.arrayLayers >
+                     (u64{1} << 28)) {
+        static std::atomic<u32> large_logged{};
+        if (large_logged.fetch_add(1, std::memory_order_relaxed) < 24) {
+            LOG_INFO(Render_Vulkan,
+                     "Image {}x{}x{} ({} levels, {} layers, format {}) is over 2^28 texels but "
+                     "about {} MiB: backed",
+                     ci.extent.width, ci.extent.height, ci.extent.depth, ci.mipLevels,
+                     ci.arrayLayers, static_cast<u32>(ci.format),
+                     EstimatedImageBytes(ci) >> 20);
+        }
+    }
     VkResult result = huge ? VK_ERROR_OUT_OF_DEVICE_MEMORY
                            : vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {
