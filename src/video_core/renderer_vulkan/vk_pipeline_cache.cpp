@@ -41,6 +41,7 @@
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
 #include "video_core/renderer_vulkan/vertex_repack.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
+#include "video_core/renderer_vulkan/vk_mesh_emulation.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -1324,7 +1325,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         // skipped (see the pipeline check in the rasterizer).
         if ((env.ShaderStage() == Shader::Stage::Task ||
              env.ShaderStage() == Shader::Stage::Mesh) &&
-            !device.IsExtMeshShaderSupported()) {
+            !device.IsExtMeshShaderSupported() && mesh_emulation_resources == nullptr) {
             // EDEN_NX2_MESH_PROBE=1: describe each skipped program once (what an emulation
             // through compute shaders would have to hold), then skip it as before.
             static const bool mesh_probe = std::getenv("EDEN_NX2_MESH_PROBE") != nullptr;
@@ -1435,6 +1436,50 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             }
         }
     }
+    // Task and mesh programs without VK_EXT_mesh_shader: compute shaders plus a vertex shader.
+    MeshEmulationInfo mesh_emulation;
+    Shader::Profile mesh_profile{profile};
+    mesh_profile.emulate_mesh_with_compute = true;
+    const bool emulate_mesh{!device.IsExtMeshShaderSupported() &&
+                            mesh_emulation_resources != nullptr};
+    if (emulate_mesh) {
+        const Shader::IR::Program* task_program{};
+        const Shader::IR::Program* mesh_program{};
+        for (size_t index = 0; index < Maxwell::MaxShaderProgram; ++index) {
+            if (key.unique_hashes[index] == 0) {
+                continue;
+            }
+            if (programs[index].stage == Shader::Stage::Task) {
+                task_program = &programs[index];
+            } else if (programs[index].stage == Shader::Stage::Mesh) {
+                mesh_program = &programs[index];
+            }
+        }
+        if (mesh_program != nullptr) {
+            const char* reason{};
+            if (!Shader::Backend::SPIRV::CanEmulateMeshVertex(mesh_program->mesh)) {
+                reason = "the mesh program has per-primitive outputs";
+            } else if (task_program != nullptr &&
+                       task_program->mesh.payload_words != mesh_program->mesh.payload_words) {
+                reason = "the task and mesh programs disagree on the payload size";
+            }
+            if (reason != nullptr) {
+                static std::atomic<u32> logged{};
+                if (logged.fetch_add(1) < 16) {
+                    LOG_WARNING(Render_Vulkan, "Mesh emulation skips pipeline {:016x}: {}", hash,
+                                reason);
+                }
+                return nullptr;
+            }
+            mesh_emulation.resources = mesh_emulation_resources;
+            mesh_emulation.topology = mesh_program->mesh.topology;
+            mesh_emulation.payload_words = task_program != nullptr ? mesh_program->mesh.payload_words : 0;
+            mesh_emulation.record_words = mesh_program->mesh.RecordWords();
+            mesh_emulation.vertices_per_group =
+                mesh_program->mesh.PrimitiveVertices() * mesh_program->mesh.max_primitives;
+        }
+    }
+
     std::array<const Shader::Info*, Maxwell::MaxShaderStage> infos{};
     std::array<vk::ShaderModule, Maxwell::MaxShaderStage> modules;
 
@@ -1455,9 +1500,18 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
 
         const auto runtime_info{MakeRuntimeInfo(programs, key, program, previous_stage, device)};
         ConvertLegacyToGeneric(program, runtime_info);
-        const std::vector<u32> code{EmitSPIRV(profile, runtime_info, program, binding)};
+        const bool emulated_stage{mesh_emulation.resources != nullptr &&
+                                  (program.stage == Shader::Stage::Task ||
+                                   program.stage == Shader::Stage::Mesh)};
+        const std::vector<u32> code{
+            EmitSPIRV(emulated_stage ? mesh_profile : profile, runtime_info, program, binding)};
         device.SaveShader(code);
         modules[stage_index] = BuildShader(device, code);
+        if (emulated_stage && program.stage == Shader::Stage::Mesh) {
+            const std::vector<u32> vertex_code{Shader::Backend::SPIRV::EmitMeshEmulationVertexShader(
+                mesh_profile, runtime_info, program.mesh)};
+            mesh_emulation.vertex_module = BuildShader(device, vertex_code);
+        }
 
         // Text log + .spv dump. Text log is gated by gpu_log_level != Off; .spv dump
         // is independent and gated only by gpu_log_shader_dumps.
@@ -1487,7 +1541,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     return std::make_unique<GraphicsPipeline>(
         scheduler, buffer_cache, texture_cache, vulkan_pipeline_cache, &shader_notify, device,
         descriptor_pool, guest_descriptor_queue, descriptor_buffer_ring, thread_worker, statistics,
-        render_pass_cache, key, std::move(modules), infos);
+        render_pass_cache, key, std::move(modules), infos, std::move(mesh_emulation));
 
 } catch (const Shader::Exception& exception) {
     auto hash = key.Hash();
@@ -1560,6 +1614,10 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
     // Task and mesh programs are translated with the mesh registers, which vulkan.bin doesn't
     // carry: they go to their own file (builds without it never read those records).
     const bool is_mesh = pipeline->IsMeshPipeline();
+    if (pipeline->IsMeshEmulated()) {
+        // Not stored: the disk cache loader of this device does not rebuild these.
+        return pipeline;
+    }
     if (disk_pipelines.contains(graphics_key.Hash())) {
         // In the disk cache already, only not built at boot.
         QueueVulkanPipelineCacheFlush();

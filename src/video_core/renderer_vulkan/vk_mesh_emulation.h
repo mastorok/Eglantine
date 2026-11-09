@@ -32,6 +32,10 @@ public:
     [[nodiscard]] VkDescriptorSetLayout ScratchSetLayout() const noexcept {
         return *scratch_set_layout;
     }
+    /// Stands in for set 0 of a pipeline whose stages use no descriptors.
+    [[nodiscard]] VkDescriptorSetLayout EmptySetLayout() const noexcept {
+        return *empty_set_layout;
+    }
     [[nodiscard]] VkDescriptorSet ScratchSet() const noexcept {
         return scratch_sets[0];
     }

@@ -89,6 +89,7 @@ namespace Vulkan {
 class ComputePipeline;
 class DescriptorPool;
 class Device;
+class MeshEmulationResources;
 class PipelineStatistics;
 class RenderPassCache;
 class Scheduler;
@@ -116,6 +117,12 @@ public:
                            RenderPassCache& render_pass_cache, BufferCache& buffer_cache,
                            TextureCache& texture_cache, VideoCore::ShaderNotify& shader_notify_);
     ~PipelineCache();
+
+    /// Task and mesh programs run as compute shaders with these resources (the device has no
+    /// VK_EXT_mesh_shader); without them their pipelines are skipped.
+    void SetMeshEmulation(MeshEmulationResources* resources) noexcept {
+        mesh_emulation_resources = resources;
+    }
 
     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipeline();
     [[nodiscard]] bool IsIndirectResetShader() const;
@@ -196,6 +203,7 @@ private:
 
     Shader::Profile profile;
     Shader::HostTranslateInfo host_info;
+    MeshEmulationResources* mesh_emulation_resources{};
 
     std::filesystem::path pipeline_cache_filename;
     /// Task and mesh pipelines, with the mesh state they are translated with.
