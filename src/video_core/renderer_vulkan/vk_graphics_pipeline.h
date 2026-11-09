@@ -68,11 +68,24 @@ struct hash<Vulkan::GraphicsPipelineCacheKey> {
 namespace Vulkan {
 
 class Device;
+class MeshEmulationResources;
 class PipelineStatistics;
 class RenderPassCache;
 class RescalingPushConstant;
 class RenderAreaPushConstant;
 class Scheduler;
+
+/// A task/mesh pipeline on a device without VK_EXT_mesh_shader: its task and mesh programs are
+/// compute shaders (in their stage slots), a synthetic vertex shader replaces the mesh stage in the
+/// graphics pipeline (see MeshEmulationResources and MeshEmulation in shader_info.h).
+struct MeshEmulationInfo {
+    MeshEmulationResources* resources{};
+    vk::ShaderModule vertex_module;
+    u32 topology{};           ///< of the mesh program: 0 points, 1 lines, 2 triangles
+    u32 payload_words{};      ///< of a task workgroup (0 without a task program)
+    u32 record_words{};       ///< a mesh workgroup leaves in the scratch buffer
+    u32 vertices_per_group{}; ///< the draw issues per mesh workgroup
+};
 
 class GraphicsPipeline {
     static constexpr size_t NUM_STAGES = Tegra::Engines::Maxwell3D::Regs::MaxShaderStage;
@@ -86,7 +99,8 @@ public:
         DescriptorBufferRing& descriptor_buffer_ring, Common::ThreadWorker* worker_thread,
         PipelineStatistics* pipeline_statistics, RenderPassCache& render_pass_cache,
         const GraphicsPipelineCacheKey& key, std::array<vk::ShaderModule, NUM_STAGES> stages,
-        const std::array<const Shader::Info*, NUM_STAGES>& infos);
+        const std::array<const Shader::Info*, NUM_STAGES>& infos,
+        MeshEmulationInfo mesh_emulation = {});
 
     bool HasDynamicVertexInput() const noexcept { return key.state.dynamic_vertex_input; }
     const std::array<u64, 6>& ShaderHashes() const noexcept {
@@ -121,6 +135,13 @@ public:
     [[nodiscard]] bool IsMeshPipeline() const noexcept {
         return stage_infos[0].is_task || stage_infos[0].is_mesh;
     }
+    /// Task/mesh pipeline run by compute shaders and a synthetic vertex shader.
+    [[nodiscard]] bool IsMeshEmulated() const noexcept {
+        return mesh_emulation.resources != nullptr;
+    }
+    /// The scratch buffer holding the draw arguments of a mesh-emulated draw.
+    [[nodiscard]] VkBuffer MeshScratch() const noexcept;
+
     GraphicsPipeline& operator=(GraphicsPipeline&&) noexcept = delete;
     GraphicsPipeline(GraphicsPipeline&&) noexcept = delete;
 
@@ -181,6 +202,15 @@ private:
     bool ConfigureDraw(const RescalingPushConstant& rescaling,
                        const RenderAreaPushConstant& render_are);
 
+    /// Records the compute passes of a mesh-emulated draw, outside any render pass: they leave
+    /// the mesh records and the draw's arguments in the scratch buffer.
+    void RecordMeshEmulation(const void* descriptor_data, u32 task_groups,
+                             const RescalingPushConstant& rescaling,
+                             const RenderAreaPushConstant& render_area, bool is_rescaling);
+
+    /// Binds the descriptor set the compute passes committed and the scratch buffer.
+    void BindMeshEmulationSets(vk::CommandBuffer& cmdbuf, VkPipelineBindPoint bind_point) const;
+
     void MakePipeline(VkRenderPass render_pass);
 
     void Validate();
@@ -212,6 +242,14 @@ private:
     std::vector<SampledImage> sampled_images;
     u32 num_textures{};
     bool fragment_has_color0_output{};
+
+    MeshEmulationInfo mesh_emulation;
+    size_t mesh_task_slot{NUM_STAGES};
+    size_t mesh_mesh_slot{NUM_STAGES};
+    vk::Pipeline mesh_task_pipeline;
+    vk::Pipeline mesh_mesh_pipeline;
+    VkDescriptorSet mesh_descriptor_set{}; ///< committed by the compute passes, bound by the draw
+    VkShaderStageFlags push_constant_stages{VK_SHADER_STAGE_ALL_GRAPHICS};
 
     vk::DescriptorSetLayout descriptor_set_layout;
     DescriptorAllocator descriptor_allocator;

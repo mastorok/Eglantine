@@ -22,6 +22,7 @@
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_fence_manager.h"
 #include "video_core/renderer_vulkan/vk_frame_dump.h"
+#include "video_core/renderer_vulkan/vk_mesh_emulation.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_query_cache.h"
 #include "video_core/renderer_vulkan/vk_render_pass_cache.h"
@@ -248,6 +249,9 @@ private:
     BufferCache buffer_cache;
     QueryCacheRuntime query_cache_runtime;
     QueryCache query_cache;
+    /// Task/mesh draws run by compute shaders (EDEN_NX2_MESH_EMU=1, no VK_EXT_mesh_shader); the
+    /// pipelines use it, so it outlives the pipeline cache.
+    std::unique_ptr<MeshEmulationResources> mesh_emulation;
     PipelineCache pipeline_cache;
     AccelerateDMA accelerate_dma;
     FenceManager fence_manager;
@@ -261,6 +265,7 @@ private:
 
     u32 draw_counter = 0;
     bool mesh_draw{}; ///< the draw being prepared uses a task/mesh pipeline
+    VkBuffer mesh_scratch{}; ///< its arguments, when the task/mesh pipeline is emulated
 };
 
 } // namespace Vulkan

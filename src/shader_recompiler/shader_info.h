@@ -273,7 +273,54 @@ struct MeshInfo {
     [[nodiscard]] u32 PrimitiveVertices() const noexcept {
         return topology == 0 ? 1 : topology == 1 ? 2 : 3;
     }
+
+    /// Words of the vertex attribute groups: groups of 32 vertices, one 32-word line per attribute.
+    [[nodiscard]] u32 PrimitiveBase() const noexcept {
+        return (max_vertices + 31) / 32 * static_cast<u32>(vertex_lines.size()) * 32;
+    }
+
+    /// Words of the whole output attribute region (vertex groups, then primitive groups).
+    [[nodiscard]] u32 AttributeWords() const noexcept {
+        const u32 words{PrimitiveBase() +
+                        (max_primitives + 31) / 32 * static_cast<u32>(primitive_lines.size()) * 32};
+        return words > 1 ? words : 1;
+    }
+
+    /// Bytes of the map region: the primitive count word, then PrimitiveVertices() bytes per primitive.
+    [[nodiscard]] u32 MapBytes() const noexcept {
+        return 4 + PrimitiveVertices() * max_primitives;
+    }
+
+    /// Mesh emulated with compute: words of the record a mesh workgroup leaves in the scratch
+    /// buffer: the primitive count, the attribute region, then the map bytes packed four to a word.
+    [[nodiscard]] u32 RecordWords() const noexcept {
+        return 1 + AttributeWords() + (MapBytes() + 3) / 4;
+    }
 };
+
+/// Task and mesh programs emulated with compute shaders (Profile::emulate_mesh_with_compute).
+/// A draw's work lives in one storage buffer (descriptor set 1, binding 0, a dynamic offset per
+/// draw), addressed in words from that offset:
+///   [0, 8)    parameters, below
+///   [8, 15)   VkDispatchIndirectCommand (3 words) then VkDrawIndirectCommand (4 words)
+///   task payloads (`task_count` * payload_words), per-task mesh group counts (`task_count`),
+///   per-task first mesh group (`task_count`), then one mesh record per mesh workgroup.
+namespace MeshEmulation {
+constexpr u32 ScratchSet{1};
+constexpr u32 ScratchBinding{0};
+constexpr u32 ParamPayloadBase{0};  ///< first word of the task payloads
+constexpr u32 ParamCountsBase{1};   ///< first word of the per-task mesh group counts
+constexpr u32 ParamOffsetsBase{2};  ///< first word of the per-task first mesh group (exclusive sums)
+constexpr u32 ParamRecordsBase{3};  ///< first word of the mesh records
+constexpr u32 ParamTaskCount{4};    ///< task workgroups of the draw, 0 without a task program
+constexpr u32 ParamMaxGroups{5};    ///< mesh records that fit
+constexpr u32 ParamVerticesPerGroup{6}; ///< vertices the draw issues per mesh workgroup
+constexpr u32 ParamDirectGroups{7}; ///< mesh workgroups of a draw without a task program
+constexpr u32 ParamWords{8};
+constexpr u32 DispatchIndirectWord{8};
+constexpr u32 DrawIndirectWord{11};
+constexpr u32 HeaderWords{16};
+} // namespace MeshEmulation
 
 struct Info {
     static constexpr size_t MAX_INDIRECT_CBUFS{14};

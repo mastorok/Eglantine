@@ -29,6 +29,20 @@ Id LocalInvocation(EmitContext& ctx) {
     return ctx.OpCompositeExtract(ctx.U32[1], ctx.OpLoad(ctx.U32[3], ctx.local_invocation_id), 0U);
 }
 
+// Mesh emulated with compute (EmitContext::mesh_compute): the draw's scratch buffer.
+Id ScratchWord(EmitContext& ctx, Id index) {
+    return ctx.OpAccessChain(ctx.mesh_scratch_u32, ctx.mesh_scratch, ctx.u32_zero_value, index,
+                             ctx.u32_zero_value);
+}
+
+Id ScratchParam(EmitContext& ctx, u32 param) {
+    return ctx.OpLoad(ctx.U32[1], ScratchWord(ctx, ctx.Const(param)));
+}
+
+Id WorkgroupIndex(EmitContext& ctx) {
+    return ctx.OpCompositeExtract(ctx.U32[1], ctx.OpLoad(ctx.U32[3], ctx.workgroup_id), 0U);
+}
+
 Id Clamped(EmitContext& ctx, Id index, u32 count) {
     return ctx.OpUMin(ctx.U32[1], index, ctx.Const(count - 1));
 }
@@ -107,7 +121,78 @@ void ConvertDepth(EmitContext& ctx, Id vertex) {
     ctx.OpStore(ctx.OpAccessChain(ctx.output_f32, ctx.output_position, vertex, ctx.Const(2U)), z);
 }
 
+// Finds the task workgroup this mesh workgroup belongs to and copies its payload into workgroup
+// memory. The task workgroups' first mesh group (exclusive sums) are in the scratch buffer; the
+// search is straight-line code because the prologue must not branch. Without a task program
+// (task count 0) the group index is the workgroup index and the payload is left alone.
+void MeshComputePrologue(EmitContext& ctx) {
+    const Id group{WorkgroupIndex(ctx)};
+    const Id task_count{ScratchParam(ctx, MeshEmulation::ParamTaskCount)};
+    const Id offsets_base{ScratchParam(ctx, MeshEmulation::ParamOffsetsBase)};
+    const Id last_task{ctx.OpISub(ctx.U32[1], task_count, ctx.Const(1U))};
+    Id low{ctx.u32_zero_value};
+    Id high{task_count};
+    // First task whose first group is past `group`: 17 halvings cover 131072 tasks.
+    for (u32 step = 0; step < 17; ++step) {
+        const Id active{ctx.OpULessThan(ctx.U1, low, high)};
+        const Id middle{ctx.OpShiftRightLogical(ctx.U32[1], ctx.OpIAdd(ctx.U32[1], low, high),
+                                                ctx.Const(1U))};
+        const Id first{ctx.OpLoad(
+            ctx.U32[1], ScratchWord(ctx, ctx.OpIAdd(ctx.U32[1], offsets_base,
+                                                    ctx.OpUMin(ctx.U32[1], middle, last_task))))};
+        const Id not_past{ctx.OpLogicalAnd(ctx.U1, active, ctx.OpULessThanEqual(ctx.U1, first, group))};
+        const Id past{ctx.OpLogicalAnd(ctx.U1, active, ctx.OpLogicalNot(ctx.U1, not_past))};
+        low = ctx.OpSelect(ctx.U32[1], not_past, ctx.OpIAdd(ctx.U32[1], middle, ctx.Const(1U)), low);
+        high = ctx.OpSelect(ctx.U32[1], past, middle, high);
+    }
+    const Id has_tasks{ctx.OpINotEqual(ctx.U1, task_count, ctx.u32_zero_value)};
+    const Id task{ctx.OpSelect(ctx.U32[1], has_tasks, ctx.OpISub(ctx.U32[1], low, ctx.Const(1U)),
+                               ctx.u32_zero_value)};
+    const Id task_first{ctx.OpLoad(
+        ctx.U32[1], ScratchWord(ctx, ctx.OpIAdd(ctx.U32[1], offsets_base, task)))};
+    ctx.OpStore(ctx.mesh_group_index,
+                ctx.OpSelect(ctx.U32[1], has_tasks, ctx.OpISub(ctx.U32[1], group, task_first), group));
+    const u32 words{ctx.mesh_info.payload_words};
+    const u32 threads{ctx.mesh_threads};
+    const Id invocation{LocalInvocation(ctx)};
+    const Id base{ctx.OpIAdd(ctx.U32[1], ScratchParam(ctx, MeshEmulation::ParamPayloadBase),
+                             ctx.OpIMul(ctx.U32[1], task, ctx.Const(words)))};
+    for (u32 first = 0; first < words; first += threads) {
+        const Id word{ctx.OpUMin(ctx.U32[1], ctx.OpIAdd(ctx.U32[1], invocation, ctx.Const(first)),
+                                 ctx.Const(words - 1))};
+        ctx.OpStore(PayloadWord(ctx, word),
+                    ctx.OpLoad(ctx.U32[1], ScratchWord(ctx, ctx.OpIAdd(ctx.U32[1], base, word))));
+    }
+}
+
+// Hands the payload and the mesh group count of this task workgroup to the scratch buffer.
+void TaskComputeEpilogue(EmitContext& ctx) {
+    Barrier(ctx);
+    const Id task{WorkgroupIndex(ctx)};
+    const Id invocation{LocalInvocation(ctx)};
+    const u32 words{ctx.mesh_info.payload_words};
+    const u32 threads{ctx.mesh_threads};
+    const Id base{ctx.OpIAdd(ctx.U32[1], ScratchParam(ctx, MeshEmulation::ParamPayloadBase),
+                             ctx.OpIMul(ctx.U32[1], task, ctx.Const(words)))};
+    for (u32 first = 0; first < words; first += threads) {
+        const Id word{ctx.OpUMin(ctx.U32[1], ctx.OpIAdd(ctx.U32[1], invocation, ctx.Const(first)),
+                                 ctx.Const(words - 1))};
+        // Indices past the end repeat the last word: the same value is stored twice.
+        ctx.OpStore(ScratchWord(ctx, ctx.OpIAdd(ctx.U32[1], base, word)),
+                    ctx.OpLoad(ctx.U32[1], PayloadWord(ctx, word)));
+    }
+    If(ctx, ctx.OpIEqual(ctx.U1, invocation, ctx.u32_zero_value), [&] {
+        const Id counts{ctx.OpIAdd(ctx.U32[1], ScratchParam(ctx, MeshEmulation::ParamCountsBase),
+                                   task)};
+        ctx.OpStore(ScratchWord(ctx, counts), ctx.OpLoad(ctx.U32[1], PayloadWord(ctx, ctx.Const(1U))));
+    });
+}
+
 void TaskEpilogue(EmitContext& ctx) {
+    if (ctx.mesh_compute) {
+        TaskComputeEpilogue(ctx);
+        return;
+    }
     Barrier(ctx);
     const Id count{ctx.OpLoad(ctx.U32[1], PayloadWord(ctx, ctx.Const(1U)))};
     const Id one{ctx.Const(1U)};
@@ -117,7 +202,105 @@ void TaskEpilogue(EmitContext& ctx) {
     ctx.mesh_tasks_marker = {count, one, one, ctx.mesh_payload};
 }
 
+// OpenGL-style clip space in the attribute region itself: z = (z + w) / 2.
+void ConvertDepthInPlace(EmitContext& ctx, Id vertex) {
+    const auto& lines{ctx.mesh_info.vertex_lines};
+    const auto z_line{std::ranges::find(lines, static_cast<u32>(IR::Attribute::PositionZ))};
+    const auto w_line{std::ranges::find(lines, static_cast<u32>(IR::Attribute::PositionW))};
+    if (z_line == lines.end() || w_line == lines.end()) {
+        return;
+    }
+    const u32 num_lines{static_cast<u32>(lines.size())};
+    const Id group{ctx.OpShiftRightLogical(ctx.U32[1], vertex, ctx.Const(5U))};
+    const Id slot{ctx.OpBitwiseAnd(ctx.U32[1], vertex, ctx.Const(31U))};
+    const Id first{ctx.OpIAdd(ctx.U32[1], ctx.OpIMul(ctx.U32[1], group, ctx.Const(num_lines * 32)),
+                              slot)};
+    const auto word = [&](auto line) {
+        const u32 offset{static_cast<u32>(line - lines.begin()) * 32};
+        return SharedWord(ctx, ctx.mesh_attributes, ctx.OpIAdd(ctx.U32[1], first, ctx.Const(offset)));
+    };
+    const Id z_pointer{word(z_line)};
+    const Id z{ctx.OpFMul(ctx.F32[1],
+                          ctx.OpFAdd(ctx.F32[1], ctx.OpBitcast(ctx.F32[1], ctx.OpLoad(ctx.U32[1], z_pointer)),
+                                     ctx.OpBitcast(ctx.F32[1], ctx.OpLoad(ctx.U32[1], word(w_line)))),
+                          ctx.Const(0.5f))};
+    ctx.OpStore(z_pointer, ctx.OpBitcast(ctx.U32[1], z));
+}
+
+// Leaves this mesh workgroup's record in the scratch buffer: the primitive count, the attribute
+// region and the map bytes, four to a word (MeshInfo::RecordWords).
+void MeshComputeEpilogue(EmitContext& ctx) {
+    const MeshInfo& mesh{ctx.mesh_info};
+    Barrier(ctx);
+    const Id count{ctx.OpUMin(ctx.U32[1], ctx.OpLoad(ctx.U32[1], ctx.mesh_primitive_count),
+                              ctx.Const(mesh.max_primitives))};
+    const Id invocation{LocalInvocation(ctx)};
+    const u32 threads{ctx.mesh_threads};
+    const bool convert_depth{ctx.runtime_info.convert_depth_mode && !ctx.profile.support_native_ndc};
+    if (convert_depth) {
+        for (u32 first = 0; first < mesh.max_vertices; first += threads) {
+            const Id vertex{ctx.OpIAdd(ctx.U32[1], invocation, ctx.Const(first))};
+            if (first + threads > mesh.max_vertices) {
+                If(ctx, ctx.OpULessThan(ctx.U1, vertex, ctx.Const(mesh.max_vertices)),
+                   [&] { ConvertDepthInPlace(ctx, vertex); });
+            } else {
+                ConvertDepthInPlace(ctx, vertex);
+            }
+        }
+    }
+    const Id record{ctx.OpIAdd(
+        ctx.U32[1], ScratchParam(ctx, MeshEmulation::ParamRecordsBase),
+        ctx.OpIMul(ctx.U32[1], WorkgroupIndex(ctx), ctx.Const(mesh.RecordWords())))};
+    If(ctx, ctx.OpIEqual(ctx.U1, invocation, ctx.u32_zero_value),
+       [&] { ctx.OpStore(ScratchWord(ctx, record), count); });
+    const u32 attribute_words{mesh.AttributeWords()};
+    for (u32 first = 0; first < attribute_words; first += threads) {
+        const Id word{ctx.OpIAdd(ctx.U32[1], invocation, ctx.Const(first))};
+        const auto copy = [&] {
+            ctx.OpStore(ScratchWord(ctx, ctx.OpIAdd(ctx.U32[1], record, ctx.OpIAdd(ctx.U32[1], word, ctx.Const(1U)))),
+                        ctx.OpLoad(ctx.U32[1], SharedWord(ctx, ctx.mesh_attributes, word)));
+        };
+        if (first + threads > attribute_words) {
+            If(ctx, ctx.OpULessThan(ctx.U1, word, ctx.Const(attribute_words)), copy);
+        } else {
+            copy();
+        }
+    }
+    const u32 map_bytes{mesh.MapBytes()};
+    const u32 map_words{(map_bytes + 3) / 4};
+    for (u32 first = 0; first < map_words; first += threads) {
+        const Id word{ctx.OpIAdd(ctx.U32[1], invocation, ctx.Const(first))};
+        const auto copy = [&] {
+            Id packed{ctx.u32_zero_value};
+            for (u32 byte = 0; byte < 4; ++byte) {
+                const Id index{ctx.OpIAdd(ctx.U32[1], ctx.OpShiftLeftLogical(ctx.U32[1], word, ctx.Const(2U)),
+                                          ctx.Const(byte))};
+                const Id in_range{ctx.OpULessThan(ctx.U1, index, ctx.Const(map_bytes))};
+                const Id value{ctx.OpSelect(
+                    ctx.U32[1], in_range,
+                    ctx.OpLoad(ctx.U32[1], SharedWord(ctx, ctx.mesh_map, Clamped(ctx, index, map_bytes))),
+                    ctx.u32_zero_value)};
+                packed = ctx.OpBitwiseOr(ctx.U32[1], packed,
+                                         ctx.OpShiftLeftLogical(ctx.U32[1], ctx.OpBitwiseAnd(ctx.U32[1], value, ctx.Const(0xffU)),
+                                                                ctx.Const(byte * 8)));
+            }
+            ctx.OpStore(ScratchWord(ctx, ctx.OpIAdd(ctx.U32[1], record,
+                                                    ctx.OpIAdd(ctx.U32[1], word, ctx.Const(1 + attribute_words)))),
+                        packed);
+        };
+        if (first + threads > map_words) {
+            If(ctx, ctx.OpULessThan(ctx.U1, word, ctx.Const(map_words)), copy);
+        } else {
+            copy();
+        }
+    }
+}
+
 void MeshEpilogue(EmitContext& ctx) {
+    if (ctx.mesh_compute) {
+        MeshComputeEpilogue(ctx);
+        return;
+    }
     const MeshInfo& mesh{ctx.mesh_info};
     Barrier(ctx);
     const Id count{ctx.OpUMin(ctx.U32[1], ctx.OpLoad(ctx.U32[1], ctx.mesh_primitive_count),
@@ -183,10 +366,13 @@ void MeshEpilogue(EmitContext& ctx) {
 } // Anonymous namespace
 
 Id EmitIsbeRead(EmitContext& ctx, Id address) {
-    const Id workgroup{
-        ctx.OpCompositeExtract(ctx.U32[1], ctx.OpLoad(ctx.U32[3], ctx.workgroup_id), 0U)};
+    // The input region holds the workgroup index (VERTEX_ID); for an emulated mesh program the
+    // index within its task, found by the prologue.
+    const Id workgroup{ctx.mesh_compute && ctx.stage == Stage::Mesh
+                           ? ctx.OpLoad(ctx.U32[1], ctx.mesh_group_index)
+                           : ctx.OpCompositeExtract(ctx.U32[1], ctx.OpLoad(ctx.U32[3], ctx.workgroup_id), 0U)};
     if (ctx.stage == Stage::Task) {
-        return workgroup; // the input region holds the workgroup index (VERTEX_ID)
+        return workgroup;
     }
     const Id index{ctx.OpShiftRightLogical(ctx.U32[1], address, ctx.Const(2U))};
     const Id word{ctx.OpLoad(ctx.U32[1], PayloadWord(ctx, index))};
@@ -227,6 +413,9 @@ void EmitMeshPrologue(EmitContext& ctx) {
     // Every invocation stores the zero: no branch here, the entry block's label is a phi
     // predecessor for later blocks.
     ctx.OpStore(ctx.mesh_primitive_count, ctx.u32_zero_value);
+    if (ctx.mesh_compute) {
+        MeshComputePrologue(ctx);
+    }
     Barrier(ctx);
 }
 

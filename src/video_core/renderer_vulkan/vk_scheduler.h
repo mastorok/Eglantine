@@ -112,6 +112,11 @@ public:
         return graphics_pipeline_missing;
     }
 
+    /// Forgets the pushed down factor: the next draw pushes it again.
+    void InvalidateRescaling() {
+        state.rescaling_defined = false;
+    }
+
     /// Update the rescaling state. Returns true if the state has to be updated.
     bool UpdateRescaling(bool is_rescaling);
 

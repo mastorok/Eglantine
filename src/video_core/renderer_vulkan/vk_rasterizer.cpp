@@ -284,6 +284,11 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
       fence_manager(*this, gpu, texture_cache, buffer_cache, query_cache, device, scheduler),
       frame_dump(device, memory_allocator, scheduler),
       wfi_event(device.GetLogical().CreateEvent()) {
+    if (!device.IsExtMeshShaderSupported() && MeshEmulationResources::Requested()) {
+        mesh_emulation = std::make_unique<MeshEmulationResources>(device, memory_allocator);
+        pipeline_cache.SetMeshEmulation(mesh_emulation.get());
+        LOG_INFO(Render_Vulkan, "Task/mesh programs run as compute shaders (EDEN_NX2_MESH_EMU)");
+    }
     scheduler.SetQueryCache(query_cache);
     buffer_cache.SetPendingCpuWrites(
         [this](const std::function<void(DAddr, size_t)>& callback) {
@@ -512,6 +517,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
     }
     // Task/mesh pipelines: the draw's vertex count is the number of task workgroups.
     mesh_draw = pipeline->IsMeshPipeline();
+    mesh_scratch = pipeline->IsMeshEmulated() ? pipeline->MeshScratch() : VkBuffer{};
     // EDEN_NX2_NO_MESH=1: skip task/mesh draws as before they were supported (A/B comparisons).
     // EDEN_NX2_NO_MESH_FILE=<path>: skip them while that file exists (checked every 1024 draws),
     // to compare the same scene with and without them in one run.
@@ -522,7 +528,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
     if (no_mesh_file && (no_mesh_check++ % 1024) == 0) {
         no_mesh = std::filesystem::exists(no_mesh_file);
     }
-    if (mesh_draw && (no_mesh || !device.IsExtMeshShaderSupported())) {
+    if (mesh_draw && (no_mesh || (!device.IsExtMeshShaderSupported() && !pipeline->IsMeshEmulated()))) {
         report_failure(no_mesh ? "EDEN_NX2_NO_MESH" : "no VK_EXT_mesh_shader");
         return;
     }
@@ -868,6 +874,17 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
         const u32 num_instances{instance_count};
         const DrawParams draw_params{MakeDrawParams(draw_state, num_instances, is_indexed)};
 
+        if (mesh_draw && mesh_scratch != VkBuffer{}) {
+            // The compute passes left the draw's arguments in the scratch buffer.
+            scheduler.Record([this, scratch = mesh_scratch](vk::CommandBuffer cmdbuf) {
+                if (scheduler.GraphicsPipelineMissing()) {
+                    return;
+                }
+                cmdbuf.DrawIndirect(scratch, Shader::MeshEmulation::DrawIndirectWord * sizeof(u32),
+                                    1, 0);
+            });
+            return;
+        }
         if (mesh_draw) {
             scheduler.Record([this, groups = draw_params.num_vertices](vk::CommandBuffer cmdbuf) {
                 if (scheduler.GraphicsPipelineMissing()) {

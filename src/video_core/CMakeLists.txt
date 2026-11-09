@@ -176,6 +176,8 @@ add_library(video_core STATIC
     renderer_vulkan/vk_command_pool.h
     renderer_vulkan/vk_compute_pass.cpp
     renderer_vulkan/vk_compute_pass.h
+    renderer_vulkan/vk_mesh_emulation.cpp
+    renderer_vulkan/vk_mesh_emulation.h
     renderer_vulkan/vk_fsr3_upscaler.cpp
     renderer_vulkan/vk_fsr3_upscaler.h
     renderer_vulkan/vk_dlss_network_probe.cpp

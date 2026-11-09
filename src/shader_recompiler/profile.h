@@ -51,6 +51,9 @@ struct Profile {
     bool support_derivative_control{};
     bool support_geometry_shader_passthrough{};
     bool support_native_ndc{};
+    /// Task and mesh programs become compute shaders (shader_info.h: MeshEmulation), for devices
+    /// without VK_EXT_mesh_shader.
+    bool emulate_mesh_with_compute{};
     bool support_gl_nv_gpu_shader_5{};
     bool support_gl_amd_gpu_shader_half_float{};
     bool support_gl_texture_shadow_lod{};

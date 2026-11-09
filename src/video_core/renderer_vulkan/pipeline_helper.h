@@ -264,6 +264,38 @@ public:
         });
     }
 
+    /// Layout of a graphics pipeline whose task and mesh programs run as compute shaders (their
+    /// descriptors have the compute stage flag, see MeshEmulationResources): the graphics push
+    /// constants, which also reach the compute stages, and the scratch buffer as set 1.
+    vk::PipelineLayout CreateMeshEmulationPipelineLayout(VkDescriptorSetLayout descriptor_set_layout,
+                                                         VkDescriptorSetLayout empty_set_layout,
+                                                         VkDescriptorSetLayout scratch_set_layout) const {
+        using Shader::Backend::SPIRV::RenderAreaLayout;
+        using Shader::Backend::SPIRV::RescalingLayout;
+        const VkPushConstantRange range{
+            .stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_COMPUTE_BIT,
+            .offset = 0,
+            .size = static_cast<u32>(sizeof(RescalingLayout)) + static_cast<u32>(sizeof(RenderAreaLayout)),
+        };
+        const std::array<VkDescriptorSetLayout, 2> set_layouts{
+            descriptor_set_layout ? descriptor_set_layout : empty_set_layout, scratch_set_layout};
+        return device->GetLogical().CreatePipelineLayout({
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .setLayoutCount = static_cast<u32>(set_layouts.size()),
+            .pSetLayouts = set_layouts.data(),
+            .pushConstantRangeCount = 1,
+            .pPushConstantRanges = &range,
+        });
+    }
+
+    /// The compute stage flag of a mesh-emulated task or mesh program does not make the layout a
+    /// compute one.
+    void KeepGraphicsLayout() noexcept {
+        is_compute = false;
+    }
+
     void Add(const Shader::Info& info, VkShaderStageFlags stage) {
         is_compute |= (stage & VK_SHADER_STAGE_COMPUTE_BIT) != 0;
 
