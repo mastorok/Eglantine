@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cstdio>
 
@@ -214,9 +215,31 @@ bool DmaPusher::Step() {
             // wait is back for the session.
             static const Nx2Sampler::Knob trust_knob = Nx2Sampler::MakeKnob("TRUST_CLEAN", 0);
             static const Nx2Sampler::Knob trust_max = Nx2Sampler::MakeKnob("TRUST_MAX_VIOLATIONS", 4);
+            // EDEN_NX2_TRUST_COOLDOWN_MS=<ms> (default 0 = off for the session): the trust comes
+            // back that long after it was turned off, with the violation count starting again.
+            // A violation is a first GPU write to a page whose entries were read without waiting; each
+            // page does it once, so a burst on entering a new area need not cost the whole session.
+            static const Nx2Sampler::Knob trust_cooldown = Nx2Sampler::MakeKnob("TRUST_COOLDOWN_MS", 0);
+            static std::atomic<long long> trust_off_ms{0};
+            static std::atomic<u64> violations_base{0};
+            static std::atomic<u64> trust_resumes{0};
+            const auto now_ms = [] {
+                return static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                  std::chrono::steady_clock::now().time_since_epoch())
+                                                  .count());
+            };
             auto& split = VideoCommon::GpuSplit::Get();
             const size_t entry_bytes = size_t{header.size} * sizeof(u32);
             bool skip = false;
+            if (trust_knob.Get() != 0 && trust_cooldown.Get() > 0 &&
+                Tegra::g_nx2_trust_off.load(std::memory_order_relaxed) &&
+                now_ms() - trust_off_ms.load(std::memory_order_relaxed) >= trust_cooldown.Get()) {
+                violations_base.store(Nx2Sampler::g_clean_violations.load(std::memory_order_relaxed),
+                                      std::memory_order_relaxed);
+                Tegra::g_nx2_trust_off.store(false, std::memory_order_relaxed);
+                LOG_WARNING(HW_GPU, "nx2 trust: back on after {} ms (#{})", trust_cooldown.Get(),
+                            trust_resumes.fetch_add(1, std::memory_order_relaxed) + 1);
+            }
             if (trust_knob.Get() != 0 && !Tegra::g_nx2_trust_off.load(std::memory_order_relaxed)) {
                 static std::atomic<u64> reported_violations{};
                 if (const u64 violations =
@@ -228,9 +251,16 @@ bool DmaPusher::Step() {
                                 "without waiting ({} so far)",
                                 Tegra::g_nx2_last_violation_page.load(std::memory_order_relaxed),
                                 violations);
-                    if (static_cast<long long>(violations) >= trust_max.Get()) {
+                    if (static_cast<long long>(violations -
+                                               violations_base.load(std::memory_order_relaxed)) >=
+                        trust_max.Get()) {
+                        trust_off_ms.store(now_ms(), std::memory_order_relaxed);
                         Tegra::g_nx2_trust_off.store(true, std::memory_order_relaxed);
-                        LOG_WARNING(HW_GPU, "nx2 trust: off for this session");
+                        if (trust_cooldown.Get() > 0) {
+                            LOG_WARNING(HW_GPU, "nx2 trust: off for {} ms", trust_cooldown.Get());
+                        } else {
+                            LOG_WARNING(HW_GPU, "nx2 trust: off for this session");
+                        }
                     }
                 }
                 skip = split.WritersPending() && AreCommandPagesClean(dma_state.dma_get, entry_bytes);
