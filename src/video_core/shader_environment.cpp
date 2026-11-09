@@ -783,6 +783,41 @@ GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
             gpu_memory->ReadBlock(address, &mesh_primitive_header, sizeof(mesh_primitive_header));
         }
     }
+    // EDEN_NX2_SHADER_DUMP: next to the code of a task or mesh program, the state its translation
+    // needs and the dump lacks (native header, program header, mesh registers, primitive header),
+    // as "<key>-mesh-meta.txt" with one "name: hex words" line per item.
+    if (mesh_slot && lowered_native != nullptr) {
+        if (const char* dump_directory = std::getenv("EDEN_NX2_SHADER_DUMP")) {
+            const auto path = std::filesystem::path{dump_directory} /
+                              fmt::format("{:016x}-mesh-meta.txt", lowered_native->native_program_key);
+            if (!std::filesystem::exists(path)) {
+                const auto words = [](const void* data, size_t size) {
+                    std::string text;
+                    for (size_t i = 0; i + 4 <= size; i += 4) {
+                        u32 word;
+                        std::memcpy(&word, static_cast<const char*>(data) + i, sizeof(word));
+                        text += fmt::format("{:08x}{}", word, i + 8 <= size ? " " : "");
+                    }
+                    return text;
+                };
+                std::array<u32, 32> native_header{};
+                gpu_memory->ReadBlock(program_base + start_address, native_header.data(),
+                                      sizeof(native_header));
+                std::filesystem::create_directories(dump_directory);
+                std::ofstream meta(path);
+                meta << fmt::format("stage: {}\nprogram_base: {:x}\nstart_address: {:x}\n",
+                                    stage == Shader::Stage::Task ? "task" : "mesh", program_base,
+                                    start_address);
+                meta << "native_header: " << words(native_header.data(), sizeof(native_header)) << '\n';
+                meta << "sph: " << words(&sph, sizeof(sph)) << '\n';
+                meta << "mesh_registers: " << words(mesh_registers.data(), sizeof(mesh_registers)) << '\n';
+                meta << "mesh_primitive_header: "
+                     << words(&mesh_primitive_header, sizeof(mesh_primitive_header)) << '\n';
+                meta << "gp_passthrough_mask: "
+                     << words(gp_passthrough_mask.data(), sizeof(gp_passthrough_mask)) << '\n';
+            }
+        }
+    }
     const u64 local_size{sph.LocalMemorySize()};
     ASSERT(local_size <= (std::numeric_limits<u32>::max)());
     local_memory_size = static_cast<u32>(local_size) + sph.common3.shader_local_memory_crs_size;
