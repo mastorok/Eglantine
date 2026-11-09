@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstring>
 #include <memory>
 #include <optional>
@@ -15,6 +16,7 @@
 #include <fmt/ranges.h>
 
 #include "common/logging.h"
+#include "common/nx2_sampler.h"
 #include <ranges>
 #include "common/scope_exit.h"
 #include "common/settings.h"
@@ -22,6 +24,7 @@
 #include "core/frontend/graphics_context.h"
 #include "video_core/capture.h"
 #include "video_core/gpu.h"
+#include "video_core/nx2.h"
 #include "video_core/present.h"
 #include "video_core/renderer_vulkan/present/util.h"
 #ifdef HAS_RESHADE
@@ -213,6 +216,19 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
     };
 
     RenderAppletCaptureLayer(framebuffers);
+
+    if (!Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
+        // Switch 1 titles present through here and nothing else notes them: the frame log
+        // (EDEN_NX2_FRAME_LOG) and the stall watchdog (EDEN_NX2_STALL_MS) follow them too.
+        static std::chrono::steady_clock::time_point last_composite{};
+        const auto now = std::chrono::steady_clock::now();
+        const long long frame_us =
+            last_composite == std::chrono::steady_clock::time_point{}
+                ? 0
+                : std::chrono::duration_cast<std::chrono::microseconds>(now - last_composite).count();
+        last_composite = now;
+        Nx2Sampler::NotePresent(frame_us, 0, 0, 0);
+    }
 
     if (!render_window.IsShown()) {
         return;

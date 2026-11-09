@@ -148,6 +148,11 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     std::vector<u8> astc_scan_buffer;
     u64 images_deleted{};
     std::map<u64, std::pair<u32, GPUVAddr>> created_shapes;
+    // Uploads from guest memory in the last 600 frames (EDEN_NX2_TC_LOG): per shape (count, bytes),
+    // and how often each image (address and shape) was uploaded, to tell new images from the same
+    // ones written again.
+    std::map<u64, std::pair<u32, u64>> uploaded_shapes;
+    std::unordered_map<u64, u32> upload_repeats;
     // When an image of this address and shape was last deleted (frame tick), for the "created
     // again" counters of Nx2Sampler. Emptied when it grows large.
     std::unordered_map<u64, u64> nx2_deleted_at;

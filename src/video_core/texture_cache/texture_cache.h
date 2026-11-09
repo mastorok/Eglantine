@@ -483,16 +483,40 @@ void TextureCache<P>::TickFrame() {
         std::vector<std::pair<u32, u64>> shapes;
         for (const auto& [key, value] : created_shapes) shapes.emplace_back(value.first, key);
         std::sort(shapes.rbegin(), shapes.rend());
-        for (size_t i = 0; i < std::min<size_t>(10, shapes.size()); ++i) {
+        for (size_t i = 0; i < std::min<size_t>(12, shapes.size()); ++i) {
             const u64 key = shapes[i].second;
-            LOG_DEBUG(HW_GPU, "  created {}x: format {} type {} levels {} layers {} {}x{} (last at {:#x})",
+            LOG_INFO(HW_GPU, "  created {}x: format {} type {} levels {} layers {} {}x{} (last at {:#x})",
                      shapes[i].first, key >> 56, (key >> 52) & 0xF, (key >> 48) & 0xF,
                      (key >> 36) & 0xFFF, (key >> 18) & 0x3FFFF, key & 0x3FFFF,
                      created_shapes[key].second);
         }
         created_shapes.clear();
-        // The per-image and per-shape tallies only feed debug lines: skip them while those are off.
-        debug_stats = Common::Log::IsLevelEnabled(Common::Log::Class::HW_GPU, Common::Log::Level::Debug);
+        {
+            // Uploads: how many were the same image (address and shape) written again.
+            u64 repeated{};
+            for (const auto& entry : upload_repeats) {
+                repeated += entry.second > 1 ? u64{entry.second} - 1 : u64{0};
+            }
+            LOG_INFO(HW_GPU,
+                     "Texture cache last 600 frames: {} distinct images uploaded, {} uploads were "
+                     "of an image already uploaded in this window",
+                     upload_repeats.size(), repeated);
+            std::vector<std::pair<u64, u64>> uploads;
+            for (const auto& [key, value] : uploaded_shapes) uploads.emplace_back(value.second, key);
+            std::sort(uploads.rbegin(), uploads.rend());
+            for (size_t i = 0; i < std::min<size_t>(12, uploads.size()); ++i) {
+                const u64 key = uploads[i].second;
+                LOG_INFO(HW_GPU,
+                         "  uploaded {}x, {} MiB: format {} type {} levels {} layers {} {}x{}",
+                         uploaded_shapes[key].first, uploads[i].first >> 20, key >> 56,
+                         (key >> 52) & 0xF, (key >> 48) & 0xF, (key >> 36) & 0xFFF,
+                         (key >> 18) & 0x3FFFF, key & 0x3FFFF);
+            }
+            uploaded_shapes.clear();
+            upload_repeats.clear();
+        }
+        // The per-image and per-shape tallies only feed these lines: skip them while they are off.
+        debug_stats = log_tc || Common::Log::IsLevelEnabled(Common::Log::Class::HW_GPU, Common::Log::Level::Debug);
         gc_deletes = gc_costly_deletes = gc_download_deletes = async_decodes_queued = 0;
         images_created = images_deleted = 0;
     }
@@ -1774,6 +1798,19 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
     ++images_uploaded;
     uploaded_bytes += image.guest_size_bytes;
     largest_upload = (std::max<u64>)(largest_upload, image.guest_size_bytes);
+    static const bool tally_uploads = std::getenv("EDEN_NX2_TC_LOG") != nullptr;
+    if (tally_uploads) {
+        const u64 shape = (u64{static_cast<u32>(image.info.format)} << 56) |
+                          (u64{static_cast<u32>(image.info.type)} << 52) |
+                          (u64{static_cast<u32>(image.info.resources.levels) & 0xF} << 48) |
+                          (u64{static_cast<u32>(image.info.resources.layers) & 0xFFF} << 36) |
+                          (u64{image.info.size.width & 0x3FFFF} << 18) |
+                          u64{image.info.size.height & 0x3FFFF};
+        auto& uploaded = uploaded_shapes[shape];
+        ++uploaded.first;
+        uploaded.second += image.guest_size_bytes;
+        ++upload_repeats[shape * 0x9E3779B97F4A7C15ULL + image.gpu_addr];
+    }
     if (!UploadInChunks(image)) {
         auto staging = runtime.UploadStagingBuffer(MapSizeBytes(image));
         UploadImageContents(image, staging);
