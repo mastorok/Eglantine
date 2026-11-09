@@ -556,6 +556,13 @@ Result FSP_SRV::OpenDataStorageWithProgramIndex(OutInterface<IStorage> out_inter
     auto patched_romfs = romfs_controller->OpenPatchedRomFSWithProgramIndex(
         program_id, program_index, FileSys::ContentRecordType::Program);
 
+    if (!patched_romfs && program_index == 0) {
+        // A loose ExeFS directory or a NUP container registers no Program NCA in the content
+        // provider, so the lookup above finds nothing. The loader already holds the RomFS of the
+        // running program (the same one OpenDataStorageByCurrentProcess serves), so use it.
+        patched_romfs = romfs_controller->OpenRomFSCurrentProcess();
+    }
+
     if (!patched_romfs) {
         // TODO: Find the right error code to use here
         LOG_ERROR(Service_FS, "Could not open storage with program_index={}", program_index);
