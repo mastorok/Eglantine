@@ -656,6 +656,12 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(u32
     Shader::Ampere::AppendNativeAddressMap(lowered_code, lowered.source_instruction_offsets);
     // What Analyze returns for this program once the environment holds the lowered code.
     const u64 shader_hash = NativeShaderHash(lowered_code);
+    // EDEN_NX2_SHADER_DUMP: tie the dump file names (native program key) to the hash the mesh
+    // probe and the pipeline cache print (shader hash), so a program can be found by either.
+    if (static const bool dumping = std::getenv("EDEN_NX2_SHADER_DUMP") != nullptr; dumping) {
+        LOG_INFO(Shader, "nx2 shader map: native key {:016x} = shader hash {:016x} (base {:#x})",
+                 result->native_program_key, shader_hash, program_base);
+    }
     if (VideoCommon::Nx2Diag::Active()) {
         VideoCommon::Nx2Diag::Diagnostics::Get().RegisterProgram(
             program_base, result->native_program_key, shader_hash);

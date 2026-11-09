@@ -1110,10 +1110,23 @@ void StartFromEnvironment() {
         return;
     }
     const char* out = std::getenv("EDEN_NX2_SAMPLE_OUT");
+    // EDEN_NX2_SAMPLE_TRIGGER=<file>: the measurement starts when that file appears (it is
+    // deleted at once), instead of EDEN_NX2_SAMPLE_START seconds after the launch, so a player
+    // can ask for it when the game is where it must be measured.
+    const char* trigger = std::getenv("EDEN_NX2_SAMPLE_TRIGGER");
     std::thread{[patterns = SplitNames(names), start = EnvSeconds("EDEN_NX2_SAMPLE_START", 60.0),
                  seconds = EnvSeconds("EDEN_NX2_SAMPLE_SECONDS", 30.0),
-                 out = std::string{out != nullptr ? out : "nx2_samples.txt"}] {
-        std::this_thread::sleep_for(std::chrono::duration<double>(start));
+                 out = std::string{out != nullptr ? out : "nx2_samples.txt"},
+                 trigger = std::string{trigger != nullptr ? trigger : ""}] {
+        if (trigger.empty()) {
+            std::this_thread::sleep_for(std::chrono::duration<double>(start));
+        } else {
+            std::error_code error;
+            while (!std::filesystem::exists(trigger, error)) {
+                std::this_thread::sleep_for(std::chrono::milliseconds{200});
+            }
+            std::filesystem::remove(trigger, error);
+        }
         SampleThreads(patterns, seconds, out);
     }}.detach();
 }
