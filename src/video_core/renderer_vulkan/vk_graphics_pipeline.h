@@ -246,6 +246,7 @@ private:
     MeshEmulationInfo mesh_emulation;
     size_t mesh_task_slot{NUM_STAGES};
     size_t mesh_mesh_slot{NUM_STAGES};
+    bool mesh_writes_resources{}; ///< the task or mesh program writes buffers or images
     vk::Pipeline mesh_task_pipeline;
     vk::Pipeline mesh_mesh_pipeline;
     VkDescriptorSet mesh_descriptor_set{}; ///< committed by the compute passes, bound by the draw

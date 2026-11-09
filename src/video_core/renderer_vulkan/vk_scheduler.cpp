@@ -310,6 +310,14 @@ void Scheduler::RequestOutsideRenderPassOperationContext() {
     EndRenderPass();
 }
 
+void Scheduler::RequestOutsideRenderPassForMeshCompute(const Framebuffer* resume) {
+    static const bool full_break{std::getenv("EDEN_NX2_MESH_FULL_BREAK") != nullptr};
+    const bool same_framebuffer = resume != nullptr && state.renderpass != VkRenderPass{} &&
+                                  deferred_clear.framebuffer == nullptr &&
+                                  state.framebuffer == resume->Handle();
+    EndRenderPass(same_framebuffer && !full_break);
+}
+
 bool Scheduler::UpdateGraphicsPipeline(GraphicsPipeline* pipeline) {
     if (state.graphics_pipeline == pipeline) {
         if (pipeline && pipeline->UsesExtendedDynamicState() &&
@@ -493,7 +501,7 @@ void Scheduler::EndPendingOperations() {
     EndRenderPass();
 }
 
-void Scheduler::EndRenderPass()
+void Scheduler::EndRenderPass(bool attachments_only)
     {
         RealizeDeferredClear();
         if (!state.renderpass) {
@@ -510,6 +518,44 @@ void Scheduler::EndRenderPass()
 
         query_cache->CounterEnable(VideoCommon::QueryType::ZPassPixelCount64, false);
         query_cache->NotifySegment(false);
+
+        if (attachments_only) {
+            Record([has_transform_feedback = device.IsExtTransformFeedbackSupported()](
+                       vk::CommandBuffer cmdbuf) {
+                constexpr VkPipelineStageFlags attachment_stages =
+                    VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                    VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
+                    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+                constexpr VkMemoryBarrier ATTACHMENT_BARRIER{
+                    .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                    .pNext = nullptr,
+                    .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                                     VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                    .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                                     VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                                     VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                                     VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                };
+                cmdbuf.EndRenderPass();
+                cmdbuf.PipelineBarrier(attachment_stages, attachment_stages, 0, ATTACHMENT_BARRIER);
+                if (has_transform_feedback) {
+                    static constexpr VkMemoryBarrier XFB_OUTPUT_BARRIER{
+                        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                        .pNext = nullptr,
+                        .srcAccessMask = VK_ACCESS_TRANSFORM_FEEDBACK_WRITE_BIT_EXT,
+                        .dstAccessMask =
+                            VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT,
+                    };
+                    cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFORM_FEEDBACK_BIT_EXT,
+                                           VK_PIPELINE_STAGE_VERTEX_INPUT_BIT |
+                                               VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                           0, XFB_OUTPUT_BARRIER);
+                }
+            });
+            state.renderpass = VkRenderPass{};
+            num_renderpass_images = 0;
+            return;
+        }
 
         Record([num_images = num_renderpass_images,
                        images = renderpass_images,

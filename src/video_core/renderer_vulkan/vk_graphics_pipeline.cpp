@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <iostream>
 #include <span>
@@ -16,6 +17,7 @@
 #include "video_core/renderer_vulkan/pipeline_helper.h"
 
 #include "common/bit_field.h"
+#include "common/scope_exit.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
@@ -314,6 +316,20 @@ GraphicsPipeline::GraphicsPipeline(
             }
         }
         push_constant_stages = VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_COMPUTE_BIT;
+        for (const size_t slot : {mesh_task_slot, mesh_mesh_slot}) {
+            if (slot >= NUM_STAGES) {
+                continue;
+            }
+            const Shader::Info& info{stage_infos[slot]};
+            mesh_writes_resources |=
+                info.stores_global_memory ||
+                std::ranges::any_of(info.storage_buffers_descriptors,
+                                    [](const auto& desc) { return desc.is_written; }) ||
+                std::ranges::any_of(info.image_buffer_descriptors,
+                                    [](const auto& desc) { return desc.is_written; }) ||
+                std::ranges::any_of(info.image_descriptors,
+                                    [](const auto& desc) { return desc.is_written; });
+        }
     }
 
     DescriptorLayoutBuilder builder{MakeBuilder(device, stage_infos, mesh_emulated)};
@@ -758,7 +774,7 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                                    [this] { return is_built.load(std::memory_order::relaxed); });
             });
         }
-        scheduler.RequestOutsideRenderPassOperationContext();
+        scheduler.RequestOutsideRenderPassForMeshCompute(texture_cache.GetFramebuffer());
         RecordMeshEmulation(descriptor_data, maxwell3d->draw_manager.draw_state.vertex_buffer.count,
                             rescaling, render_area, is_rescaling);
     }
@@ -775,7 +791,7 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
     if (IsMeshEmulated()) {
         // The layout's push constant ranges differ from the other pipelines': the next draw
         // pushes the down factor again.
-        scheduler.InvalidateRescaling();
+        scheduler.InvalidateMeshBindings();
     }
     const bool bind_pipeline{scheduler.UpdateGraphicsPipeline(this)};
     const bool bind_descriptor_buffer{
@@ -878,6 +894,7 @@ void GraphicsPipeline::RecordMeshEmulation(const void* descriptor_data, u32 task
                                            const RenderAreaPushConstant& render_area,
                                            bool is_rescaling) {
     namespace ME = Shader::MeshEmulation;
+    const auto record_begin{std::chrono::steady_clock::now()};
     const bool has_task{mesh_task_slot < NUM_STAGES};
     const u32 record_words{(std::max)(mesh_emulation.record_words, 1U)};
     const u64 scratch_words{MeshEmulationResources::ScratchBytes / sizeof(u32)};
@@ -889,12 +906,17 @@ void GraphicsPipeline::RecordMeshEmulation(const void* descriptor_data, u32 task
     u64 records_base{counts_base + 2 * u64{tasks}};
     const bool fits{records_base + record_words <= scratch_words};
     static std::atomic<u64> emulated_draws{};
+    static std::atomic<u64> record_ns{};
+    static std::atomic<u64> worker_ns{};
     if (const u64 index{emulated_draws.fetch_add(1, std::memory_order_relaxed) + 1};
         index == 1 || index % 5000 == 0) {
         LOG_INFO(Render_Vulkan,
                  "Mesh emulation: {} draws so far (this one: {} task workgroups, {} payload words, "
-                 "{} record words)",
-                 index, task_groups, mesh_emulation.payload_words, record_words);
+                 "{} record words); per draw: {} us preparing on the draw thread, {} us recording "
+                 "on the worker",
+                 index, task_groups, mesh_emulation.payload_words, record_words,
+                 record_ns.load(std::memory_order_relaxed) / 1000 / index,
+                 worker_ns.load(std::memory_order_relaxed) / 1000 / index);
     }
     if (!fits) {
         static std::atomic_bool logged{};
@@ -918,6 +940,10 @@ void GraphicsPipeline::RecordMeshEmulation(const void* descriptor_data, u32 task
     header[ME::ParamVerticesPerGroup] = mesh_emulation.vertices_per_group;
     header[ME::ParamDirectGroups] = fits && !has_task ? task_groups : 0;
 
+    record_ns.fetch_add(static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                             std::chrono::steady_clock::now() - record_begin)
+                                             .count()),
+                        std::memory_order_relaxed);
     scheduler.Record([this, descriptor_data, header, tasks, has_task,
                       rescaling_data = rescaling.Data(), is_rescaling,
                       uses_render_area = render_area.uses_render_area,
@@ -925,6 +951,14 @@ void GraphicsPipeline::RecordMeshEmulation(const void* descriptor_data, u32 task
         if (!pipeline || !mesh_mesh_pipeline || (has_task && !mesh_task_pipeline)) {
             return;
         }
+        const auto worker_begin{std::chrono::steady_clock::now()};
+        SCOPE_EXIT {
+            worker_ns.fetch_add(static_cast<u64>(
+                                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                        std::chrono::steady_clock::now() - worker_begin)
+                                        .count()),
+                                std::memory_order_relaxed);
+        };
         const MeshEmulationResources& resources{*mesh_emulation.resources};
         const VkBuffer scratch{resources.Scratch()};
 
@@ -1002,7 +1036,11 @@ void GraphicsPipeline::RecordMeshEmulation(const void* descriptor_data, u32 task
                 VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
                 VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT);
     });
-    scheduler.NoteComputeWrites();
+    // The vertex shader and the draw read the scratch buffer behind the lambda's own barrier; only
+    // a program that writes other resources needs the full compute-to-graphics barrier.
+    if (mesh_writes_resources) {
+        scheduler.NoteComputeWrites();
+    }
 }
 
 void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {

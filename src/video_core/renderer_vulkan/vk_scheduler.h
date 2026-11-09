@@ -90,6 +90,12 @@ public:
     /// of a renderpass.
     void RequestOutsideRenderPassOperationContext();
 
+    /// Same, for compute passes that read no render target and are followed by the render pass of
+    /// `resume`: when that is the framebuffer being left, the pass ends with a barrier that only
+    /// orders the attachments (the full one also flushes them for shader reads and compute).
+    /// EDEN_NX2_MESH_FULL_BREAK=1 uses the full barrier.
+    void RequestOutsideRenderPassForMeshCompute(const Framebuffer* resume);
+
     /// A dispatch was recorded: the next render pass must see what it wrote.
     void NoteComputeWrites() {
         compute_writes_pending = true;
@@ -115,6 +121,13 @@ public:
     /// Forgets the pushed down factor: the next draw pushes it again.
     void InvalidateRescaling() {
         state.rescaling_defined = false;
+    }
+
+    /// An emulated task/mesh draw bound its own layout, push constants and descriptor sets: the
+    /// next draw binds its own again, descriptor buffers included.
+    void InvalidateMeshBindings() {
+        state.rescaling_defined = false;
+        state.descriptor_buffer_bound = false;
     }
 
     /// Update the rescaling state. Returns true if the state has to be updated.
@@ -350,7 +363,7 @@ private:
 
     void EndPendingOperations();
 
-    void EndRenderPass();
+    void EndRenderPass(bool attachments_only = false);
 
     void AcquireNewChunk();
 

@@ -89,6 +89,15 @@ public:
         stencil_reset = true;
     }
 
+    /// A task/mesh pipeline was bound: it has no dynamic topology, primitive restart or vertex
+    /// input, so the command buffer holds its static values instead of the ones tracked here.
+    void InvalidateMeshStaticState() {
+        (*flags)[Dirty::VertexInput] = true;
+        (*flags)[VideoCommon::Dirty::VertexBuffers] = true;
+        (*flags)[Dirty::PrimitiveRestartEnable] = true;
+        current_topology = INVALID_TOPOLOGY;
+    }
+
     void InvalidateViewports() {
         (*flags)[Dirty::Viewports] = true;
     }

@@ -524,9 +524,23 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
     static const bool no_mesh_always{std::getenv("EDEN_NX2_NO_MESH") != nullptr};
     static const char* const no_mesh_file{std::getenv("EDEN_NX2_NO_MESH_FILE")};
     static bool no_mesh{no_mesh_always};
-    static u32 no_mesh_check{};
-    if (no_mesh_file && (no_mesh_check++ % 1024) == 0) {
-        no_mesh = std::filesystem::exists(no_mesh_file);
+    static auto no_mesh_next_check{std::chrono::steady_clock::time_point{}};
+    if (no_mesh_file) {
+        static std::once_flag logged_file;
+        std::call_once(logged_file, [] {
+            LOG_INFO(Render_Vulkan, "Task/mesh draws can be switched off with the file {}",
+                     no_mesh_file);
+        });
+        if (const auto now{std::chrono::steady_clock::now()}; now >= no_mesh_next_check) {
+            no_mesh_next_check = now + std::chrono::milliseconds(200);
+            std::error_code ec;
+            const bool wanted{no_mesh_always || std::filesystem::exists(no_mesh_file, ec)};
+            if (wanted != no_mesh) {
+                no_mesh = wanted;
+                LOG_INFO(Render_Vulkan, "Task/mesh draws are now {}",
+                         no_mesh ? "skipped (flag file present)" : "drawn (flag file removed)");
+            }
+        }
     }
     if (mesh_draw && (no_mesh || (!device.IsExtMeshShaderSupported() && !pipeline->IsMeshEmulated()))) {
         report_failure(no_mesh ? "EDEN_NX2_NO_MESH" : "no VK_EXT_mesh_shader");
@@ -596,6 +610,11 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
     {
         Profile::Scope scope{Profile::Zone::DrawRecord};
         draw_func();
+    }
+    if (mesh_draw) {
+        // The task/mesh pipeline replaced the topology, primitive restart and vertex input the
+        // next draw's pipeline expects to find set.
+        state_tracker.InvalidateMeshStaticState();
     }
     if (diag_query >= 0) {
         scheduler.Record([pool = **g_diag_pool, diag_query](vk::CommandBuffer cmdbuf) {
