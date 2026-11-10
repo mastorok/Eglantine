@@ -3,6 +3,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -49,6 +50,13 @@
 //                            reaches the screen with real geometry but passes 0 samples is drawing
 //                            nothing visible. Draws made while the game itself counts occlusion
 //                            samples are not probed ("-").
+//   (mesh emulation)         with a draw-list capture, every task/mesh draw emulated with compute
+//                            also gets an "emu" column read back from the GPU: tasks (task
+//                            workgroups of the draw), groups (mesh workgroups the task pass produced),
+//                            max (records that fit), verts (vertices the draw issues), per (vertices
+//                            per group) and TRUNC when the records did not all fit. "groups=0" means
+//                            the chain produced nothing to draw. Programs in inspect.txt also log the
+//                            textures they sample ("diag tex" lines, capture frame only).
 //   EDEN_NX2_LAB=1|open      start tools/nx2/shader_lab.py for <dir> (Linux/macOS; "open" also opens the
 //                            browser). EDEN_NX2_SHADER_DUMP and EDEN_NX2_FRAME_CAPTURE are passed on.
 //                            The script is looked up as tools/nx2/shader_lab.py from the working
@@ -92,6 +100,11 @@ inline bool SamplesEnabled() {
 }
 
 inline constexpr u32 MaxProbeQueries = 8192;
+inline constexpr u32 MaxEmuSlots = 1024;
+// The mesh emulation read-back slot of the draw being prepared on this thread (-1: none); the draw's
+// row picks it up when it is written.
+inline thread_local int EmuSlot = -1;
+inline constexpr u32 EmuSlotWords = 16;
 
 inline std::string Hex16(u64 value) {
     char text[17];
@@ -246,11 +259,29 @@ public:
 
     // One tab separated row of the frame being captured (only call while Capturing()). `query` is the
     // probe query of the draw (NextQuery()) and vs/ps its programs, for the samples column.
-    void Row(const std::string& row, int query = -1, u64 vs = 0, u64 ps = 0) {
+    void Row(const std::string& row, int query = -1, u64 vs = 0, u64 ps = 0, int emu = -1) {
         std::scoped_lock lock{mutex};
         if (capturing) {
-            rows.push_back({row, query, vs, ps});
+            rows.push_back({row, query, vs, ps, emu});
         }
+    }
+
+    // The next slot of the mesh emulation read-back of the capture in progress, or -1 (not
+    // capturing or out of slots). The draw records a copy of its scratch header into that slot.
+    int NextEmuSlot() {
+        std::scoped_lock lock{mutex};
+        return capturing && emu_count < MaxEmuSlots ? static_cast<int>(emu_count++) : -1;
+    }
+
+    u32 EmuCount() {
+        std::scoped_lock lock{mutex};
+        return emu_count;
+    }
+
+    // The scratch headers read back for the capture that is ending, EmuSlotWords words per slot.
+    void SetEmu(std::vector<u32> words) {
+        std::scoped_lock lock{mutex};
+        emu_words = std::move(words);
     }
 
     // The next probe query of the capture in progress, or -1 (not capturing or out of queries).
@@ -289,13 +320,14 @@ public:
             const auto path = dir / ("draw-list-" + std::to_string(next_capture++) + ".tsv");
             if (std::ofstream out{path}) {
                 out << "seq\tkind\tvs\tps\toutcome\tvertices\tinstances\ttopology\trt0\twidth\theight\t"
-                       "format\tzeta\tblend\tcolor_mask\textra\tvs_key\tps_key\tsamples\n";
+                       "format\tzeta\tblend\tcolor_mask\textra\tvs_key\tps_key\tsamples\temu\n";
                 for (auto& [id, program] : programs) {
                     program.probe = {};
                 }
                 for (const auto& entry : rows) {
                     const bool known = entry.query >= 0 && static_cast<size_t>(entry.query) < samples.size();
-                    out << entry.text << '\t' << (known ? std::to_string(samples[entry.query]) : "-") << '\n';
+                    out << entry.text << '\t' << (known ? std::to_string(samples[entry.query]) : "-") << '\t'
+                        << EmuText(entry.emu) << '\n';
                     if (known) {
                         for (const auto& [kind, address] : {std::pair{'v', entry.vs}, std::pair{'p', entry.ps}}) {
                             const u64 key = KeyOf(address);
@@ -314,7 +346,9 @@ public:
             }
             rows.clear();
             samples.clear();
+            emu_words.clear();
             query_count = 0;
+            emu_count = 0;
             return;
         }
         std::error_code error;
@@ -324,7 +358,9 @@ public:
             seq = 0;
             rows.clear();
             samples.clear();
+            emu_words.clear();
             query_count = 0;
+            emu_count = 0;
         }
     }
 
@@ -333,6 +369,12 @@ public:
     std::optional<u32> TakeScreenshotRequest() {
         std::scoped_lock lock{mutex};
         return std::exchange(screenshot_request, std::nullopt);
+    }
+
+    // The sequence number the next row of the capture in progress will get.
+    u32 PeekSeq() {
+        std::scoped_lock lock{mutex};
+        return seq;
     }
 
     u32 NextSeq() {
@@ -386,6 +428,20 @@ public:
     }
 
 private:
+    // The "emu" column of a draw: what its mesh emulation passes left in the scratch header
+    // (MeshEmulation in shader_info.h: words 4 tasks, 5 max groups, 6 vertices per group, 8 mesh
+    // dispatch groups, 11 vertices of the draw).
+    std::string EmuText(int slot) const {
+        if (slot < 0 || static_cast<size_t>(slot + 1) * EmuSlotWords > emu_words.size()) {
+            return "-";
+        }
+        const u32* w = emu_words.data() + static_cast<size_t>(slot) * EmuSlotWords;
+        char text[160];
+        std::snprintf(text, sizeof(text), "tasks=%u groups=%u max=%u verts=%u per=%u%s", w[4], w[8],
+                      w[5], w[11], w[6], (w[5] != 0 && w[8] >= w[5]) ? " TRUNC" : "");
+        return text;
+    }
+
     Diagnostics() {
         if (!LabStatus().empty()) {
             LOG_INFO(HW_GPU, "diag: {}", LabStatus());
@@ -423,6 +479,7 @@ private:
         int query;
         u64 vs;
         u64 ps;
+        int emu;
     };
 
     struct Watch {
@@ -604,7 +661,9 @@ private:
     std::filesystem::file_time_type inspect_stamp{};
     std::vector<RowEntry> rows;
     std::vector<u64> samples;
+    std::vector<u32> emu_words;
     u32 query_count{};
+    u32 emu_count{};
     bool capturing{};
     u32 seq{};
     u32 next_capture{};

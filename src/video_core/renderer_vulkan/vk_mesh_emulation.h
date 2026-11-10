@@ -4,6 +4,7 @@
 #pragma once
 
 #include <span>
+#include <vector>
 
 #include "common/common_types.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
@@ -49,8 +50,20 @@ public:
         return *prefix_pipeline;
     }
 
+    /// Slots of the diagnostic read-back (EDEN_NX2_DIAG_DIR draw-list captures): each holds a copy
+    /// of the first 16 words of the scratch buffer (the draw's header) taken right after the
+    /// emulation passes, so a capture can say how many mesh groups each draw produced.
+    static constexpr u32 DiagSlots{1024};
+    static constexpr u32 DiagSlotWords{16};
+    [[nodiscard]] VkBuffer DiagBuffer() const noexcept {
+        return *diag_readback;
+    }
+    /// The words of `count` slots; call after the GPU finished the copies.
+    [[nodiscard]] std::vector<u32> ReadDiag(u32 count) const;
+
 private:
     vk::Buffer scratch;
+    vk::Buffer diag_readback;
     vk::DescriptorSetLayout empty_set_layout;
     vk::DescriptorSetLayout scratch_set_layout;
     vk::DescriptorPool descriptor_pool;

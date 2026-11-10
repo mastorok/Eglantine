@@ -442,6 +442,7 @@ void DiagRecordDraw(Tegra::Engines::Maxwell3D& maxwell3d, Tegra::MemoryManager& 
     }
     if (!diag.Capturing()) {
         g_diag_query = -1;
+        VideoCommon::Nx2Diag::EmuSlot = -1;
     } else {
         const auto& regs = maxwell3d.regs;
         diag.Row(fmt::format(
@@ -451,7 +452,8 @@ void DiagRecordDraw(Tegra::Engines::Maxwell3D& maxwell3d, Tegra::MemoryManager& 
             regs.rt[0].Address(), regs.rt[0].width, regs.rt[0].height,
             static_cast<u32>(regs.rt[0].format), regs.zeta_enable, regs.blend.enable[0],
             regs.color_mask[0].raw, mesh ? "mesh" : "", diag.ProgramKey(vs), diag.ProgramKey(ps)),
-            std::exchange(g_diag_query, -1), vs, ps);
+            std::exchange(g_diag_query, -1), vs, ps,
+            std::exchange(VideoCommon::Nx2Diag::EmuSlot, -1));
     }
 }
 } // namespace
@@ -1766,6 +1768,12 @@ void RasterizerVulkan::TickFrame() {
     frame_dump.TickFrame();
     if (VideoCommon::Nx2Diag::Active()) {
         auto& diag = VideoCommon::Nx2Diag::Diagnostics::Get();
+        if (const u32 emu = diag.EmuCount(); diag.Capturing() && emu > 0 && mesh_emulation != nullptr) {
+            // The capture ends here: wait for the mesh emulation passes and read the headers they
+            // left for each draw (the "emu" column).
+            scheduler.Finish();
+            diag.SetEmu(mesh_emulation->ReadDiag(emu));
+        }
         if (const u32 count = diag.QueryCount(); diag.Capturing() && count > 0 && g_diag_pool != nullptr) {
             // The capture ends here: wait for its draws and read what the probes counted.
             scheduler.Finish();

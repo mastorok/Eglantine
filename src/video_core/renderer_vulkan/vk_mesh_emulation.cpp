@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
 #include <cstdlib>
+#include <cstring>
 
 #include "video_core/renderer_vulkan/vk_mesh_emulation.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -25,12 +27,24 @@ MeshEmulationResources::MeshEmulationResources(const Device& device,
             .flags = 0,
             .size = ScratchBytes,
             .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
-                     VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                     VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
             .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
             .queueFamilyIndexCount = 0,
             .pQueueFamilyIndices = nullptr,
         },
         MemoryUsage::DeviceLocal);
+    diag_readback = allocator.CreateBuffer(
+        VkBufferCreateInfo{
+            .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .size = VkDeviceSize{DiagSlots} * DiagSlotWords * sizeof(u32),
+            .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            .queueFamilyIndexCount = 0,
+            .pQueueFamilyIndices = nullptr,
+        },
+        MemoryUsage::Download);
 
     empty_set_layout = logical.CreateDescriptorSetLayout({
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
@@ -131,5 +145,17 @@ MeshEmulationResources::MeshEmulationResources(const Device& device,
 }
 
 MeshEmulationResources::~MeshEmulationResources() = default;
+
+std::vector<u32> MeshEmulationResources::ReadDiag(u32 count) const {
+    count = (std::min)(count, DiagSlots);
+    std::vector<u32> words(static_cast<size_t>(count) * DiagSlotWords);
+    const auto mapped = diag_readback.Mapped();
+    if (mapped.size() < words.size() * sizeof(u32)) {
+        return {};
+    }
+    diag_readback.Invalidate();
+    std::memcpy(words.data(), mapped.data(), words.size() * sizeof(u32));
+    return words;
+}
 
 } // namespace Vulkan

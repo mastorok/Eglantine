@@ -27,6 +27,7 @@
 #include "video_core/renderer_vulkan/vk_render_pass_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
+#include "video_core/nx2_diag.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/shader_handle_program.h"
 #include "video_core/shader_notify.h"
@@ -554,6 +555,49 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         texture_cache.FillImageViews(std::span(views.data(), views.size()), false,
                                      Spec::has_images);
     }
+    if (VideoCommon::Nx2Diag::Active() && IsMeshEmulated() &&
+        VideoCommon::Nx2Diag::Diagnostics::Get().Capturing()) {
+        // Draw-list capture: say which textures each emulated mesh draw samples, and whether the
+        // texture cache found them (a NULL view samples as nothing: alpha-tested cards vanish).
+        const u32 diag_seq{VideoCommon::Nx2Diag::Diagnostics::Get().PeekSeq()};
+        size_t view_index{};
+        for (size_t stage = 0; stage < Spec::enabled_stages.size(); ++stage) {
+            if (!Spec::enabled_stages[stage]) {
+                continue;
+            }
+            const Shader::Info& info{stage_infos[stage]};
+            if constexpr (Spec::has_texture_buffers) {
+                view_index += Shader::NumDescriptors(info.texture_buffer_descriptors);
+            }
+            if constexpr (Spec::has_image_buffers) {
+                view_index += Shader::NumDescriptors(info.image_buffer_descriptors);
+            }
+            u32 slot{};
+            for (const auto& desc : info.texture_descriptors) {
+                for (u32 index = 0; index < desc.count; ++index, ++view_index, ++slot) {
+                    const auto& in_out{views[view_index]};
+                    const bool by_program{desc.handle_program != ~0U};
+                    if (in_out.id == VideoCommon::NULL_IMAGE_VIEW_ID) {
+                        LOG_INFO(HW_GPU,
+                                 "diag tex: draw {} stage {} tex {}: tic {} -> NULL VIEW{}", diag_seq,
+                                 stage, slot, in_out.index, by_program ? " (handle read by program)" : "");
+                        continue;
+                    }
+                    const ImageView& view{texture_cache.GetImageView(in_out.id)};
+                    LOG_INFO(HW_GPU,
+                             "diag tex: draw {} stage {} tex {}: tic {} -> format {} {}x{}x{} levels {} "
+                             "layers {} type {}{}",
+                             diag_seq, stage, slot, in_out.index, static_cast<u32>(view.format),
+                             view.size.width, view.size.height, view.size.depth,
+                             view.range.extent.levels, view.range.extent.layers,
+                             static_cast<u32>(view.type), by_program ? " (handle read by program)" : "");
+                }
+            }
+            if constexpr (Spec::has_images) {
+                view_index += Shader::NumDescriptors(info.image_descriptors);
+            }
+        }
+    }
     if (RecordingSampledTextures()) {
         sampled_images.clear();
         size_t view_index{};
@@ -944,10 +988,22 @@ void GraphicsPipeline::RecordMeshEmulation(const void* descriptor_data, u32 task
                                              std::chrono::steady_clock::now() - record_begin)
                                              .count()),
                         std::memory_order_relaxed);
+    // Draw-list captures read back the draw's header (what the passes produced) into a slot.
+    int diag_slot{-1};
+    VkBuffer diag_buffer{};
+    if (VideoCommon::Nx2Diag::Active()) {
+        diag_slot = VideoCommon::Nx2Diag::Diagnostics::Get().NextEmuSlot();
+        if (diag_slot >= static_cast<int>(MeshEmulationResources::DiagSlots)) {
+            diag_slot = -1;
+        }
+        VideoCommon::Nx2Diag::EmuSlot = diag_slot;
+        diag_buffer = mesh_emulation.resources->DiagBuffer();
+    }
     scheduler.Record([this, descriptor_data, header, tasks, has_task,
                       rescaling_data = rescaling.Data(), is_rescaling,
                       uses_render_area = render_area.uses_render_area,
-                      render_area_data = render_area.words](vk::CommandBuffer cmdbuf) {
+                      render_area_data = render_area.words, diag_slot,
+                      diag_buffer](vk::CommandBuffer cmdbuf) {
         if (!pipeline || !mesh_mesh_pipeline || (has_task && !mesh_task_pipeline)) {
             return;
         }
@@ -974,9 +1030,9 @@ void GraphicsPipeline::RecordMeshEmulation(const void* descriptor_data, u32 task
         };
         // The previous draw's vertex shaders and indirect draw read the buffer this one rewrites.
         barrier(VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT |
-                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
                 VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
-                    VK_ACCESS_INDIRECT_COMMAND_READ_BIT,
+                    VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT,
                 VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                 VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT |
                     VK_ACCESS_SHADER_WRITE_BIT);
@@ -1033,8 +1089,21 @@ void GraphicsPipeline::RecordMeshEmulation(const void* descriptor_data, u32 task
         cmdbuf.DispatchIndirect(scratch, ME::DispatchIndirectWord * sizeof(u32));
         // The records feed the vertex shader and the draw's arguments.
         barrier(compute_stage, VK_ACCESS_SHADER_WRITE_BIT,
-                VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
-                VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT);
+                VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT |
+                    (diag_slot >= 0 ? VK_PIPELINE_STAGE_TRANSFER_BIT : 0),
+                VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT |
+                    (diag_slot >= 0 ? VK_ACCESS_TRANSFER_READ_BIT : 0));
+        if (diag_slot >= 0 && diag_buffer != VkBuffer{}) {
+            const VkBufferCopy region{
+                .srcOffset = 0,
+                .dstOffset = VkDeviceSize{static_cast<u32>(diag_slot)} *
+                             MeshEmulationResources::DiagSlotWords * sizeof(u32),
+                .size = MeshEmulationResources::DiagSlotWords * sizeof(u32),
+            };
+            cmdbuf.CopyBuffer(scratch, diag_buffer, region);
+            barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                    VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT);
+        }
     });
     // The vertex shader and the draw read the scratch buffer behind the lambda's own barrier; only
     // a program that writes other resources needs the full compute-to-graphics barrier.
