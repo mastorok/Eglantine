@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <span>
 #include <vector>
 
@@ -74,6 +75,14 @@ public:
         }
 
         minimum_latency = (std::max)(minimum_latency, TargetSampleCount * 2);
+        // EDEN_NX2_AUDIO_LATENCY=<frames at 48 kHz>: a larger device buffer (e.g. 1920 = 40 ms)
+        // rides out host stalls the default 10 ms cannot.
+        if (const char* value = std::getenv("EDEN_NX2_AUDIO_LATENCY"); value != nullptr) {
+            const long frames = std::atol(value);
+            if (frames > 0 && frames <= 48000) {
+                minimum_latency = (std::max)(minimum_latency, static_cast<u32>(frames));
+            }
+        }
 
         LOG_INFO(Service_Audio,
                  "Opening cubeb stream {} type {} with: rate {} channels {} (system channels {}) "

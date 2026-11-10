@@ -17,6 +17,7 @@
 #include "audio_core/sink/sink_stream.h"
 #include "common/common_types.h"
 #include "common/fixed_point.h"
+#include "common/nx2_sampler.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "core/core.h"
@@ -111,6 +112,9 @@ void SinkStream::ClearQueue() {
     queued_buffers = 0;
     playing_buffer = {};
     playing_buffer.consumed = true;
+    if (preroll_target > 0) {
+        rebuffering = true;
+    }
 }
 
 void SinkStream::ProcessAudioIn(std::span<const s16> input_buffer, std::size_t num_frames) {
@@ -184,12 +188,62 @@ void SinkStream::ProcessAudioOutAndRender(std::span<s16> output_buffer, std::siz
         return;
     }
 
+    // Queue depth statistics of the renderer stream (EDEN_NX2_AUDIO_LOG, default on).
+    if (type == StreamType::Render && !name.empty() && name.back() == '0') {
+        const u32 depth = queued_buffers.load();
+        stat_min_queued = std::min(stat_min_queued, depth);
+        stat_max_queued = std::max(stat_max_queued, depth);
+        stat_frames += num_frames;
+        if (stat_frames >= TargetSampleRate * 10) {
+            static const bool log_enabled = [] {
+                const char* value = std::getenv("EDEN_NX2_AUDIO_LOG");
+                return value == nullptr || *value != '0';
+            }();
+            if (log_enabled && (stat_max_queued > 0 || stat_underruns > 0)) {
+                LOG_INFO(Audio,
+                         "nx2 audio {}: {} buffers queued at least, {} at most over {} frames; "
+                         "{} underruns, {} frames of preroll silence",
+                         name, stat_min_queued, stat_max_queued, stat_frames, stat_underruns,
+                         stat_silent_frames);
+            }
+            stat_min_queued = ~0U;
+            stat_max_queued = 0;
+            stat_frames = 0;
+            stat_underruns = 0;
+            stat_silent_frames = 0;
+        }
+    }
+
     while (frames_written < num_frames) {
         if (playing_buffer.consumed || playing_buffer.frames == 0) {
             std::unique_lock lk{release_mutex};
 
+            if (preroll_target > 0 && rebuffering.load()) {
+                const u32 wanted =
+                    max_queue_size > 0 ? std::min(preroll_target, max_queue_size) : preroll_target;
+                if (queued_buffers.load() >= wanted) {
+                    rebuffering = false;
+                } else {
+                    lk.unlock();
+                    for (size_t i = frames_written; i < num_frames; i++)
+                        std::memset(&output_buffer[i * frame_size], 0, frame_size_bytes);
+                    stat_silent_frames += num_frames - frames_written;
+                    frames_written = num_frames;
+                    continue;
+                }
+            }
+
             if (!queue.TryPop(playing_buffer)) {
                 lk.unlock();
+                if (has_played) {
+                    // Nothing to play although the stream had been playing: the game will hear it.
+                    ++stat_underruns;
+                    Nx2Sampler::NoteAudioUnderrun(name.c_str(),
+                                                  static_cast<std::uint32_t>(queued_buffers.load()));
+                    if (preroll_target > 0) {
+                        rebuffering = true;
+                    }
+                }
                 for (size_t i = frames_written; i < num_frames; i++)
                     std::memcpy(&output_buffer[i * frame_size], last_frame.data(), frame_size_bytes);
                 frames_written = num_frames;
@@ -197,6 +251,7 @@ void SinkStream::ProcessAudioOutAndRender(std::span<s16> output_buffer, std::siz
             }
 
             --queued_buffers;
+            has_played = true;
             lk.unlock();
             release_cv.notify_one();
         }

@@ -8,6 +8,7 @@
 
 #include <array>
 #include <atomic>
+#include <cstdlib>
 #include <chrono>
 #include <memory>
 #include <mutex>
@@ -58,7 +59,20 @@ struct SinkBuffer {
  */
 class SinkStream {
 public:
-    explicit SinkStream(Core::System& system_, StreamType type_) : system{system_}, type{type_} {}
+    explicit SinkStream(Core::System& system_, StreamType type_) : system{system_}, type{type_} {
+        // EDEN_NX2_AUDIO_PREROLL=<n>: a renderer stream plays only once n buffers (5 ms each) are
+        // queued, and again after every underrun. The silence it plays instead of one click is
+        // paid back as n x 5 ms of cushion: the next host stall shorter than that is not heard.
+        static const u32 preroll = [] {
+            const char* value = std::getenv("EDEN_NX2_AUDIO_PREROLL");
+            const long n = value != nullptr ? std::atol(value) : 0;
+            return n > 0 && n <= 32 ? static_cast<u32>(n) : 0U;
+        }();
+        if (type_ == StreamType::Render && preroll > 0) {
+            preroll_target = preroll;
+            rebuffering = true;
+        }
+    }
     virtual ~SinkStream() {}
 
     /**
@@ -245,6 +259,18 @@ private:
     SinkBuffer playing_buffer{};
     /// The last played (or received) frame of audio, used when the callback underruns
     std::array<s16, MaxChannels> last_frame{};
+    /// A buffer has been played from this stream (an empty queue before that is not an underrun).
+    bool has_played{};
+    /// EDEN_NX2_AUDIO_PREROLL: buffers to have queued before playing, and whether the stream is
+    /// waiting for them (output callback and ClearQueue).
+    u32 preroll_target{};
+    std::atomic<bool> rebuffering{};
+    /// Queue depth statistics of the output callback, logged every ten seconds.
+    u32 stat_min_queued{~0U};
+    u32 stat_max_queued{};
+    u64 stat_frames{};
+    u64 stat_silent_frames{};
+    u64 stat_underruns{};
     /// EDEN_NX2_AUDIO_LEVEL meter state.
     s32 level_peak{};
     u64 level_frames{};

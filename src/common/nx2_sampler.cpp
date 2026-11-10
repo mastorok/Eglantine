@@ -697,8 +697,8 @@ std::string Report(const std::vector<Target>& targets, const std::vector<Sample>
 const auto g_process_start = std::chrono::steady_clock::now();
 std::atomic<long long> g_last_present_ns{0};
 
-constexpr std::array<const char*, 7> StallGroups{"GPU",     "GPUBack", "VulkanWorker", "CPUCores",
-                                                 "Workers", "Service", "Others"};
+constexpr std::array<const char*, 8> StallGroups{"GPU",     "GPUBack", "VulkanWorker", "CPUCores",
+                                                 "Workers", "Service", "Audio",        "Others"};
 
 struct StallTarget {
     HANDLE handle;
@@ -723,6 +723,8 @@ struct StallCounters {
     std::uint64_t gc_finish_us;
     std::uint64_t list_waits;
     std::uint64_t list_wait_us;
+    std::uint64_t audio_underruns;
+    std::uint64_t audio_late_ticks;
 };
 
 StallCounters ReadCounters() {
@@ -735,7 +737,8 @@ StallCounters ReadCounters() {
             g_del_gc_download.load(relaxed),  g_del_unmap.load(relaxed),
             g_del_join.load(relaxed),         g_created_replace.load(relaxed),
             g_gc_finish_us.load(relaxed),     g_list_waits.load(relaxed),
-            g_list_wait_us.load(relaxed)};
+            g_list_wait_us.load(relaxed),     g_audio_underruns.load(relaxed),
+            g_audio_late_ticks.load(relaxed)};
 }
 
 int StallGroupOf(const std::string& name) {
@@ -758,12 +761,15 @@ int StallGroupOf(const std::string& name) {
     if (name.starts_with("Service") || name.starts_with("HLE") || name.starts_with("Hle")) {
         return 5;
     }
+    if (name == "audio" || name.starts_with("DSP_") || name.starts_with("Audio")) {
+        return 6;
+    }
     // EDEN_NX2_STALL_OTHERS=1: every other thread too, the graphics driver's among them.
     static const bool others = [] {
         const char* value = std::getenv("EDEN_NX2_STALL_OTHERS");
         return value != nullptr && *value != '\0' && *value != '0';
     }();
-    return others ? 6 : -1;
+    return others ? 7 : -1;
 }
 
 void CloseStallTargets(std::vector<StallTarget>& targets) {
@@ -861,12 +867,14 @@ void ReportStall(unsigned index, double at_seconds, long long gap_ms, unsigned r
     LOG_INFO(Common,
              "nx2 stall #{} cache: deleted by collector {} ({} downloaded, GPU waits {:.1f} ms), by "
              "unmap {}, replaced {}; new images replacing others {}; command list waits {} ({:.1f} "
-             "ms); texture cache {} MiB of {} / {} MiB, collector mode {}",
+             "ms); audio underruns {}, late DSP ticks {}; texture cache {} MiB of {} / {} MiB, "
+             "collector mode {}",
              index, after.del_gc - before.del_gc, after.del_gc_download - before.del_gc_download,
              (after.gc_finish_us - before.gc_finish_us) / 1000.0, after.del_unmap - before.del_unmap,
              after.del_join - before.del_join, after.created_replace - before.created_replace,
              after.list_waits - before.list_waits, (after.list_wait_us - before.list_wait_us) / 1000.0,
-             g_tc_used_mib.load(std::memory_order_relaxed),
+             after.audio_underruns - before.audio_underruns,
+             after.audio_late_ticks - before.audio_late_ticks, g_tc_used_mib.load(std::memory_order_relaxed),
              g_tc_expected_mib.load(std::memory_order_relaxed),
              g_tc_critical_mib.load(std::memory_order_relaxed),
              g_tc_mode.load(std::memory_order_relaxed));
@@ -916,7 +924,7 @@ void ReportStall(unsigned index, double at_seconds, long long gap_ms, unsigned r
             addresses[signature] = entry.address;
         }
         std::sort(ranked.rbegin(), ranked.rend());
-        const size_t shown = group <= 2 ? 3 : group == 6 ? 8 : 2;
+        const size_t shown = group <= 2 || group == 6 ? 3 : group == 7 ? 8 : 2;
         for (size_t i = 0; i < (std::min)(shown, ranked.size()); ++i) {
             LOG_INFO(Common, "  {} {:.0f}% of {}: {}  [{}]", StallGroups[group],
                      100.0 * ranked[i].first / total, total, ranked[i].second,
@@ -1464,6 +1472,40 @@ void SetGuestMemoryReader(std::function<bool(std::uint64_t, void*, std::size_t)>
     g_guest_reader = std::move(reader);
 }
 
+void NoteAudioUnderrun(const char* stream, std::uint32_t queued) {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_AUDIO_LOG");
+        return value == nullptr || *value != '0';
+    }();
+    const auto count = g_audio_underruns.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (enabled && count <= 600) {
+        LOG_INFO(Common, "nx2 audio underrun #{} at {:.3f} s on {} ({} buffers queued)", count,
+                 std::chrono::duration<double>(std::chrono::steady_clock::now() - g_process_start)
+                     .count(),
+                 stream, queued);
+    }
+}
+
+void NoteAudioRenderGap(double gap_ms, double process_ms) {
+    static const double late_ms = [] {
+        const char* value = std::getenv("EDEN_NX2_AUDIO_LATE_MS");
+        return value != nullptr && *value != '\0' ? std::atof(value) : 20.0;
+    }();
+    if (gap_ms < late_ms && process_ms < late_ms) {
+        return;
+    }
+    const auto count = g_audio_late_ticks.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (count <= 600) {
+        LOG_INFO(Common,
+                 "nx2 late DSP render tick #{} at {:.3f} s: {:.1f} ms since the previous tick, the "
+                 "previous one took {:.1f} ms",
+                 count,
+                 std::chrono::duration<double>(std::chrono::steady_clock::now() - g_process_start)
+                     .count(),
+                 gap_ms, process_ms);
+    }
+}
+
 void StartFromEnvironment() {
     if (const char* stall = std::getenv("EDEN_NX2_STALL_MS"); stall != nullptr && *stall != '\0') {
         const auto threshold = static_cast<unsigned>((std::max)(20L, std::strtol(stall, nullptr, 10)));
@@ -1514,14 +1556,14 @@ void NotePresent(long long frame_us, long long fence_us, long long composite_us,
             "t_s,frame_ms,fence_ms,composite_ms,pace_ms,astc_decodes,pipelines_built,pipeline_ms,"
             "sparse_binds,sparse_ms,sparse_call_ms,images_created,images_deleted,gc_ms,"
             "tc_used_mib,tc_expected_mib,tc_critical_mib,gc_mode,del_gc,del_gc_download,del_unmap,"
-            "del_join,created_replace,gc_finish_ms,list_waits,list_wait_ms,recr_30,recr_150,recr_600,recr_old,ab,draws,indirect,dispatches,writer_waits,writer_wait_ms,drains,drain_ms,back_idles,back_idle_ms,trust_skips,trust_violations,sem_drains,sem_drain_ms,dma_drains,dma_drain_ms,acq_checks,acq_skips,acq_same,acq_needed,acq_waits,acq_wrong,acq_written,acq_exec,resume_polls,resume_skips\n";
+            "del_join,created_replace,gc_finish_ms,list_waits,list_wait_ms,recr_30,recr_150,recr_600,recr_old,ab,draws,indirect,dispatches,writer_waits,writer_wait_ms,drains,drain_ms,back_idles,back_idle_ms,trust_skips,trust_violations,sem_drains,sem_drain_ms,dma_drains,dma_drain_ms,acq_checks,acq_skips,acq_same,acq_needed,acq_waits,acq_wrong,acq_written,acq_exec,resume_polls,resume_skips,audio_underruns,audio_late_ticks\n";
     }
     if (!frames.file.is_open()) {
         return;
     }
     const StallCounters counters = ReadCounters();
     frames.pending += fmt::format("{:.3f},{:.2f},{:.2f},{:.2f},{:.2f},{},{},{:.1f},{},{:.1f},{:.1f},{},{},{:.1f},"
-                                  "{},{},{},{},{},{},{},{},{},{:.1f},{},{:.1f},{},{},{},{},{},{},{},{},{},{:.1f},{},{:.1f},{},{:.1f},{},{},{},{:.1f},{},{:.1f},{},{},{},{},{},{},{},{},{},{}\n",
+                                  "{},{},{},{},{},{},{},{},{},{:.1f},{},{:.1f},{},{},{},{},{},{},{},{},{},{:.1f},{},{:.1f},{},{:.1f},{},{},{},{:.1f},{},{:.1f},{},{},{},{},{},{},{},{},{},{},{},{}\n",
                                   std::chrono::duration<double>(now - g_process_start).count(),
                                   frame_us / 1000.0, fence_us / 1000.0, composite_us / 1000.0,
                                   pace_us / 1000.0, counters.astc, counters.pipelines,
@@ -1563,7 +1605,9 @@ void NotePresent(long long frame_us, long long fence_us, long long composite_us,
                                   g_acq_written.load(std::memory_order_relaxed),
                                   g_acq_exec.load(std::memory_order_relaxed),
                                   g_resume_polls.load(std::memory_order_relaxed),
-                                  g_resume_skips.load(std::memory_order_relaxed));
+                                  g_resume_skips.load(std::memory_order_relaxed),
+                                  g_audio_underruns.load(std::memory_order_relaxed),
+                                  g_audio_late_ticks.load(std::memory_order_relaxed));
     if (++frames.lines % 150 == 0) {
         frames.Flush();
     }
@@ -1581,6 +1625,8 @@ void NoteGuestThread(std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
 void SetClientThread(std::uint64_t) {}
 void NoteGpuSubmit(std::uint32_t) {}
 void StartFromEnvironment() {}
+void NoteAudioUnderrun(const char*, std::uint32_t) {}
+void NoteAudioRenderGap(double, double) {}
 std::string Sample(const char*, double, const std::string&) {
     return "the sampler is Windows only";
 }

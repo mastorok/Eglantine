@@ -6,12 +6,14 @@
 
 #include <array>
 #include <chrono>
+#include <cstdlib>
 
 #include "audio_core/adsp/apps/audio_renderer/audio_renderer.h"
 #include "audio_core/audio_core.h"
 #include "audio_core/common/common.h"
 #include "audio_core/sink/sink.h"
 #include "common/logging.h"
+#include "common/nx2_sampler.h"
 #include "common/thread.h"
 #include "core/core.h"
 #include "core/core_timing.h"
@@ -125,7 +127,14 @@ void AudioRenderer::CreateSinkStreams() {
         std::string name{fmt::format("ADSP_RenderStream-{}", i)};
         streams[i] =
             sink.AcquireSinkStream(system, channels, name, ::AudioCore::Sink::StreamType::Render);
-        streams[i]->SetRingSize(4);
+        // EDEN_NX2_AUDIO_RING=<n>: buffers (5 ms each) the renderer may run ahead of the speakers.
+        // More of them hide longer host stalls at the price of that much extra delay.
+        static const u32 ring = [] {
+            const char* value = std::getenv("EDEN_NX2_AUDIO_RING");
+            const long n = value != nullptr ? std::atol(value) : 0;
+            return n >= 2 && n <= 64 ? static_cast<u32>(n) : 4U;
+        }();
+        streams[i]->SetRingSize(ring);
     }
 }
 
@@ -142,6 +151,10 @@ void AudioRenderer::Main(std::stop_token stop_token) {
     }
 
     mailbox.Send(Direction::Host, Message::InitializeOK);
+
+    std::chrono::steady_clock::time_point last_tick_start{};
+    double last_tick_process_ms{};
+    bool last_tick_valid{};
 
     // 0.12 seconds (2,304,000 / 19,200,000)
     constexpr u64 max_process_time{2'304'000ULL};
@@ -162,6 +175,13 @@ void AudioRenderer::Main(std::stop_token stop_token) {
             std::array<bool, MaxRendererSessions> buffers_reset{};
             std::array<u64, MaxRendererSessions> render_times_taken{};
             const auto start_time{system.CoreTiming().GetGlobalTimeUs().count()};
+            // Wall-clock gap between ticks and time the previous tick took (EDEN_NX2_AUDIO_LATE_MS).
+            const auto wall_start = std::chrono::steady_clock::now();
+            if (last_tick_valid) {
+                Nx2Sampler::NoteAudioRenderGap(
+                    std::chrono::duration<double, std::milli>(wall_start - last_tick_start).count(),
+                    last_tick_process_ms);
+            }
 
             for (u32 index = 0; index < MaxRendererSessions; index++) {
                 auto& command_buffer{command_buffers[index]};
@@ -211,6 +231,12 @@ void AudioRenderer::Main(std::stop_token stop_token) {
                     command_buffer.render_time_taken_us = end_time - start_time;
                 }
             }
+            last_tick_process_ms =
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                          wall_start)
+                    .count();
+            last_tick_start = wall_start;
+            last_tick_valid = true;
             mailbox.Send(Direction::Host, Message::RenderResponse);
         } break;
         default:

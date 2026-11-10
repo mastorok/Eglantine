@@ -63,6 +63,14 @@ void SetClientThread(std::uint64_t id);
 /// A GPFIFO submission with `entries` pushbuffer entries, credited to the client thread.
 void NoteGpuSubmit(std::uint32_t entries);
 
+/// EDEN_NX2_AUDIO_LOG (default on): an audio sink stream found no buffer to play ("underrun",
+/// the output repeats its last sample = a click) with `queued` buffers waiting; logged with the
+/// time on the same clock as the frame log (t_s), so a click can be matched to a stall.
+void NoteAudioUnderrun(const char* stream, std::uint32_t queued);
+/// The DSP renderer started a tick `gap_ms` after the previous one (nominally 5 ms), and the
+/// previous one took `process_ms` to render.
+void NoteAudioRenderGap(double gap_ms, double process_ms);
+
 /// Samples the named threads for `seconds` now (blocking), writes the report to `out` (and
 /// the folded stacks to `out`.folded) and returns the report.
 std::string Sample(const char* names, double seconds, const std::string& out);
@@ -131,6 +139,10 @@ inline std::atomic<std::uint64_t> g_indirect_draws{0};
 inline std::atomic<std::uint64_t> g_dispatches{0};
 inline std::atomic<std::uint64_t> g_list_waits{0};      // GPU-written command list reads that waited
 inline std::atomic<std::uint64_t> g_list_wait_us{0};
+// Audio: output buffers the sink found empty (the game heard a repeated sample) and DSP render
+// ticks that came late.
+inline std::atomic<std::uint64_t> g_audio_underruns{0};
+inline std::atomic<std::uint64_t> g_audio_late_ticks{0};
 inline std::atomic<std::uint64_t> g_tc_used_mib{0};
 inline std::atomic<std::uint64_t> g_tc_expected_mib{0};
 inline std::atomic<std::uint64_t> g_tc_critical_mib{0};
