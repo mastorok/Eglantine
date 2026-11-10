@@ -121,6 +121,7 @@ private:
 
     std::atomic<s64> m_cpu_time{};
     std::atomic_bool m_mkw_dynamic_fps_patch_applied{};
+    std::atomic<u64> m_oot_dynamic_dt_mailbox{};
     std::atomic<s64> m_num_process_switches{};
     std::atomic<s64> m_num_thread_switches{};
     std::atomic<s64> m_num_fpu_switches{};
@@ -190,6 +191,16 @@ public:
 
     void SetMkwDynamicFpsPatchApplied(bool applied) {
         m_mkw_dynamic_fps_patch_applied.store(applied, std::memory_order_relaxed);
+    }
+
+    /// Guest address of the float "frames per second" cell Ocarina of Time's frame-delta code reads
+    /// once the dynamic frame delta patch is applied (0: not applied). See loader/nso.cpp.
+    u64 GetOotDynamicDtMailbox() const {
+        return m_oot_dynamic_dt_mailbox.load(std::memory_order_relaxed);
+    }
+
+    void SetOotDynamicDtMailbox(u64 guest_address) {
+        m_oot_dynamic_dt_mailbox.store(guest_address, std::memory_order_relaxed);
     }
 
     u64 GetProcessId() const {

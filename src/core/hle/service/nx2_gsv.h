@@ -9,6 +9,7 @@
 #include <thread>
 #include <chrono>
 #include <condition_variable>
+#include <cmath>
 #include <cstring>
 #include <set>
 #include <span>
@@ -1800,6 +1801,7 @@ private:
         const auto composited = std::chrono::steady_clock::now();
         PaceToVblank(w[12]);
         const auto paced = std::chrono::steady_clock::now();
+        UpdateOotDynamicDt(paced);
         // Where each frame's time goes on the present thread, averaged per 600 presents: the
         // game is blocked here while Eden's GPU thread catches up (fence) and composites.
         {
@@ -1864,6 +1866,100 @@ private:
     // next vblank instead (title 4 ran at up to 160 fps, its timing and audio with it).
     std::chrono::steady_clock::time_point m_next_vblank{};
     u32 m_swap_word{};
+
+    // Ocarina of Time's frame delta follows the "frames per second" float in a cell the loader
+    // pointed its delta code at (loader/nso.cpp): 60 / fps frames of 60 Hz, 30 / fps in the game's
+    // 30 FPS mode. Feed it the rate the game is really being presented at, so the game advances by
+    // the time that actually passed between its frames whatever that rate is: full speed at 20 or
+    // 45 FPS, no cap, menus included. The delta of the next frame is the period of the last one.
+    // EDEN_NX2_OOT_DT_MIN_FPS (default 15) bounds the delta (a very slow frame must not make the
+    // game step by seconds); EDEN_NX2_OOT_DT_FPS=<n> pins the rate for a game speed test (a
+    // pinned 20 at 60 FPS plays at triple speed); EDEN_NX2_OOT_DT_LOG=0 silences the report.
+    void UpdateOotDynamicDt(std::chrono::steady_clock::time_point paced) {
+        const Kernel::KProcess* const app_process = system.ApplicationProcess();
+        if (app_process == nullptr) {
+            return;
+        }
+        const u64 mailbox = app_process->GetOotDynamicDtMailbox();
+        if (mailbox == 0) {
+            return;
+        }
+        static const double min_fps = [] {
+            const char* value = std::getenv("EDEN_NX2_OOT_DT_MIN_FPS");
+            const double fps = value ? std::strtod(value, nullptr) : 15.0;
+            return std::clamp(fps, 2.0, 60.0);
+        }();
+        static const double pinned_fps = [] {
+            const char* value = std::getenv("EDEN_NX2_OOT_DT_FPS");
+            return value ? std::clamp(std::strtod(value, nullptr), 0.0, 240.0) : 0.0;
+        }();
+        static const bool report = [] {
+            const char* value = std::getenv("EDEN_NX2_OOT_DT_LOG");
+            return value == nullptr || value[0] != '0';
+        }();
+        auto& dt = m_oot_dt;
+        const auto previous = std::exchange(dt.last_paced, paced);
+        if (previous == std::chrono::steady_clock::time_point{}) {
+            LOG_INFO(Service, "nx2:vi2 Ocarina of Time real-time frame delta active (fps cell at {:#x}{})",
+                     mailbox, pinned_fps > 0.0 ? ", rate pinned by EDEN_NX2_OOT_DT_FPS" : "");
+            return;
+        }
+        const double seconds = std::chrono::duration<double>(paced - previous).count();
+        // A loading stall or a pause is not a frame time: keep the last good one.
+        if (seconds > 0.25 || seconds <= 0.0) {
+            return;
+        }
+        // Smooth the sleep jitter of the vblank pacing, but follow a real change at once.
+        if (dt.period <= 0.0 || std::abs(seconds - dt.period) > 0.25 * dt.period) {
+            dt.period = seconds;
+        } else {
+            dt.period += 0.2 * (seconds - dt.period);
+        }
+        // The game's time runs at the emulation speed: a speed limit of 200% is a game at 2x.
+        const u32 limit = Settings::values.use_speed_limit.GetValue() ? Settings::SpeedLimit() : 0U;
+        double period = dt.period * (limit != 0 ? static_cast<double>(limit) / 100.0 : 1.0);
+        // A frame at the vblank grid (16.7 ms, 33.3 ms...) is exactly that, not 16.5 or 16.9.
+        constexpr double Vblank = 1.0 / 60.0;
+        const double vblanks = std::round(period / Vblank);
+        if (vblanks >= 1.0 && vblanks <= 8.0 && std::abs(period - vblanks * Vblank) < 0.0003) {
+            period = vblanks * Vblank;
+        }
+        const double fps = pinned_fps > 0.0 ? pinned_fps : std::clamp(1.0 / period, min_fps, 240.0);
+        const float fps_value = static_cast<float>(fps);
+        u32 bits;
+        std::memcpy(&bits, &fps_value, sizeof(bits));
+        auto& memory = system.ApplicationMemory();
+        memory.Write32(mailbox, bits);
+
+        dt.fps_sum += fps;
+        dt.fps_min = (std::min)(dt.fps_min, fps);
+        dt.fps_max = (std::max)(dt.fps_max, fps);
+        dt.seconds_max = (std::max)(dt.seconds_max, seconds);
+        if (++dt.updates == 600 && report) {
+            u32 read_back = memory.Read32(mailbox);
+            float read_back_fps;
+            std::memcpy(&read_back_fps, &read_back, sizeof(read_back_fps));
+            LOG_INFO(Service,
+                     "nx2:vi2 Ocarina of Time frame delta, last 600 presents: rate sent to the game "
+                     "{:.1f} fps on average (min {:.1f}, max {:.1f}), slowest frame {:.1f} ms, "
+                     "cell reads back {:.1f}",
+                     dt.fps_sum / 600.0, dt.fps_min, dt.fps_max, dt.seconds_max * 1000.0,
+                     read_back_fps);
+        }
+        if (dt.updates >= 600) {
+            dt.updates = 0;
+            dt.fps_sum = 0.0;
+            dt.fps_min = 1e9;
+            dt.fps_max = 0.0;
+            dt.seconds_max = 0.0;
+        }
+    }
+    struct OotDynamicDt {
+        std::chrono::steady_clock::time_point last_paced{};
+        double period{};
+        double fps_sum{}, fps_min{1e9}, fps_max{}, seconds_max{};
+        u32 updates{};
+    } m_oot_dt{};
 
     // timing: present word 12, (swap interval << 16) | refresh rate. Fire Emblem: Fortune's Weave
     // sends 0x1003c during its boot logos and 0x2003c (two vblanks per frame, 30 fps) after; paced

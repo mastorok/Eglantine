@@ -5,7 +5,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <cinttypes>
+#include <cstdlib>
 #include <cstring>
 #include <span>
 #include <vector>
@@ -270,6 +272,74 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
         }
     }
 
+    // Ocarina of Time (Switch 2): real-time frame delta.
+    // The game derives its frame delta from an integer "frames per second" its own frame
+    // governor picks (60 / interval): delta = 60 / fps, in 60 Hz frames. The governor only sees
+    // the time its own thread spends, not the time Eden's present path holds the game, so it
+    // keeps choosing 60 fps while frames really take 30-50 ms and the whole game runs in slow
+    // motion. The two places that turn that integer into a delta (the main frame update and the
+    // frame-begin virtual that publishes the global delta) are pointed at a float cell in the
+    // text segment's page padding that the present path of nx2:vi2 refreshes with the measured
+    // frame rate (nx2_gsv.h, UpdateOotDynamicDt). EDEN_NX2_OOT_DYNAMIC_DT=0 leaves the code alone.
+    size_t oot_dt_mailbox_offset = 0;
+    if (name == "main" && process.GetProgramId() == 0x0400486024DEC000ULL) {
+        const char* const oot_dt_env = std::getenv("EDEN_NX2_OOT_DYNAMIC_DT");
+        constexpr std::array<u8, 20> BuildId{0xE0, 0xF3, 0xCC, 0xFA, 0xF5, 0x00, 0x65,
+                                             0xAE, 0x4E, 0xA0, 0x1E, 0xB5, 0xAE, 0xB1,
+                                             0x3B, 0x1A, 0x45, 0xDA, 0x33, 0x48};
+        // Sites: scvtf s0, s0 (fps integer to float) and the instruction that follows it.
+        constexpr u32 ScvtfInsn = 0x5E21D800;
+        struct Site {
+            size_t offset;
+            u32 next;
+        };
+        constexpr std::array<Site, 2> sites{{{0x3B4EAF4, 0x1E201820},   // fdiv s0, s1, s0
+                                             {0x6E6CA8, 0x7200011F}}}; // tst w8, #1
+        // Cave: ldr s0, [pc, #8]; ret; .float fps; nop. Needs 16 zero bytes in the page padding
+        // after the text segment, and the fps float starts at 60 (the unpatched behaviour).
+        constexpr size_t CaveOffset = 0x3C46200;
+        constexpr std::array<u32, 4> cave{0x1C000040U, 0xD65F03C0U, 0x42700000U, 0xD503201FU};
+        const auto& text = nso_header.segments[0];
+        const auto& rodata = nso_header.segments[1];
+        u8* const image = codeset.memory.data() + module_start;
+        const auto read_word = [image](size_t offset) {
+            u32 value;
+            std::memcpy(&value, image + offset, sizeof(value));
+            return value;
+        };
+        bool match = (oot_dt_env == nullptr || oot_dt_env[0] != '0') &&
+                     std::equal(BuildId.begin(), BuildId.end(), nso_header.build_id.begin()) &&
+                     CaveOffset >= u64{text.location} + text.size &&
+                     CaveOffset + sizeof(cave) <= u64{rodata.location} &&
+                     module_start + CaveOffset + sizeof(cave) <= codeset.memory.size();
+        for (size_t i = 0; match && i < sizeof(cave) / sizeof(u32); ++i) {
+            match = read_word(CaveOffset + i * sizeof(u32)) == 0;
+        }
+        for (const Site& site : sites) {
+            match = match && site.offset + 2 * sizeof(u32) <= text.size &&
+                    module_start + site.offset + 2 * sizeof(u32) <= codeset.memory.size() &&
+                    read_word(site.offset) == ScvtfInsn && read_word(site.offset + 4) == site.next;
+        }
+        if (match) {
+            std::memcpy(image + CaveOffset, cave.data(), sizeof(cave));
+            for (const Site& site : sites) {
+                const s64 words = (static_cast<s64>(CaveOffset) - static_cast<s64>(site.offset)) / 4;
+                const u32 call = 0x94000000U | (static_cast<u32>(words) & 0x03FFFFFFU); // bl cave
+                std::memcpy(image + site.offset, &call, sizeof(call));
+            }
+            oot_dt_mailbox_offset = CaveOffset + 2 * sizeof(u32);
+            LOG_INFO(Loader, "Ocarina of Time: real-time frame delta patch applied (main+{:#x}, "
+                             "main+{:#x}; fps cell at main+{:#x})",
+                     sites[0].offset, sites[1].offset, oot_dt_mailbox_offset);
+        } else if (oot_dt_env == nullptr || oot_dt_env[0] != '0') {
+            LOG_WARNING(Loader, "Ocarina of Time real-time frame delta patch skipped "
+                                "(unsupported build or instructions)");
+        } else {
+            LOG_INFO(Loader, "Ocarina of Time real-time frame delta patch disabled "
+                             "(EDEN_NX2_OOT_DYNAMIC_DT=0)");
+        }
+    }
+
 #ifdef HAS_NCE
     // If we are computing the process code layout and using nce backend, patch.
     const auto& code = codeset.CodeSegment();
@@ -345,6 +415,9 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
     process.LoadModule(system.Kernel(), std::move(codeset), load_base);
     if (name == "main" && process.GetProgramId() == Settings::MarioKartWorldProgramId) {
         process.SetMkwDynamicFpsPatchApplied(mkw_dynamic_fps_patch_applied);
+    }
+    if (oot_dt_mailbox_offset != 0) {
+        process.SetOotDynamicDtMailbox(load_base + module_start + oot_dt_mailbox_offset);
     }
     return load_base + image_size;
 }
