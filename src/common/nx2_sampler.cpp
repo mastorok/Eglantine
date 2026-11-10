@@ -1506,6 +1506,60 @@ void NoteAudioRenderGap(double gap_ms, double process_ms) {
     }
 }
 
+void NoteGuestAudioUpdate(const void* renderer) {
+    static const double gap_limit_ms = [] {
+        const char* value = std::getenv("EDEN_NX2_AUDIO_GUEST_MS");
+        return value != nullptr && *value != '\0' ? std::atof(value) : 30.0;
+    }();
+    struct State {
+        std::chrono::steady_clock::time_point last{};
+        std::chrono::steady_clock::time_point window{};
+        std::uint64_t count = 0;
+        std::uint64_t late = 0;
+        double max_gap_ms = 0.0;
+        double sum_gap_ms = 0.0;
+    };
+    static std::mutex mutex;
+    static std::unordered_map<const void*, State> states;
+    static std::atomic<std::uint64_t> logged{0};
+    const auto now = std::chrono::steady_clock::now();
+    std::scoped_lock lock{mutex};
+    State& state = states[renderer];
+    if (state.last != std::chrono::steady_clock::time_point{}) {
+        const double gap_ms = std::chrono::duration<double, std::milli>(now - state.last).count();
+        ++state.count;
+        state.sum_gap_ms += gap_ms;
+        state.max_gap_ms = (std::max)(state.max_gap_ms, gap_ms);
+        if (gap_ms >= gap_limit_ms) {
+            ++state.late;
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 600) {
+                LOG_INFO(Common,
+                         "nx2 guest audio update gap at {:.3f} s: {:.1f} ms since the previous "
+                         "RequestUpdate (renderer {})",
+                         std::chrono::duration<double>(now - g_process_start).count(), gap_ms,
+                         fmt::ptr(renderer));
+            }
+        }
+    }
+    state.last = now;
+    if (state.window == std::chrono::steady_clock::time_point{}) {
+        state.window = now;
+    } else if (now - state.window >= std::chrono::seconds{10}) {
+        LOG_INFO(Common,
+                 "nx2 guest audio renderer {}: {} updates in {:.1f} s, average gap {:.1f} ms, "
+                 "longest {:.1f} ms, {} gaps over {:.0f} ms",
+                 fmt::ptr(renderer), state.count,
+                 std::chrono::duration<double>(now - state.window).count(),
+                 state.count != 0 ? state.sum_gap_ms / static_cast<double>(state.count) : 0.0,
+                 state.max_gap_ms, state.late, gap_limit_ms);
+        state.window = now;
+        state.count = 0;
+        state.late = 0;
+        state.max_gap_ms = 0.0;
+        state.sum_gap_ms = 0.0;
+    }
+}
+
 void StartFromEnvironment() {
     if (const char* stall = std::getenv("EDEN_NX2_STALL_MS"); stall != nullptr && *stall != '\0') {
         const auto threshold = static_cast<unsigned>((std::max)(20L, std::strtol(stall, nullptr, 10)));
@@ -1627,6 +1681,7 @@ void NoteGpuSubmit(std::uint32_t) {}
 void StartFromEnvironment() {}
 void NoteAudioUnderrun(const char*, std::uint32_t) {}
 void NoteAudioRenderGap(double, double) {}
+void NoteGuestAudioUpdate(const void*) {}
 std::string Sample(const char*, double, const std::string&) {
     return "the sampler is Windows only";
 }

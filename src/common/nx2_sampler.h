@@ -70,6 +70,11 @@ void NoteAudioUnderrun(const char* stream, std::uint32_t queued);
 /// The DSP renderer started a tick `gap_ms` after the previous one (nominally 5 ms), and the
 /// previous one took `process_ms` to render.
 void NoteAudioRenderGap(double gap_ms, double process_ms);
+/// The guest called RequestUpdate on audio renderer `renderer`. Logs every 10 s how many updates
+/// arrived and the longest gap between them, and each gap over EDEN_NX2_AUDIO_GUEST_MS (default
+/// 30): the DSP replays its last command list when the game's audio thread is late, which is
+/// what a crackle during a hitch sounds like, so these lines can be matched to the stalls.
+void NoteGuestAudioUpdate(const void* renderer);
 
 /// Samples the named threads for `seconds` now (blocking), writes the report to `out` (and
 /// the folded stacks to `out`.folded) and returns the report.

@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/nx2_sampler.h"
 #include "core/hle/service/audio/audio_renderer.h"
 #include "core/hle/service/cmif_serialization.h"
 
@@ -86,6 +87,7 @@ Result IAudioRenderer::RequestUpdateAuto(
     InBuffer<BufferAttr_HipcAutoSelect> input) {
     LOG_TRACE(Service_Audio, "called");
 
+    Nx2Sampler::NoteGuestAudioUpdate(impl.get());
     const auto result = impl->RequestUpdate(input, out_performance_buffer, out_buffer);
     if (result.IsFailure()) {
         LOG_ERROR(Service_Audio, "RequestUpdate failed error {:#02x}!", result.GetDescription());

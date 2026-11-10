@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdlib>
@@ -1185,9 +1186,12 @@ void PipelineCache::EvictUnusedPipelines() {
     // with every place a session went (title 1: 1,500 on its title screen alone). One unused for
     // this long is destroyed; it takes 2-3 ms to build again from the driver's pipeline cache.
     // EDEN_NX2_EVICT_FRAMES overrides the delay (0 = never evict) and EDEN_NX2_EVICT_MIN_PIPELINES
-    // the number of pipelines below which nothing is evicted (default 3000, about 1.3 GB of host
+    // the number of pipelines below which nothing is evicted (default 12000, about 5.4 GB of host
     // memory): a rebuilt pipeline stalls the GPU thread 2 ms (20 to 120 of them in one frame at a
     // camera cut = a 40-250 ms freeze and an audio glitch), which costs far more than the memory.
+    // Metroid Prime 4 reached 6,761 pipelines and lost 6,073 of them to the old limit of 3000 at
+    // 170 s; the 26-83 it then rebuilt per 10 s in the desert (8-36 ms each while the background
+    // threads compiled too) made freezes of up to 1 s.
     static const u64 EvictAfterFrames = [] {
         u64 frames = 9000;
         if (const char* value = std::getenv("EDEN_NX2_EVICT_FRAMES")) {
@@ -1196,7 +1200,7 @@ void PipelineCache::EvictUnusedPipelines() {
         return frames;
     }();
     static const size_t EvictMinPipelines = [] {
-        size_t count = 3000;
+        size_t count = 12000;
         if (const char* value = std::getenv("EDEN_NX2_EVICT_MIN_PIPELINES")) {
             count = static_cast<size_t>(std::strtoull(value, nullptr, 10));
         }
@@ -1570,14 +1574,21 @@ namespace {
 // Pipelines built on the GPU thread at run time (shader translation; the driver compile is on
 // workers): every one over 2 ms is logged, and the total every 10 s, to tell how much of the
 // stutter on new content is translation.
-void ReportRuntimePipeline(const char* kind, std::chrono::steady_clock::time_point begin) {
+void ReportRuntimePipeline(const char* kind, std::chrono::steady_clock::time_point begin,
+                           u32 origin = 0) {
+    // origin: 0 = not seen before (translated and compiled now), 1 = in the disk cache but not
+    // built at boot, 2 = built earlier this session and evicted.
     static std::chrono::steady_clock::duration total{};
+    static std::array<u32, 3> by_origin{};
+    static std::array<double, 3> origin_ms{};
     static u32 count{}, logged{};
     static auto window = std::chrono::steady_clock::now();
     const auto now = std::chrono::steady_clock::now();
     const auto elapsed = now - begin;
     total += elapsed;
     ++count;
+    by_origin[origin % 3] += 1;
+    origin_ms[origin % 3] += std::chrono::duration<double, std::milli>(elapsed).count();
     Nx2Sampler::g_pipelines_built.fetch_add(1, std::memory_order_relaxed);
     Nx2Sampler::g_pipeline_build_us.fetch_add(
         static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count()),
@@ -1585,12 +1596,19 @@ void ReportRuntimePipeline(const char* kind, std::chrono::steady_clock::time_poi
     const auto ms = [](auto d) { return std::chrono::duration<double, std::milli>(d).count(); };
     if (elapsed > std::chrono::milliseconds{2} && logged < 400) {
         ++logged;
-        LOG_INFO(Render_Vulkan, "{} pipeline built on the GPU thread in {:.1f} ms", kind, ms(elapsed));
+        static constexpr std::array<const char*, 3> origin_names{"new", "on disk", "evicted"};
+        LOG_INFO(Render_Vulkan, "{} pipeline built on the GPU thread in {:.1f} ms ({})", kind,
+                 ms(elapsed), origin_names[origin % 3]);
     }
     if (now - window > std::chrono::seconds{10}) {
-        LOG_INFO(Render_Vulkan, "Runtime pipelines in the last 10 s: {} built, {:.1f} ms on the GPU thread",
-                 count, ms(total));
+        LOG_INFO(Render_Vulkan,
+                 "Runtime pipelines in the last 10 s: {} built, {:.1f} ms on the GPU thread "
+                 "(new {} / {:.1f} ms, on disk {} / {:.1f} ms, evicted {} / {:.1f} ms)",
+                 count, ms(total), by_origin[0], origin_ms[0], by_origin[1], origin_ms[1],
+                 by_origin[2], origin_ms[2]);
         total = {};
+        by_origin = {};
+        origin_ms = {};
         count = 0;
         window = now;
     }
@@ -1599,8 +1617,12 @@ void ReportRuntimePipeline(const char* kind, std::chrono::steady_clock::time_poi
 
 std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
     const auto begin = std::chrono::steady_clock::now();
+    const u64 key_hash = graphics_key.Hash();
+    const u32 origin = used_and_evicted.contains(key_hash) ? 2U
+                       : disk_pipelines.contains(key_hash) ? 1U
+                                                           : 0U;
     SCOPE_EXIT {
-        ReportRuntimePipeline("Graphics", begin);
+        ReportRuntimePipeline("Graphics", begin, origin);
     };
     GraphicsEnvironments environments;
     GetGraphicsEnvironments(environments, graphics_key.unique_hashes);
