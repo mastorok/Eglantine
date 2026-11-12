@@ -435,6 +435,33 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
         }
     }
 
+    // Metroid Prime 4 (Switch 1 build): the game advances by a fixed frame time it picks from a
+    // {1/60, 1/30} table in rodata, so it runs in slow motion whenever a frame takes longer. The
+    // GPU front end rewrites that table with the measured frame time (video_core/gpu.cpp).
+    // EDEN_NX2_MP4_DYNAMIC_DT=0 leaves the table alone.
+    size_t mp4_frame_time_table_offset = 0;
+    if (name == "main" && process.GetProgramId() == 0x010019A01E2F2000ULL) {
+        constexpr size_t TableOffset = 0x13bf400;
+        constexpr std::array<u32, 2> Expected{0x3c888889, 0x3d088889};
+        const char* const mp4_env = std::getenv("EDEN_NX2_MP4_DYNAMIC_DT");
+        std::array<u32, 2> found{};
+        if (module_start + TableOffset + sizeof(found) <= codeset.memory.size()) {
+            std::memcpy(found.data(), codeset.memory.data() + module_start + TableOffset,
+                        sizeof(found));
+        }
+        if (mp4_env != nullptr && mp4_env[0] == '0') {
+            LOG_INFO(Loader, "Metroid Prime 4: real-time frame time disabled by the environment");
+        } else if (found == Expected) {
+            mp4_frame_time_table_offset = TableOffset;
+            LOG_INFO(Loader, "Metroid Prime 4: frame-time table found at main+{:#x}", TableOffset);
+        } else {
+            LOG_WARNING(Loader,
+                        "Metroid Prime 4: frame-time table not found at main+{:#x} ({:#x}, {:#x}): "
+                        "another build of the game",
+                        TableOffset, found[0], found[1]);
+        }
+    }
+
     // Load codeset for current process
     LOG_INFO(Loader, "Module {} loaded at {:#x} (size {:#x})", nso_file.GetName(), load_base, image_size);
     process.LoadModule(system.Kernel(), std::move(codeset), load_base);
@@ -443,6 +470,9 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
     }
     if (oot_dt_mailbox_offset != 0) {
         process.SetOotDynamicDtMailbox(load_base + module_start + oot_dt_mailbox_offset);
+    }
+    if (mp4_frame_time_table_offset != 0) {
+        process.SetFrameTimeTable(load_base + module_start + mp4_frame_time_table_offset);
     }
     return load_base + image_size;
 }

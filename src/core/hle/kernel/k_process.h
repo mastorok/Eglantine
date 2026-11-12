@@ -122,6 +122,7 @@ private:
     std::atomic<s64> m_cpu_time{};
     std::atomic_bool m_mkw_dynamic_fps_patch_applied{};
     std::atomic<u64> m_oot_dynamic_dt_mailbox{};
+    std::atomic<u64> m_frame_time_table{};
     std::atomic<s64> m_num_process_switches{};
     std::atomic<s64> m_num_thread_switches{};
     std::atomic<s64> m_num_fpu_switches{};
@@ -201,6 +202,16 @@ public:
 
     void SetOotDynamicDtMailbox(u64 guest_address) {
         m_oot_dynamic_dt_mailbox.store(guest_address, std::memory_order_relaxed);
+    }
+
+    /// Guest address of Metroid Prime 4's {1/60, 1/30} frame-time table once the loader has
+    /// found it (0: not found or disabled). See loader/nso.cpp and video_core/gpu.cpp.
+    u64 GetFrameTimeTable() const {
+        return m_frame_time_table.load(std::memory_order_relaxed);
+    }
+
+    void SetFrameTimeTable(u64 guest_address) {
+        m_frame_time_table.store(guest_address, std::memory_order_relaxed);
     }
 
     u64 GetProcessId() const {

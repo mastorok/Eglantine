@@ -8,7 +8,10 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
+#include <cstdlib>
+#include <cstring>
 #include <list>
 #include <memory>
 #include <mutex>
@@ -16,6 +19,7 @@
 #include <vector>
 
 #include "common/assert.h"
+#include "common/logging.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
 #include "core/core.h"
@@ -23,7 +27,9 @@
 #include "core/frontend/emu_window.h"
 #include "core/frontend/graphics_context.h"
 #include "core/gpu_dirty_memory_manager.h"
+#include "core/hle/kernel/k_process.h"
 #include "core/hle/service/nvdrv/nvdata.h"
+#include "core/memory.h"
 #include "core/perf_stats.h"
 #include "video_core/cdma_pusher.h"
 #include "video_core/control/channel_state.h"
@@ -184,7 +190,87 @@ struct GPU::Impl {
 
     void RendererFrameEndNotify() {
         system.GetPerfStats().EndGameFrame();
+        UpdateFrameTimeTable();
     }
+
+    /// Metroid Prime 4: writes the measured frame time into the game's {1/60, 1/30} frame-time
+    /// table, so the game keeps real-time speed when a frame takes longer than 1/60 s.
+    /// EDEN_NX2_MP4_DT_SCALE=<x> pins the step to x/60 s (2 = a game twice too fast at 60 fps, the
+    /// proof that the table drives the simulation). EDEN_NX2_MP4_DT_MIN_FPS bounds the step.
+    void UpdateFrameTimeTable() {
+        const Kernel::KProcess* const process = system.ApplicationProcess();
+        if (process == nullptr) {
+            return;
+        }
+        const u64 table = process->GetFrameTimeTable();
+        if (table == 0) {
+            return;
+        }
+        static const double pinned_scale = [] {
+            const char* const value = std::getenv("EDEN_NX2_MP4_DT_SCALE");
+            return value ? std::clamp(std::strtod(value, nullptr), 0.0, 8.0) : 0.0;
+        }();
+        static const double longest_step = [] {
+            const char* const value = std::getenv("EDEN_NX2_MP4_DT_MIN_FPS");
+            return 1.0 / std::clamp(value ? std::strtod(value, nullptr) : 20.0, 5.0, 60.0);
+        }();
+        const auto now = std::chrono::steady_clock::now();
+        const auto previous = std::exchange(frame_time_last, now);
+        if (previous == std::chrono::steady_clock::time_point{}) {
+            LOG_INFO(HW_GPU, "Metroid Prime 4 real-time frame time active (table at {:#x}{})", table,
+                     pinned_scale > 0.0 ? ", step pinned by EDEN_NX2_MP4_DT_SCALE" : "");
+            return;
+        }
+        const double seconds = std::chrono::duration<double>(now - previous).count();
+        // A loading stall or a pause is not a frame time: keep the last good one.
+        if (seconds > 0.25 || seconds <= 0.0) {
+            return;
+        }
+        if (frame_time_period <= 0.0 ||
+            std::abs(seconds - frame_time_period) > 0.25 * frame_time_period) {
+            frame_time_period = seconds;
+        } else {
+            frame_time_period += 0.2 * (seconds - frame_time_period);
+        }
+        constexpr double Frame = 1.0 / 60.0;
+        // A game at full speed steps by exactly 1/60 s, whatever the jitter of the measure.
+        double step = frame_time_period < Frame * 1.04 ? Frame : frame_time_period;
+        step = (std::min)(step, longest_step);
+        if (pinned_scale > 0.0) {
+            step = Frame * pinned_scale;
+        }
+        const std::array<float, 2> steps{static_cast<float>(step),
+                                         static_cast<float>((std::max)(step, 2.0 * Frame))};
+        auto& memory = system.ApplicationMemory();
+        for (size_t index = 0; index < steps.size(); ++index) {
+            u32 bits;
+            std::memcpy(&bits, &steps[index], sizeof(bits));
+            memory.Write32(table + index * sizeof(u32), bits);
+        }
+        frame_time_sum += step;
+        frame_time_longest = (std::max)(frame_time_longest, seconds);
+        if (step > Frame) {
+            ++frame_time_slow;
+        }
+        if (++frame_time_updates == 600) {
+            LOG_INFO(HW_GPU,
+                     "Metroid Prime 4 frame time, last 600 frames: step sent {:.2f} ms on average, "
+                     "{} frames over 1/60 s, slowest frame {:.1f} ms, table reads back {:#x}",
+                     frame_time_sum / 600.0 * 1000.0, frame_time_slow, frame_time_longest * 1000.0,
+                     memory.Read32(table));
+            frame_time_updates = 0;
+            frame_time_slow = 0;
+            frame_time_sum = 0.0;
+            frame_time_longest = 0.0;
+        }
+    }
+
+    std::chrono::steady_clock::time_point frame_time_last{};
+    double frame_time_period{};
+    double frame_time_sum{};
+    double frame_time_longest{};
+    u32 frame_time_updates{};
+    u32 frame_time_slow{};
 
     /// Performs any additional setup necessary in order to begin GPU emulation.
     /// This can be used to launch any necessary threads and register any necessary
