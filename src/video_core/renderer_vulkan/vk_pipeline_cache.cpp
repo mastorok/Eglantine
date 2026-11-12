@@ -1444,6 +1444,14 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     MeshEmulationInfo mesh_emulation;
     Shader::Profile mesh_profile{profile};
     mesh_profile.emulate_mesh_with_compute = true;
+    // The emulated task and mesh stages run as compute shaders, so their warp operations (ballot,
+    // shuffle, lane id) follow the compute stage. Without this a device that has no task/mesh stages
+    // (GTX 10xx) reports no subgroups for them: every lane then believes it is lane 0 and the
+    // compaction/index code of the mesh program produces garbage triangles.
+    if (profile.SupportsSubgroupStage(Shader::Stage::Compute)) {
+        mesh_profile.supported_subgroup_stages |= (1u << static_cast<u32>(Shader::Stage::Task)) |
+                                                  (1u << static_cast<u32>(Shader::Stage::Mesh));
+    }
     const bool emulate_mesh{!device.IsExtMeshShaderSupported() &&
                             mesh_emulation_resources != nullptr};
     if (emulate_mesh) {
@@ -1507,6 +1515,16 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         const bool emulated_stage{mesh_emulation.resources != nullptr &&
                                   (program.stage == Shader::Stage::Task ||
                                    program.stage == Shader::Stage::Mesh)};
+        if (emulated_stage) {
+            const Shader::Info& info{program.info};
+            LOG_INFO(Render_Vulkan,
+                     "Mesh emulation: {} program {:016x} warp ops: vote {} lane id {} shuffles {} "
+                     "masks {} (subgroups for the stage: {})",
+                     program.stage == Shader::Stage::Task ? "task" : "mesh",
+                     key.unique_hashes[index], info.uses_subgroup_vote,
+                     info.uses_subgroup_invocation_id, info.uses_subgroup_shuffles,
+                     info.uses_subgroup_mask, mesh_profile.SupportsSubgroupStage(program.stage));
+        }
         const std::vector<u32> code{
             EmitSPIRV(emulated_stage ? mesh_profile : profile, runtime_info, program, binding)};
         device.SaveShader(code);

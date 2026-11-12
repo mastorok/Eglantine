@@ -1547,6 +1547,12 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
     // pipeline stays empty and the draw is dropped instead of using stale arguments.
     if (mesh_emulated) {
         const auto make_compute = [&](size_t slot) {
+            // Warp operations of the guest program need the guest's 32 lanes per subgroup.
+            const Shader::Info& info{stage_infos[slot]};
+            const bool uses_warp_ops = info.uses_subgroup_vote || info.uses_subgroup_invocation_id ||
+                                       info.uses_subgroup_shuffles || info.uses_subgroup_mask;
+            const bool force_warp_size = device.IsExtSubgroupSizeControlSupported() && uses_warp_ops &&
+                                         device.IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT);
             return device.GetLogical().CreateComputePipeline(
                 VkComputePipelineCreateInfo{
                     .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
@@ -1554,7 +1560,7 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
                     .flags = 0,
                     .stage{
                         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-                        .pNext = nullptr,
+                        .pNext = force_warp_size ? &subgroup_size_ci : nullptr,
                         .flags = 0,
                         .stage = VK_SHADER_STAGE_COMPUTE_BIT,
                         .module = *spv_modules[slot],

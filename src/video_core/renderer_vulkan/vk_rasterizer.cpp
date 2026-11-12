@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -391,6 +392,8 @@ struct DiagDraw {
 };
 thread_local DiagDraw g_diag_draw;
 thread_local int g_diag_query{-1};
+// EDEN_NX2_DIAG_SAMPLES: why draws of a capture got no probe (logged when the capture ends).
+std::atomic<u32> g_diag_probe_draws{}, g_diag_probe_no_pool{}, g_diag_probe_game_query{};
 
 u64 DiagShader(const Tegra::Engines::Maxwell3D& maxwell3d, size_t stage) {
     const auto& regs = maxwell3d.regs;
@@ -451,7 +454,13 @@ void DiagRecordDraw(Tegra::Engines::Maxwell3D& maxwell3d, Tegra::MemoryManager& 
             g_diag_draw.instances, static_cast<u32>(maxwell3d.draw_manager.draw_state.topology),
             regs.rt[0].Address(), regs.rt[0].width, regs.rt[0].height,
             static_cast<u32>(regs.rt[0].format), regs.zeta_enable, regs.blend.enable[0],
-            regs.color_mask[0].raw, mesh ? "mesh" : "", diag.ProgramKey(vs), diag.ProgramKey(ps)),
+            regs.color_mask[0].raw,
+            fmt::format("{}zt={} zf={:#x} zw={} cull={} stencil={} alpha={} zcount={}",
+                        mesh ? "mesh " : "", regs.depth_test_enable,
+                        static_cast<u32>(regs.depth_test_func), regs.depth_write_enabled,
+                        regs.gl_cull_test_enabled, regs.stencil_enable, regs.alpha_test_enabled,
+                        regs.zpass_pixel_count_enable),
+            diag.ProgramKey(vs), diag.ProgramKey(ps)),
             std::exchange(g_diag_query, -1), vs, ps,
             std::exchange(VideoCommon::Nx2Diag::EmuSlot, -1));
     }
@@ -600,9 +609,15 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
     // EDEN_NX2_DIAG_SAMPLES: count the samples this draw passes while a draw list is captured. The
     // game's own occlusion counting is left alone (one occlusion query can be active at a time).
     int diag_query = -1;
-    if (VideoCommon::Nx2Diag::SamplesEnabled() && g_diag_pool != nullptr &&
-        !maxwell3d->regs.zpass_pixel_count_enable) {
-        diag_query = VideoCommon::Nx2Diag::Diagnostics::Get().NextQuery();
+    if (VideoCommon::Nx2Diag::SamplesEnabled() && VideoCommon::Nx2Diag::Diagnostics::Get().Capturing()) {
+        ++g_diag_probe_draws;
+        if (g_diag_pool == nullptr) {
+            ++g_diag_probe_no_pool;
+        } else if (maxwell3d->regs.zpass_pixel_count_enable) {
+            ++g_diag_probe_game_query;
+        } else {
+            diag_query = VideoCommon::Nx2Diag::Diagnostics::Get().NextQuery();
+        }
     }
     if (diag_query >= 0) {
         scheduler.Record([pool = **g_diag_pool, diag_query](vk::CommandBuffer cmdbuf) {
@@ -1768,6 +1783,13 @@ void RasterizerVulkan::TickFrame() {
     frame_dump.TickFrame();
     if (VideoCommon::Nx2Diag::Active()) {
         auto& diag = VideoCommon::Nx2Diag::Diagnostics::Get();
+        if (diag.Capturing() && VideoCommon::Nx2Diag::SamplesEnabled()) {
+            LOG_INFO(Render_Vulkan,
+                     "diag probe: {} draws seen, {} without a probe pool, {} while the game counts "
+                     "samples itself, {} probes taken",
+                     g_diag_probe_draws.exchange(0), g_diag_probe_no_pool.exchange(0),
+                     g_diag_probe_game_query.exchange(0), diag.QueryCount());
+        }
         if (const u32 emu = diag.EmuCount(); diag.Capturing() && emu > 0 && mesh_emulation != nullptr) {
             // The capture ends here: wait for the mesh emulation passes and read the headers they
             // left for each draw (the "emu" column).
