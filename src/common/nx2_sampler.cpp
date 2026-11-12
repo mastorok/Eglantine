@@ -1506,6 +1506,19 @@ void NoteAudioRenderGap(double gap_ms, double process_ms) {
     }
 }
 
+void NoteVoiceStarved(bool mid_stream) {
+    g_voices_starved.fetch_add(1, std::memory_order_relaxed);
+    if (!mid_stream) {
+        return;
+    }
+    const auto count = g_voices_starved_mid_stream.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (count <= 400) {
+        LOG_INFO(Common, "nx2 voice starved mid-stream #{} at {:.3f} s", count,
+                 std::chrono::duration<double>(std::chrono::steady_clock::now() - g_process_start)
+                     .count());
+    }
+}
+
 void NoteGuestAudioUpdate(const void* renderer) {
     static const double gap_limit_ms = [] {
         const char* value = std::getenv("EDEN_NX2_AUDIO_GUEST_MS");
@@ -1547,11 +1560,13 @@ void NoteGuestAudioUpdate(const void* renderer) {
     } else if (now - state.window >= std::chrono::seconds{10}) {
         LOG_INFO(Common,
                  "nx2 guest audio renderer {}: {} updates in {:.1f} s, average gap {:.1f} ms, "
-                 "longest {:.1f} ms, {} gaps over {:.0f} ms",
+                 "longest {:.1f} ms, {} gaps over {:.0f} ms; voices starved {} (mid-stream {})",
                  fmt::ptr(renderer), state.count,
                  std::chrono::duration<double>(now - state.window).count(),
                  state.count != 0 ? state.sum_gap_ms / static_cast<double>(state.count) : 0.0,
-                 state.max_gap_ms, state.late, gap_limit_ms);
+                 state.max_gap_ms, state.late, gap_limit_ms,
+                 g_voices_starved.exchange(0, std::memory_order_relaxed),
+                 g_voices_starved_mid_stream.exchange(0, std::memory_order_relaxed));
         state.window = now;
         state.count = 0;
         state.late = 0;
@@ -1682,6 +1697,7 @@ void StartFromEnvironment() {}
 void NoteAudioUnderrun(const char*, std::uint32_t) {}
 void NoteAudioRenderGap(double, double) {}
 void NoteGuestAudioUpdate(const void*) {}
+void NoteVoiceStarved(bool) {}
 std::string Sample(const char*, double, const std::string&) {
     return "the sampler is Windows only";
 }

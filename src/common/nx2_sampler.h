@@ -75,6 +75,10 @@ void NoteAudioRenderGap(double gap_ms, double process_ms);
 /// 30): the DSP replays its last command list when the game's audio thread is late, which is
 /// what a crackle during a hitch sounds like, so these lines can be matched to the stalls.
 void NoteGuestAudioUpdate(const void* renderer);
+/// A voice found no wave buffer to play. `mid_stream` is set when its last buffer was not flagged
+/// as the end of the stream, i.e. the game was late refilling it. The counts are logged with the
+/// guest update summary, and the first mid-stream events are logged one by one with their time.
+void NoteVoiceStarved(bool mid_stream);
 
 /// Samples the named threads for `seconds` now (blocking), writes the report to `out` (and
 /// the folded stacks to `out`.folded) and returns the report.
@@ -148,6 +152,8 @@ inline std::atomic<std::uint64_t> g_list_wait_us{0};
 // ticks that came late.
 inline std::atomic<std::uint64_t> g_audio_underruns{0};
 inline std::atomic<std::uint64_t> g_audio_late_ticks{0};
+inline std::atomic<std::uint64_t> g_voices_starved{0};
+inline std::atomic<std::uint64_t> g_voices_starved_mid_stream{0};
 inline std::atomic<std::uint64_t> g_tc_used_mib{0};
 inline std::atomic<std::uint64_t> g_tc_expected_mib{0};
 inline std::atomic<std::uint64_t> g_tc_critical_mib{0};

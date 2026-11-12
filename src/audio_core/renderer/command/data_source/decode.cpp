@@ -11,6 +11,7 @@
 #include "audio_core/renderer/command/resample/resample.h"
 #include "common/fixed_point.h"
 #include "common/logging.h"
+#include "common/nx2_sampler.h"
 #include "common/scratch_buffer.h"
 #include "core/guest_memory.h"
 #include "core/memory.h"
@@ -401,6 +402,12 @@ void DecodeFromWaveBuffers(Core::Memory::Memory& memory, const DecodeFromWaveBuf
     voice_state.wave_buffer_index = wavebuffer_index;
     voice_state.offset = offset;
     voice_state.fraction = fraction;
+
+    if (is_buffer_starved) {
+        // A voice that ran out of wave buffers before the game flagged the end of its stream.
+        const auto previous{(wavebuffer_index + MaxWaveBuffers - 1) % MaxWaveBuffers};
+        Nx2Sampler::NoteVoiceStarved(!args.wave_buffers[previous].stream_ended);
+    }
 }
 
 } // namespace AudioCore::Renderer
