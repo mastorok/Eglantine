@@ -14,6 +14,7 @@
 #include <optional>
 #include <set>
 #include <sstream>
+#include <cstring>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -104,7 +105,7 @@ inline constexpr u32 MaxEmuSlots = 1024;
 // The mesh emulation read-back slot of the draw being prepared on this thread (-1: none); the draw's
 // row picks it up when it is written.
 inline thread_local int EmuSlot = -1;
-inline constexpr u32 EmuSlotWords = 16;
+inline constexpr u32 EmuSlotWords = 288;
 
 inline std::string Hex16(u64 value) {
     char text[17];
@@ -439,7 +440,21 @@ private:
         char text[160];
         std::snprintf(text, sizeof(text), "tasks=%u groups=%u max=%u verts=%u per=%u%s", w[4], w[8],
                       w[5], w[11], w[6], (w[5] != 0 && w[8] >= w[5]) ? " TRUNC" : "");
-        return text;
+        std::string result{text};
+        // A draw without a task program has its first record right after the header: the
+        // primitive count, then attribute lines of 32 vertices. Vertices 0 and 1 of 8 lines.
+        if (w[4] == 0 && w[3] == 16 && w[8] != 0) {
+            std::snprintf(text, sizeof(text), " r0 prims=%u", w[16]);
+            result += text;
+            for (u32 line = 0; line < 8; ++line) {
+                float a{}, b{};
+                std::memcpy(&a, &w[17 + line * 32], sizeof(a));
+                std::memcpy(&b, &w[18 + line * 32], sizeof(b));
+                std::snprintf(text, sizeof(text), " L%u=%.4g,%.4g", line, a, b);
+                result += text;
+            }
+        }
+        return result;
     }
 
     Diagnostics() {

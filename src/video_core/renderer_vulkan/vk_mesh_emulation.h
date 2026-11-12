@@ -54,7 +54,7 @@ public:
     /// of the first 16 words of the scratch buffer (the draw's header) taken right after the
     /// emulation passes, so a capture can say how many mesh groups each draw produced.
     static constexpr u32 DiagSlots{1024};
-    static constexpr u32 DiagSlotWords{16};
+    static constexpr u32 DiagSlotWords{288}; ///< header, then the start of the first record
     [[nodiscard]] VkBuffer DiagBuffer() const noexcept {
         return *diag_readback;
     }

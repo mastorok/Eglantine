@@ -3196,8 +3196,27 @@ private:
                               layout.pitch * ((height + 1) / 2));
         }
         // The game samples the image on the GPU: drop the texture cache's copy of the old frame.
-        if (const auto device = Nvidia::Devices::Nx2GpuMemoryRegistry::Get().DeviceAddressOf(address)) {
+        auto& registry = Nvidia::Devices::Nx2GpuMemoryRegistry::Get();
+        const auto device = registry.DeviceAddressOf(address);
+        if (device) {
             system.GPU().InvalidateRegion(*device, layout.size);
+        }
+        if (layout.format == Tegra::Host1x::Nx2PictureFormat::Nv12) {
+            // The chroma plane can have a GPU mapping of its own, which the range above misses:
+            // its texture then keeps the first frame's chroma and the movie plays in grey.
+            const auto chroma = registry.DeviceAddressOf(address + layout.chroma_offset);
+            const bool separate = chroma && (!device || *chroma != *device + layout.chroma_offset);
+            if (separate) {
+                system.GPU().InvalidateRegion(*chroma, layout.pitch * ((height + 1) / 2));
+            }
+            if (!m_logged_planes) {
+                m_logged_planes = true;
+                LOG_INFO(Service,
+                         "nx2:vdecsvc NV12 image {}: luma at {:#x} (GPU {:#x}), chroma at +{:#x} "
+                         "(GPU {:#x}{})",
+                         image_id, address, device.value_or(0), layout.chroma_offset,
+                         chroma.value_or(0), separate ? ", mapped apart" : "");
+            }
         }
         return {width, height};
     }
@@ -3240,6 +3259,7 @@ private:
     u32 m_syncpoint{NoSyncpoint}; ///< Counts finished frames (allocated at the first register)
     u32 m_sync_base{};            ///< Its value before the first frame
     std::vector<u8> m_tiled;      ///< Decode thread: block-linear copy of a frame (WriteImage)
+    bool m_logged_planes{};       ///< Decode thread: the NV12 plane mappings were logged once
 
     // Shared with the decode thread.
     std::mutex m_mutex;

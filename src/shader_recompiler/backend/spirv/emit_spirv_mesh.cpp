@@ -124,7 +124,7 @@ void ConvertDepth(EmitContext& ctx, Id vertex) {
 // Finds the task workgroup this mesh workgroup belongs to and copies its payload into workgroup
 // memory. The task workgroups' first mesh group (exclusive sums) are in the scratch buffer; the
 // search is straight-line code because the prologue must not branch. Without a task program
-// (task count 0) the group index is the workgroup index and the payload is left alone.
+// (task count 0) the group index is the workgroup index and the payload is zero.
 void MeshComputePrologue(EmitContext& ctx) {
     const Id group{WorkgroupIndex(ctx)};
     const Id task_count{ScratchParam(ctx, MeshEmulation::ParamTaskCount)};
@@ -160,8 +160,11 @@ void MeshComputePrologue(EmitContext& ctx) {
     for (u32 first = 0; first < words; first += threads) {
         const Id word{ctx.OpUMin(ctx.U32[1], ctx.OpIAdd(ctx.U32[1], invocation, ctx.Const(first)),
                                  ctx.Const(words - 1))};
+        // Without a task program the region at the payload base holds the mesh records: the
+        // payload reads zeros, not what another workgroup is writing there.
+        const Id stored{ctx.OpLoad(ctx.U32[1], ScratchWord(ctx, ctx.OpIAdd(ctx.U32[1], base, word)))};
         ctx.OpStore(PayloadWord(ctx, word),
-                    ctx.OpLoad(ctx.U32[1], ScratchWord(ctx, ctx.OpIAdd(ctx.U32[1], base, word))));
+                    ctx.OpSelect(ctx.U32[1], has_tasks, stored, ctx.u32_zero_value));
     }
 }
 

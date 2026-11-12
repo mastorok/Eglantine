@@ -9,7 +9,9 @@
 #include <cinttypes>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <span>
+#include <string>
 #include <vector>
 
 #include "common/common_funcs.h"
@@ -177,6 +179,29 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
         pi_header = pm->PatchNSO(pi_header, name);
 
         std::copy(pi_header.begin() + sizeof(NSOHeader), pi_header.end(), patchable_section.data());
+    }
+
+    // EDEN_NX2_DUMP_MODULES=<dir>: write each module's image as loaded (text, rodata, data) to
+    // <dir>/<program id>-<name>.bin, to study a game's code offline.
+    if (const char* const dump_dir = std::getenv("EDEN_NX2_DUMP_MODULES");
+        dump_dir != nullptr && dump_dir[0] != 0) {
+        const std::string dump_path{
+            fmt::format("{}/{:016X}-{}.bin", dump_dir, process.GetProgramId(), name)};
+        const size_t dump_size{codeset.memory.size() - module_start};
+        std::ofstream dump_file{dump_path, std::ios::binary};
+        dump_file.write(reinterpret_cast<const char*>(codeset.memory.data() + module_start),
+                        static_cast<std::streamsize>(dump_size));
+        if (dump_file) {
+            LOG_INFO(Loader,
+                     "Module image written to {} ({} bytes; text {:#x}+{:#x}, rodata {:#x}+{:#x}, "
+                     "data {:#x}+{:#x})",
+                     dump_path, dump_size, static_cast<u32>(nso_header.segments[0].location),
+                     codeset.segments[0].size, static_cast<u32>(nso_header.segments[1].location),
+                     codeset.segments[1].size, static_cast<u32>(nso_header.segments[2].location),
+                     codeset.segments[2].size);
+        } else {
+            LOG_WARNING(Loader, "Cannot write the module image to {}", dump_path);
+        }
     }
 
     // Star Fox output pacing for the tested build. The engine's explicit-rate path
