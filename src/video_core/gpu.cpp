@@ -226,16 +226,23 @@ struct GPU::Impl {
         if (seconds > 0.25 || seconds <= 0.0) {
             return;
         }
-        if (frame_time_period <= 0.0 ||
-            std::abs(seconds - frame_time_period) > 0.25 * frame_time_period) {
-            frame_time_period = seconds;
-        } else {
-            frame_time_period += 0.2 * (seconds - frame_time_period);
-        }
+        frame_time_period =
+            frame_time_period <= 0.0 ? seconds : frame_time_period + 0.05 * (seconds - frame_time_period);
         constexpr double Frame = 1.0 / 60.0;
-        // A game at full speed steps by exactly 1/60 s, whatever the jitter of the measure.
-        double step = frame_time_period < Frame * 1.04 ? Frame : frame_time_period;
-        step = (std::min)(step, longest_step);
+        // Hysteresis: 1/60 s exactly until the average is clearly slow, back only when it is clearly fast.
+        if (frame_time_slow_mode) {
+            frame_time_slow_mode = frame_time_period > Frame * 1.05;
+        } else {
+            frame_time_slow_mode = frame_time_period > Frame * 1.12;
+        }
+        const double target =
+            (std::min)(frame_time_slow_mode ? frame_time_period : Frame, longest_step);
+        // The step moves by at most 0.2 ms per frame: a sudden jump makes time-based effects pop.
+        if (frame_time_step <= 0.0) {
+            frame_time_step = Frame;
+        }
+        frame_time_step += std::clamp(target - frame_time_step, -0.0002, 0.0002);
+        double step = frame_time_step;
         if (pinned_scale > 0.0) {
             step = Frame * pinned_scale;
         }
@@ -267,6 +274,8 @@ struct GPU::Impl {
 
     std::chrono::steady_clock::time_point frame_time_last{};
     double frame_time_period{};
+    double frame_time_step{};
+    bool frame_time_slow_mode{};
     double frame_time_sum{};
     double frame_time_longest{};
     u32 frame_time_updates{};
