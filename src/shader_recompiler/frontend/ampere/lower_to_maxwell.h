@@ -1393,15 +1393,19 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 (u64{insn.Bits(73, 1)} << 28) | (u64{offset >> 2} << 30) | (u64{operation} << 52));
             break;
         }
-        case 0x3a8: { // ATOMG.E.ADD.STRONG.GPU U32 at a 64-bit register address plus an offset.
+        case 0x3a8: { // ATOMG.E.<op>.STRONG.GPU U32 at a 64-bit register address plus an offset.
             const u32 address = insn.Bits(24, 8);
             const s32 offset = static_cast<s32>(insn.Bits(40, 24) << 8) >> 8;
-            if (insn.words[2] != 0x001ee100 || (address & 1) || address >= 246 ||
-                offset < -0x80000 || offset > 0x7ffff)
+            // The operation (bits 87-90) is numbered as in Maxwell's ATOM (52-55): ADD, MIN, MAX,
+            // AND, OR, XOR and EXCH. INC and DEC are no-ops there for U32, so they stay refused.
+            const u32 operation = insn.Bits(87, 4);
+            const bool known_operation = operation <= 2 || (operation >= 5 && operation <= 8);
+            if ((insn.words[2] & ~0x07800000U) != 0x001ee100 || !known_operation || (address & 1) ||
+                address >= 246 || offset < -0x80000 || offset > 0x7ffff)
                 return fail(index, "native global atomic register mode");
             emit(0xed00000000000000ULL | predicate | dest | (u64{address} << 8) |
                 (u64{insn.Bits(32, 8)} << 20) | (u64{static_cast<u32>(offset) & 0xfffff} << 28) |
-                (u64{1} << 48));
+                (u64{1} << 48) | (u64{operation} << 52));
             break;
         }
         case 0x9a8: { // ATOMG.E.ADD.STRONG.GPU U32 through a uniform pointer plus an offset.
@@ -1420,7 +1424,9 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             const u32 coordinate = insn.Bits(24, 8);
             const u32 channels = insn.Bits(72, 4);
             const u32 dimension = insn.Bits(61, 3); // Maxwell's codes: 3 = 2D, 4 = 2D_ARRAY, 5 = 3D
-            if ((insn.words[2] & ~0xf00U) != 0x001e0000 || channels == 0 || dimension < 3 || dimension > 5 ||
+            // Dimension 1 is a texel buffer (Maxwell's BUFFER_1D), addressed by one coordinate.
+            if ((insn.words[2] & ~0xf00U) != 0x001e0000 || channels == 0 ||
+                (dimension != 1 && (dimension < 3 || dimension > 5)) ||
                 binding >= 18 || offset > 0x1fff || insn.Bits(59, 2) || dest == 255 ||
                 coordinate > (dimension >= 4 ? 252U : 253U))
                 return fail(index, "native formatted surface load mode");
@@ -1438,7 +1444,8 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             const u32 channels = insn.Bits(72, 4);
             const u32 mode = insn.words[2] & ~0xf00U;
             const bool strong = mode == 0x0010a000; // .STRONG.SM: fenced on both sides
-            if ((mode != 0x00100000 && !strong) || channels == 0 || dimension < 3 || dimension > 5 ||
+            if ((mode != 0x00100000 && !strong) || channels == 0 ||
+                (dimension != 1 && (dimension < 3 || dimension > 5)) ||
                 binding >= 18 || offset > 0x1fff || insn.Bits(59, 2) || data > 252 || coordinate > (dimension >= 4 ? 252U : 253U))
                 return fail(index, "native formatted surface store mode");
             // A second descriptor buffer: SUST.B with the handle, loaded from that buffer, in R250.
@@ -1461,8 +1468,9 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             const bool returns_value = opcode == 0x593;
             const u32 operation = insn.Bits(87, 3); // 2D SURED: ADD..XOR; 3D SURED and SUATOM: ADD and OR.
             const u32 mode = returns_value ? 0x001ee000U : 0x0010e000U;
+            // Dimension 1 is a texel buffer: ADD and OR only, like the 3D forms.
             if ((insn.words[2] & ~0x03800000U) != mode || ((returns_value || dimension != 3) && operation != 0 && operation != 6) ||
-                (dimension != 3 && dimension != 5) || binding >= 18 ||
+                (dimension != 1 && dimension != 3 && dimension != 5) || binding >= 18 ||
                 offset > 0x1fff || insn.Bits(59, 2) || coordinate > (dimension == 5 ? 252U : 253U))
                 return fail(index, "native surface reduction mode");
             if (result.required_texture_buffer != ~0U && result.required_texture_buffer != binding)

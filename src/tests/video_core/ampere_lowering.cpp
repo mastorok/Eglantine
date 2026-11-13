@@ -440,4 +440,50 @@ TEST_CASE("Ampere Ocarina byte constant loads, ULEA carries to UP3 and two-sourc
     REQUIRE(static_cast<bool>(convert));
     CHECK(field(FindMaxwell(convert, 0x5cb, 52), 41, 2) == 3);
 }
+
+TEST_CASE("Ampere Yoshi texel buffer surface forms and ATOMG exchange", "[video_core][ampere]") {
+    const auto lower = [](const Instruction& instruction) {
+        const std::array<Instruction, 2> code{{instruction, EXIT}};
+        return LowerToMaxwell(code);
+    };
+    const auto field = [](u64 word, u32 offset, u32 count) {
+        return (word >> offset) & ((u64{1} << count) - 1);
+    };
+    // SUST.P.BUFFER (dimension 1) with all four channels: Maxwell SUST type BUFFER_1D (1).
+    const auto store = lower({{0x00007b9b, 0x20c00004, 0x00100f00, 0x000fe200}});
+    INFO(store.error);
+    REQUIRE(static_cast<bool>(store));
+    const u64 sust = FindMaxwell(store, 0xeb2, 52);
+    REQUIRE(sust != 0);
+    CHECK(field(sust, 33, 3) == 1);
+    CHECK(field(sust, 20, 4) == 0xf);
+
+    // SULD.P.BUFFER of the red channel.
+    const auto load = lower({{0x0f007b97, 0x20c00000, 0x001e0100, 0x000f6200}});
+    INFO(load.error);
+    REQUIRE(static_cast<bool>(load));
+    const u64 suld = FindMaxwell(load, 0xeb0, 52);
+    REQUIRE(suld != 0);
+    CHECK(field(suld, 33, 3) == 1);
+    CHECK(field(suld, 20, 4) == 1);
+
+    // SUATOM.D.ADD on a texel buffer returning the old value.
+    const auto atom = lower({{0x0e050593, 0x20c00205, 0x001ee000, 0x002ea200}});
+    INFO(atom.error);
+    REQUIRE(static_cast<bool>(atom));
+    const u64 suatom = FindMaxwell(atom, 0xea0, 52);
+    REQUIRE(suatom != 0);
+    CHECK(field(suatom, 33, 3) == 1);
+
+    // ATOMG.E.EXCH.STRONG.GPU: Maxwell ATOM with operation 8 (bits 52-55).
+    const auto exchange = lower({{0x040473a8, 0x00000007, 0x041ee100, 0x00016800}});
+    INFO(exchange.error);
+    REQUIRE(static_cast<bool>(exchange));
+    const u64 atomg = FindMaxwell(exchange, 0xed, 56);
+    REQUIRE(atomg != 0);
+    CHECK(field(atomg, 52, 4) == 8);
+
+    // INC and DEC do nothing for U32 in the Maxwell translator, so they stay refused.
+    CHECK_FALSE(static_cast<bool>(lower({{0x040473a8, 0x00000007, 0x019ee100, 0x00016800}})));
+}
 } // namespace

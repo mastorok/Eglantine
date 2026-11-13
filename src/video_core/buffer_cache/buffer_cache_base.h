@@ -786,6 +786,9 @@ private:
         /// once: the front can't tell from what it sent whether such a write is still queued, so
         /// the page's lists always drain the split instead of reading a copy.
         bool draw_written{};
+        /// EDEN_NX2_LIST_DRAW_WORDS=1: the 4-byte words (1024 per 4 KiB page) draws wrote. Draw
+        /// writes don't count in `writes` then, and only lists that overlap these words drain.
+        std::array<u64, 16> draw_words{};
         std::optional<Nx2Staging> copy;
     };
     std::mutex nx2_list_mutex; ///< nx2_list_pages: the split's front reads the copies

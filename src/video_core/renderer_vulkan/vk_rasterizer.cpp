@@ -395,22 +395,131 @@ thread_local int g_diag_query{-1};
 // EDEN_NX2_DIAG_SAMPLES: why draws of a capture got no probe (logged when the capture ends).
 std::atomic<u32> g_diag_probe_draws{}, g_diag_probe_no_pool{}, g_diag_probe_game_query{};
 
-// EDEN_NX2_MESH_TEST_DIR=<folder>: live experiments on the emulated task/mesh draws. A file in that
-// folder switches one change on while it exists (checked every 200 ms):
-//   mesh_zlequal.flag  draws that test depth with EQUAL test LESS_EQUAL instead
-//   mesh_zalways.flag  draws that test depth with EQUAL always pass the depth test
-//   mesh_nocull.flag   no face culling
-// Used to tell a depth-equality mismatch between the depth pass and the colour pass, or a wrong
-// winding, from the other reasons a mesh draw can be invisible.
+// Depth test of the emulated task/mesh draws that the game draws with depth func EQUAL (the colour
+// pass after a depth pre-pass). The two passes run different mesh programs; when their positions
+// differ by a rounding error an EQUAL test keeps only the few pixels that match exactly, which shows
+// as faint dots where foliage and doors should be. LESS_EQUAL (the default) keeps the nearest
+// surface, which is what the game meant.
+//   EDEN_NX2_MESH_Z=exact|lequal|always   exact: the game's EQUAL test (the behaviour before build 32)
+enum class MeshDepthMode : u8 { Exact, LessEqual, Always };
+
 struct MeshTestFlags {
-    bool z_less_equal{};
-    bool z_always{};
+    MeshDepthMode depth{MeshDepthMode::LessEqual};
     bool no_cull{};
 };
 
+MeshDepthMode DefaultMeshDepthMode() {
+    static const MeshDepthMode mode = [] {
+        const char* value{std::getenv("EDEN_NX2_MESH_Z")};
+        if (value == nullptr) {
+            return MeshDepthMode::LessEqual;
+        }
+        const std::string_view text{value};
+        if (text == "exact") {
+            return MeshDepthMode::Exact;
+        }
+        if (text == "always") {
+            return MeshDepthMode::Always;
+        }
+        return MeshDepthMode::LessEqual;
+    }();
+    return mode;
+}
+
+const char* MeshDepthName(MeshDepthMode mode) {
+    switch (mode) {
+    case MeshDepthMode::Exact:
+        return "EQUAL (as the game sets it)";
+    case MeshDepthMode::Always:
+        return "ALWAYS";
+    default:
+        return "LESS_EQUAL";
+    }
+}
+
+// EDEN_NX2_MESH_TEST_AUTO=<seconds>: walks the emulated mesh draws through four settings, <seconds>
+// each, twice, and asks the diagnostics (EDEN_NX2_DIAG_DIR) for a draw list and a screenshot in the
+// middle of each one, so the settings can be compared on the same view without touching anything.
+// It starts EDEN_NX2_MESH_TEST_AUTO_DELAY seconds (30) after the first emulated mesh draw. Each
+// change is logged as "mesh test auto: phase N ...".
+struct MeshAutoPhase {
+    const char* name;
+    MeshDepthMode depth;
+    bool no_cull;
+};
+
+constexpr std::array<MeshAutoPhase, 4> MeshAutoPhases{{
+    {"depth LESS_EQUAL", MeshDepthMode::LessEqual, false},
+    {"depth EQUAL as the game sets it", MeshDepthMode::Exact, false},
+    {"depth ALWAYS", MeshDepthMode::Always, false},
+    {"depth LESS_EQUAL, no face culling", MeshDepthMode::LessEqual, true},
+}};
+
+std::optional<MeshTestFlags> PollMeshAutoTest() {
+    static const u32 seconds = [] {
+        const char* value{std::getenv("EDEN_NX2_MESH_TEST_AUTO")};
+        const long n{value != nullptr ? std::atol(value) : 0};
+        return n > 0 ? static_cast<u32>(std::clamp<long>(n, 4, 120)) : 0U;
+    }();
+    if (seconds == 0) {
+        return std::nullopt;
+    }
+    static const double delay = [] {
+        const char* value{std::getenv("EDEN_NX2_MESH_TEST_AUTO_DELAY")};
+        const long n{value != nullptr ? std::atol(value) : 30};
+        return static_cast<double>(std::clamp<long>(n, 0, 600));
+    }();
+    constexpr u32 rounds{2};
+    constexpr u32 total_phases{static_cast<u32>(MeshAutoPhases.size()) * rounds};
+    static const auto start{std::chrono::steady_clock::now()};
+    static u32 current_phase{~0U};
+    static bool captured{};
+    const double elapsed{
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() - delay};
+    if (elapsed < 0.0) {
+        return std::nullopt;
+    }
+    const u32 phase{static_cast<u32>(elapsed / seconds)};
+    if (phase >= total_phases) {
+        if (current_phase != total_phases) {
+            current_phase = total_phases;
+            LOG_INFO(Render_Vulkan, "mesh test auto: finished after {} phases", total_phases);
+        }
+        return std::nullopt;
+    }
+    const MeshAutoPhase& entry{MeshAutoPhases[phase % MeshAutoPhases.size()]};
+    if (phase != current_phase) {
+        current_phase = phase;
+        captured = false;
+        LOG_INFO(Render_Vulkan, "mesh test auto: phase {} of {}: {}", phase, total_phases,
+                 entry.name);
+    }
+    if (!captured && elapsed - static_cast<double>(phase) * seconds >= seconds / 2.0) {
+        captured = true;
+        const auto& dir{VideoCommon::Nx2Diag::DrawListDir()};
+        if (!dir.empty()) {
+            std::error_code ec;
+            std::filesystem::create_directories(dir, ec);
+            std::ofstream trigger{dir / "draw-list"};
+            LOG_INFO(Render_Vulkan, "mesh test auto: capture requested in phase {} ({})", phase,
+                     entry.name);
+        }
+    }
+    return MeshTestFlags{.depth = entry.depth, .no_cull = entry.no_cull};
+}
+
+// EDEN_NX2_MESH_TEST_DIR=<folder>: live experiments on the emulated task/mesh draws. A file in that
+// folder switches one change on while it exists (checked every 200 ms):
+//   mesh_zexact.flag   the game's EQUAL depth test
+//   mesh_zlequal.flag  draws that test depth with EQUAL test LESS_EQUAL instead (the default)
+//   mesh_zalways.flag  draws that test depth with EQUAL always pass the depth test
+//   mesh_nocull.flag   no face culling
 MeshTestFlags PollMeshTestFlags() {
+    if (const auto automatic{PollMeshAutoTest()}; automatic.has_value()) {
+        return *automatic;
+    }
     static const char* const dir{std::getenv("EDEN_NX2_MESH_TEST_DIR")};
-    static MeshTestFlags flags;
+    static MeshTestFlags flags{.depth = DefaultMeshDepthMode()};
     static auto next_check{std::chrono::steady_clock::time_point{}};
     if (dir == nullptr || *dir == '\0') {
         return flags;
@@ -419,16 +528,18 @@ MeshTestFlags PollMeshTestFlags() {
         next_check = now + std::chrono::milliseconds(200);
         std::error_code ec;
         const std::filesystem::path base{dir};
-        const MeshTestFlags wanted{
-            .z_less_equal = std::filesystem::exists(base / "mesh_zlequal.flag", ec),
-            .z_always = std::filesystem::exists(base / "mesh_zalways.flag", ec),
-            .no_cull = std::filesystem::exists(base / "mesh_nocull.flag", ec),
-        };
-        if (wanted.z_less_equal != flags.z_less_equal || wanted.z_always != flags.z_always ||
-            wanted.no_cull != flags.no_cull) {
-            LOG_INFO(Render_Vulkan,
-                     "mesh test flags: depth EQUAL->LESS_EQUAL {}, depth EQUAL->ALWAYS {}, no cull {}",
-                     wanted.z_less_equal, wanted.z_always, wanted.no_cull);
+        MeshTestFlags wanted{.depth = DefaultMeshDepthMode()};
+        if (std::filesystem::exists(base / "mesh_zexact.flag", ec)) {
+            wanted.depth = MeshDepthMode::Exact;
+        } else if (std::filesystem::exists(base / "mesh_zalways.flag", ec)) {
+            wanted.depth = MeshDepthMode::Always;
+        } else if (std::filesystem::exists(base / "mesh_zlequal.flag", ec)) {
+            wanted.depth = MeshDepthMode::LessEqual;
+        }
+        wanted.no_cull = std::filesystem::exists(base / "mesh_nocull.flag", ec);
+        if (wanted.depth != flags.depth || wanted.no_cull != flags.no_cull) {
+            LOG_INFO(Render_Vulkan, "mesh test flags: depth {}, no cull {}",
+                     MeshDepthName(wanted.depth), wanted.no_cull);
         }
         flags = wanted;
     }
@@ -649,14 +760,20 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
             scheduler.Record([](vk::CommandBuffer cmdbuf) { cmdbuf.SetCullModeEXT(VK_CULL_MODE_NONE); });
             mesh_test_applied = true;
         }
-        if ((test.z_less_equal || test.z_always) &&
+        if (test.depth != MeshDepthMode::Exact &&
             MaxwellToVK::ComparisonOp(maxwell3d->regs.depth_test_func) == VK_COMPARE_OP_EQUAL) {
-            const VkCompareOp replacement =
-                test.z_always ? VK_COMPARE_OP_ALWAYS : VK_COMPARE_OP_LESS_OR_EQUAL;
+            const VkCompareOp replacement = test.depth == MeshDepthMode::Always
+                                                ? VK_COMPARE_OP_ALWAYS
+                                                : VK_COMPARE_OP_LESS_OR_EQUAL;
             scheduler.Record([replacement](vk::CommandBuffer cmdbuf) {
                 cmdbuf.SetDepthCompareOpEXT(replacement);
             });
             mesh_test_applied = true;
+            static u64 changed_draws{};
+            if (++changed_draws == 1 || changed_draws % 50000 == 0) {
+                LOG_INFO(Render_Vulkan, "mesh depth test: {} emulated mesh draws changed from EQUAL to {}",
+                         changed_draws, MeshDepthName(test.depth));
+            }
         }
     }
 

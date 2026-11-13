@@ -1895,6 +1895,40 @@ void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u3
     }
 }
 
+namespace Nx2ListWords {
+// Bits [first, last) of a page's word bitmap (one bit per 4-byte word, 1024 per 4 KiB page).
+inline void Set(std::array<u64, 16>& bits, u32 first, u32 last) {
+    while (first < last) {
+        const u32 count = (std::min)(64U - first % 64, last - first);
+        const u64 mask = (count == 64 ? ~u64{0} : (u64{1} << count) - 1) << (first % 64);
+        bits[first / 64] |= mask;
+        first += count;
+    }
+}
+
+inline bool Any(const std::array<u64, 16>& bits, u32 first, u32 last) {
+    while (first < last) {
+        const u32 count = (std::min)(64U - first % 64, last - first);
+        const u64 mask = (count == 64 ? ~u64{0} : (u64{1} << count) - 1) << (first % 64);
+        if ((bits[first / 64] & mask) != 0) {
+            return true;
+        }
+        first += count;
+    }
+    return false;
+}
+
+// EDEN_NX2_LIST_DRAW_WORDS=1: a draw's writes to a command list page are remembered per word instead
+// of sending every list on the page through a drain of the split.
+inline bool DrawWordsEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_LIST_DRAW_WORDS");
+        return value != nullptr && *value != '\0' && *value != '0';
+    }();
+    return enabled;
+}
+} // namespace Nx2ListWords
+
 template <class P>
 void BufferCache<P>::Nx2NoteListWrite(BufferId buffer_id, DAddr device_addr, u64 size) {
     if constexpr (!IS_OPENGL) {
@@ -1918,12 +1952,29 @@ void BufferCache<P>::Nx2NoteListWrite(BufferId buffer_id, DAddr device_addr, u64
                 {
                     std::scoped_lock lock{nx2_list_mutex};
                     Nx2ListPage& entry = nx2_list_pages[page_addr];
-                    ++entry.writes;
-                    if (!nx2_collect_list_copies && !entry.draw_written) {
-                        entry.draw_written = true;
-                        LOG_INFO(HW_GPU, "Command list page {:#x} is written by draws too: its "
-                                         "lists drain the split",
-                                 page_addr);
+                    if (!nx2_collect_list_copies && Nx2ListWords::DrawWordsEnabled()) {
+                        // The words a draw wrote; the page's copy and sync state stay as they are
+                        // for the lists that don't read them.
+                        constexpr u64 page_size = u64{1} << page_bits;
+                        const u64 begin = (std::max<u64>)(device_addr, page_addr) - page_addr;
+                        const u64 end = (std::min<u64>)(device_addr + size, page_addr + page_size) -
+                                        page_addr;
+                        Nx2ListWords::Set(entry.draw_words, static_cast<u32>(begin / 4),
+                                          static_cast<u32>((end + 3) / 4));
+                        if (!entry.draw_written) {
+                            entry.draw_written = true;
+                            LOG_INFO(HW_GPU, "Command list page {:#x} gets draw writes: lists on "
+                                             "other words skip the drain",
+                                     page_addr);
+                        }
+                    } else {
+                        ++entry.writes;
+                        if (!nx2_collect_list_copies && !entry.draw_written) {
+                            entry.draw_written = true;
+                            LOG_INFO(HW_GPU, "Command list page {:#x} is written by draws too: its "
+                                             "lists drain the split",
+                                     page_addr);
+                        }
                     }
                 }
                 if (nx2_collect_list_copies) {
@@ -2002,8 +2053,34 @@ auto BufferCache<P>::Nx2ReadListCopy(DAddr device_addr, std::span<u8> out) -> Nx
         if (offset + out.size() > page_size) {
             return Nx2ListRead::Unknown;
         }
+        // A draw-written page sends every list through a drain, unless the words draws wrote are
+        // known (EDEN_NX2_LIST_DRAW_WORDS) and this list reads none of them.
+        const auto draw_written = [&](const Nx2ListPage& entry) {
+            if (!entry.draw_written) {
+                return false;
+            }
+            if (!Nx2ListWords::DrawWordsEnabled()) {
+                return true;
+            }
+            static std::atomic<u64> clear_lists{};
+            static std::atomic<u64> overlapping_lists{};
+            const bool overlap = Nx2ListWords::Any(entry.draw_words, static_cast<u32>(offset / 4),
+                                                   static_cast<u32>((offset + out.size() + 3) / 4));
+            const u64 clear = overlap ? clear_lists.load(std::memory_order_relaxed)
+                                      : clear_lists.fetch_add(1, std::memory_order_relaxed) + 1;
+            const u64 overlapping =
+                overlap ? overlapping_lists.fetch_add(1, std::memory_order_relaxed) + 1
+                        : overlapping_lists.load(std::memory_order_relaxed);
+            if ((clear + overlapping) % 4096 == 1) {
+                LOG_INFO(HW_GPU,
+                         "List draw words: {} lists on draw-written pages read no draw word, "
+                         "{} overlapped one",
+                         clear, overlapping);
+            }
+            return overlap;
+        };
         const auto current = [&](const Nx2ListPage& entry) {
-            return entry.copy && !entry.draw_written && entry.copy_writes == entry.writes &&
+            return entry.copy && !draw_written(entry) && entry.copy_writes == entry.writes &&
                    offset >= entry.copy_begin && offset + out.size() <= entry.copy_end;
         };
         u64 tick{};
@@ -2016,7 +2093,7 @@ auto BufferCache<P>::Nx2ReadListCopy(DAddr device_addr, std::span<u8> out) -> Nx
             }
             const Nx2ListPage& entry = it->second;
             // Pages the CPU writes the lists of (GPU-written once, long before) stay synced.
-            if (!entry.draw_written && entry.synced_writes == entry.writes) {
+            if (entry.synced_writes == entry.writes && !draw_written(entry)) {
                 return Nx2ListRead::Synced;
             }
             if (!current(entry)) {

@@ -5,6 +5,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <array>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "audio_core/renderer/command/data_source/decode.h"
@@ -19,6 +24,44 @@
 namespace AudioCore::Renderer {
 
 constexpr u32 TempBufferSize = 0x3F00;
+
+namespace {
+
+// EDEN_NX2_AUDIO_DUMP=<folder> also writes voices.csv: a line each time a voice starts a render tick at
+// the same wave buffer position it started the tick before last, but not the tick right before
+// (the X Y X Y replay heard as a 100 Hz buzz). It names the voice, its wave buffer and loop settings,
+// so a replayed guest ring and a DSP state fault can be told apart.
+struct VoiceReplayTrace {
+    struct Entry {
+        VAddr buffer{};
+        u32 position{};
+        bool valid{};
+    };
+    std::array<Entry, 3> history{};
+    u32 ticks{};
+    u32 events{};
+};
+
+std::FILE* OpenVoiceTrace() {
+    static std::FILE* file = [] () -> std::FILE* {
+        const char* folder = std::getenv("EDEN_NX2_AUDIO_DUMP");
+        if (folder == nullptr || *folder == '\0') {
+            return nullptr;
+        }
+        const std::string path = std::string(folder) + "/voices.csv";
+        std::FILE* f = std::fopen(path.c_str(), "w");
+        if (f != nullptr) {
+            std::fputs("wall_ms,voice,channel,buffer,position,previous_position,loop,loop_count,"
+                       "voice_loop_count,loop_start,loop_end,start,end,index,consumed,played,"
+                       "format,ticks,event\n",
+                       f);
+        }
+        return f;
+    }();
+    return file;
+}
+
+} // namespace
 
 /// @brief Decode PCM data. Only s16 or f32 is supported.
 /// @tparam T         - Type to decode. Only s16 and f32 are supported.
@@ -146,10 +189,11 @@ static u32 DecodeAdpcm(Core::Memory::Memory& memory, std::span<s16> out_buffer, 
     auto const get_step = [](u32 index) {
         // Emulates the following table
         // 0, 1, 2, 3, 4, 5, 6, 7, -8, -7, -6, -5, -4, -3, -2, -1,
+        // (a set bit in steps_sign marks the negative half, nibbles 8..15)
         constexpr u64 steps_table = 0x1234567876543210ull;
         constexpr u64 steps_sign = 0b1111111100000000ull;
         auto const r = s32((steps_table >> (index * 4)) & 0xf);
-        return ((steps_sign >> index) & 1) == 0 ? -r : r;
+        return ((steps_sign >> index) & 1) == 0 ? r : -r;
     };
     auto const decode_sample = [&](const s32 code) -> s16 {
         const auto xn = code * (1 << scale);
@@ -225,6 +269,16 @@ void DecodeFromWaveBuffers(Core::Memory::Memory& memory, const DecodeFromWaveBuf
     auto& voice_state{*args.voice_state};
     auto remaining_sample_count{args.sample_count};
     auto fraction{voice_state.fraction};
+
+    std::FILE* const trace_file = OpenVoiceTrace();
+    VoiceReplayTrace::Entry trace_start{};
+    if (trace_file != nullptr) {
+        const auto first{voice_state.wave_buffer_index % MaxWaveBuffers};
+        const auto& first_buffer{args.wave_buffers[first]};
+        trace_start.valid = voice_state.wave_buffer_valid[first];
+        trace_start.buffer = first_buffer.buffer;
+        trace_start.position = first_buffer.start_offset + voice_state.offset;
+    }
 
     const auto sample_rate_ratio{Common::FixedPoint<49, 15>(
         (f32)args.source_sample_rate / (f32)args.target_sample_rate * (f32)args.pitch)};
@@ -395,6 +449,46 @@ void DecodeFromWaveBuffers(Core::Memory::Memory& memory, const DecodeFromWaveBuf
         }
 
         output_buffer = output_buffer.subspan(samples_to_write);
+    }
+
+    if (trace_file != nullptr) {
+        static std::unordered_map<const void*, VoiceReplayTrace> traces;
+        static const auto trace_origin = std::chrono::steady_clock::now();
+        auto& trace = traces[&voice_state];
+        trace.history[0] = trace.history[1];
+        trace.history[1] = trace.history[2];
+        trace.history[2] = trace_start;
+        trace.ticks++;
+        const auto& now = trace.history[2];
+        const auto& last = trace.history[1];
+        const auto& before = trace.history[0];
+        if (trace.ticks >= 3 && now.valid && before.valid && trace.events < 400 &&
+            now.buffer == before.buffer && now.position == before.position &&
+            (now.buffer != last.buffer || now.position != last.position)) {
+            trace.events++;
+            const auto first{voice_state.wave_buffer_index % MaxWaveBuffers};
+            const auto& wb{args.wave_buffers[first]};
+            const double wall_ms = std::chrono::duration<double, std::milli>(
+                                       std::chrono::steady_clock::now() - trace_origin)
+                                       .count();
+            std::fprintf(trace_file,
+                         "%.1f,%p,%d,%llx,%u,%u,%d,%d,%d,%u,%u,%u,%u,%u,%u,%llu,%u,%u,replay\n",
+                         wall_ms, static_cast<const void*>(&voice_state),
+                         static_cast<int>(args.channel),
+                         static_cast<unsigned long long>(now.buffer),
+                         static_cast<unsigned>(now.position),
+                         static_cast<unsigned>(last.position), wb.loop ? 1 : 0,
+                         static_cast<int>(wb.loop_count), static_cast<int>(voice_state.loop_count),
+                         static_cast<unsigned>(wb.loop_start_offset),
+                         static_cast<unsigned>(wb.loop_end_offset),
+                         static_cast<unsigned>(wb.start_offset),
+                         static_cast<unsigned>(wb.end_offset), static_cast<unsigned>(first),
+                         static_cast<unsigned>(voice_state.wave_buffers_consumed),
+                         static_cast<unsigned long long>(voice_state.played_sample_count),
+                         static_cast<unsigned>(args.sample_format),
+                         static_cast<unsigned>(trace.ticks));
+            std::fflush(trace_file);
+        }
     }
 
     voice_state.wave_buffers_consumed = wavebuffers_consumed;
