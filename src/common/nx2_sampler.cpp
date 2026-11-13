@@ -696,6 +696,7 @@ std::string Report(const std::vector<Target>& targets, const std::vector<Sample>
 
 const auto g_process_start = std::chrono::steady_clock::now();
 std::atomic<long long> g_last_present_ns{0};
+std::atomic<std::uint64_t> g_present_count{0};
 
 constexpr std::array<const char*, 8> StallGroups{"GPU",     "GPUBack", "VulkanWorker", "CPUCores",
                                                  "Workers", "Service", "Audio",        "Others"};
@@ -1590,11 +1591,33 @@ void StartFromEnvironment() {
     // deleted at once), instead of EDEN_NX2_SAMPLE_START seconds after the launch, so a player
     // can ask for it when the game is where it must be measured.
     const char* trigger = std::getenv("EDEN_NX2_SAMPLE_TRIGGER");
+    // EDEN_NX2_SAMPLE_AUTO_MS=<ms>: the measurement starts by itself once the game has been
+    // presenting slower than that for 6 seconds in a row (and EDEN_NX2_SAMPLE_START seconds have
+    // passed since the launch), e.g. 26 to catch a game that drops below 40 fps in combat.
+    const double auto_ms = EnvSeconds("EDEN_NX2_SAMPLE_AUTO_MS", 0.0);
     std::thread{[patterns = SplitNames(names), start = EnvSeconds("EDEN_NX2_SAMPLE_START", 60.0),
                  seconds = EnvSeconds("EDEN_NX2_SAMPLE_SECONDS", 30.0),
                  out = std::string{out != nullptr ? out : "nx2_samples.txt"},
-                 trigger = std::string{trigger != nullptr ? trigger : ""}] {
-        if (trigger.empty()) {
+                 trigger = std::string{trigger != nullptr ? trigger : ""}, auto_ms] {
+        if (auto_ms > 0.0) {
+            std::this_thread::sleep_for(std::chrono::duration<double>(start));
+            std::uint64_t last_count = g_present_count.load(std::memory_order_relaxed);
+            auto last_time = std::chrono::steady_clock::now();
+            int slow_rounds = 0;
+            while (slow_rounds < 3) {
+                std::this_thread::sleep_for(std::chrono::seconds{2});
+                const std::uint64_t count = g_present_count.load(std::memory_order_relaxed);
+                const auto now = std::chrono::steady_clock::now();
+                const double ms = std::chrono::duration<double, std::milli>(now - last_time).count();
+                const std::uint64_t presents = count - last_count;
+                last_count = count;
+                last_time = now;
+                // Fewer than 5 presents in 2 s is a loading screen or a pause, not a slow scene.
+                slow_rounds = presents >= 5 && ms / static_cast<double>(presents) > auto_ms
+                                  ? slow_rounds + 1
+                                  : 0;
+            }
+        } else if (trigger.empty()) {
             std::this_thread::sleep_for(std::chrono::duration<double>(start));
         } else {
             std::error_code error;
@@ -1611,6 +1634,7 @@ void NotePresent(long long frame_us, long long fence_us, long long composite_us,
     const auto now = std::chrono::steady_clock::now();
     g_last_present_ns.store(std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count(),
                             std::memory_order_relaxed);
+    g_present_count.fetch_add(1, std::memory_order_relaxed);
     static const bool log_frames = std::getenv("EDEN_NX2_FRAME_LOG") != nullptr;
     if (!log_frames) {
         return;

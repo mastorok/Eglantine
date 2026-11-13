@@ -7,7 +7,11 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
+#include <mutex>
+#include <string>
 #include <memory>
 #include <span>
 #include <vector>
@@ -25,9 +29,97 @@
 
 namespace AudioCore::Sink {
 
+namespace {
+
+// EDEN_NX2_AUDIO_DUMP=<folder>: write what the audio renderer hands to the sink ("dsp_out") and what
+// the host callback receives ("host_out") as raw s16 interleaved PCM, with one CSV line per block
+// (wall time, first frame, frame count, buffers queued). Lets a clicking sound be traced to the
+// renderer or to the host side offline. Capped at 240 MB per file.
+class AudioDump {
+public:
+    static AudioDump& Get() {
+        static AudioDump instance;
+        return instance;
+    }
+
+    bool Enabled() const {
+        return enabled;
+    }
+
+    void Write(bool host_side, const s16* data, std::size_t sample_count, u32 channels,
+               u32 queued) {
+        if (!enabled) {
+            return;
+        }
+        std::scoped_lock lk{mutex};
+        Side& side = host_side ? host : dsp;
+        if (side.raw == nullptr || side.bytes > MaxBytes) {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        const double wall_ms = std::chrono::duration<double, std::milli>(now - start).count();
+        const std::size_t frames = channels > 0 ? sample_count / channels : 0;
+        std::fwrite(data, sizeof(s16), sample_count, side.raw);
+        std::fprintf(side.csv, "%.3f,%llu,%zu,%u,%u\n", wall_ms,
+                     static_cast<unsigned long long>(side.frames), frames, queued, channels);
+        side.frames += frames;
+        side.bytes += sample_count * sizeof(s16);
+        if ((++side.blocks & 0x3F) == 0) {
+            std::fflush(side.raw);
+            std::fflush(side.csv);
+        }
+    }
+
+private:
+    struct Side {
+        std::FILE* raw{};
+        std::FILE* csv{};
+        u64 frames{};
+        u64 bytes{};
+        u64 blocks{};
+    };
+
+    AudioDump() {
+        const char* folder = std::getenv("EDEN_NX2_AUDIO_DUMP");
+        if (folder == nullptr || *folder == '\0') {
+            return;
+        }
+        const std::string base{folder};
+        const auto open = [&](Side& side, const char* name) {
+            side.raw = std::fopen((base + "/" + name + ".raw").c_str(), "wb");
+            side.csv = std::fopen((base + "/" + name + ".csv").c_str(), "wb");
+            if (side.csv != nullptr) {
+                std::fprintf(side.csv, "wall_ms,first_frame,frames,queued,channels\n");
+            }
+        };
+        open(dsp, "dsp_out");
+        open(host, "host_out");
+        start = std::chrono::steady_clock::now();
+        enabled = dsp.raw != nullptr && host.raw != nullptr && dsp.csv != nullptr &&
+                  host.csv != nullptr;
+        if (enabled) {
+            LOG_INFO(Audio, "nx2 audio dump: writing dsp_out and host_out to {}", base);
+        }
+    }
+
+    static constexpr u64 MaxBytes = 240ULL * 1024 * 1024;
+    bool enabled{};
+    std::mutex mutex;
+    Side dsp{};
+    Side host{};
+    std::chrono::steady_clock::time_point start{};
+};
+
+} // Anonymous namespace
+
 void SinkStream::AppendBuffer(SinkBuffer& buffer, std::span<s16> samples) {
     if (type == StreamType::In)
         return;
+
+    if (type == StreamType::Render && !name.empty() && name.back() == '0') {
+        AudioDump::Get().Write(false, samples.data(), samples.size(), system_channels,
+                               queued_buffers.load());
+    }
 
     constexpr s32 min = (std::numeric_limits<s16>::min)();
     constexpr s32 max = (std::numeric_limits<s16>::max)();
@@ -269,6 +361,11 @@ void SinkStream::ProcessAudioOutAndRender(std::span<s16> output_buffer, std::siz
     }
 
     std::memcpy(last_frame.data(), &output_buffer[(frames_written - 1) * frame_size], frame_size_bytes);
+
+    if (type == StreamType::Render && !name.empty() && name.back() == '0') {
+        AudioDump::Get().Write(true, output_buffer.data(), num_frames * frame_size,
+                               static_cast<u32>(frame_size), queued_buffers.load());
+    }
 
     // EDEN_NX2_AUDIO_LEVEL: log the output peak about every two seconds (is a game audible?).
     if (static const bool meter = std::getenv("EDEN_NX2_AUDIO_LEVEL") != nullptr; meter) {

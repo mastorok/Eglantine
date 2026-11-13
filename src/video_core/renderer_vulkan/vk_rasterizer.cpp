@@ -395,6 +395,46 @@ thread_local int g_diag_query{-1};
 // EDEN_NX2_DIAG_SAMPLES: why draws of a capture got no probe (logged when the capture ends).
 std::atomic<u32> g_diag_probe_draws{}, g_diag_probe_no_pool{}, g_diag_probe_game_query{};
 
+// EDEN_NX2_MESH_TEST_DIR=<folder>: live experiments on the emulated task/mesh draws. A file in that
+// folder switches one change on while it exists (checked every 200 ms):
+//   mesh_zlequal.flag  draws that test depth with EQUAL test LESS_EQUAL instead
+//   mesh_zalways.flag  draws that test depth with EQUAL always pass the depth test
+//   mesh_nocull.flag   no face culling
+// Used to tell a depth-equality mismatch between the depth pass and the colour pass, or a wrong
+// winding, from the other reasons a mesh draw can be invisible.
+struct MeshTestFlags {
+    bool z_less_equal{};
+    bool z_always{};
+    bool no_cull{};
+};
+
+MeshTestFlags PollMeshTestFlags() {
+    static const char* const dir{std::getenv("EDEN_NX2_MESH_TEST_DIR")};
+    static MeshTestFlags flags;
+    static auto next_check{std::chrono::steady_clock::time_point{}};
+    if (dir == nullptr || *dir == '\0') {
+        return flags;
+    }
+    if (const auto now{std::chrono::steady_clock::now()}; now >= next_check) {
+        next_check = now + std::chrono::milliseconds(200);
+        std::error_code ec;
+        const std::filesystem::path base{dir};
+        const MeshTestFlags wanted{
+            .z_less_equal = std::filesystem::exists(base / "mesh_zlequal.flag", ec),
+            .z_always = std::filesystem::exists(base / "mesh_zalways.flag", ec),
+            .no_cull = std::filesystem::exists(base / "mesh_nocull.flag", ec),
+        };
+        if (wanted.z_less_equal != flags.z_less_equal || wanted.z_always != flags.z_always ||
+            wanted.no_cull != flags.no_cull) {
+            LOG_INFO(Render_Vulkan,
+                     "mesh test flags: depth EQUAL->LESS_EQUAL {}, depth EQUAL->ALWAYS {}, no cull {}",
+                     wanted.z_less_equal, wanted.z_always, wanted.no_cull);
+        }
+        flags = wanted;
+    }
+    return flags;
+}
+
 u64 DiagShader(const Tegra::Engines::Maxwell3D& maxwell3d, size_t stage) {
     const auto& regs = maxwell3d.regs;
     return (u64{regs.pipelines[stage].reserved[0] & 0xff} << 32) | regs.pipelines[stage].reserved[1];
@@ -602,6 +642,23 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
         Profile::Scope scope{Profile::Zone::DynamicState};
         UpdateDynamicStates();
     }
+    bool mesh_test_applied = false;
+    if (mesh_draw && pipeline->IsMeshEmulated() && device.IsExtExtendedDynamicStateSupported()) {
+        const MeshTestFlags test{PollMeshTestFlags()};
+        if (test.no_cull) {
+            scheduler.Record([](vk::CommandBuffer cmdbuf) { cmdbuf.SetCullModeEXT(VK_CULL_MODE_NONE); });
+            mesh_test_applied = true;
+        }
+        if ((test.z_less_equal || test.z_always) &&
+            MaxwellToVK::ComparisonOp(maxwell3d->regs.depth_test_func) == VK_COMPARE_OP_EQUAL) {
+            const VkCompareOp replacement =
+                test.z_always ? VK_COMPARE_OP_ALWAYS : VK_COMPARE_OP_LESS_OR_EQUAL;
+            scheduler.Record([replacement](vk::CommandBuffer cmdbuf) {
+                cmdbuf.SetDepthCompareOpEXT(replacement);
+            });
+            mesh_test_applied = true;
+        }
+    }
 
     query_cache.NotifySegment(true);
     HandleTransformFeedback();
@@ -632,6 +689,11 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
         // The task/mesh pipeline replaced the topology, primitive restart and vertex input the
         // next draw's pipeline expects to find set.
         state_tracker.InvalidateMeshStaticState();
+        if (mesh_test_applied) {
+            // The next draw must set the guest's depth compare op and cull mode again.
+            maxwell3d->dirty.flags[Dirty::DepthCompareOp] = true;
+            maxwell3d->dirty.flags[Dirty::CullMode] = true;
+        }
     }
     if (diag_query >= 0) {
         scheduler.Record([pool = **g_diag_pool, diag_query](vk::CommandBuffer cmdbuf) {
