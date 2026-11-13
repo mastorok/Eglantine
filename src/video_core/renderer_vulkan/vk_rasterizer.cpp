@@ -446,13 +446,18 @@ struct MeshAutoPhase {
     const char* name;
     MeshDepthMode depth;
     bool no_cull;
+    int cond; ///< Nx2Sampler::g_cond_test
 };
 
+// Build 33: the render enable conditions (see Maxwell3D::ProcessQueryCondition), depth LESS_EQUAL
+// except where said. Build 32 walked the depth test and face culling instead.
 constexpr std::array<MeshAutoPhase, 4> MeshAutoPhases{{
-    {"depth LESS_EQUAL", MeshDepthMode::LessEqual, false},
-    {"depth EQUAL as the game sets it", MeshDepthMode::Exact, false},
-    {"depth ALWAYS", MeshDepthMode::Always, false},
-    {"depth LESS_EQUAL, no face culling", MeshDepthMode::LessEqual, true},
+    {"conditions as the game sets them (baseline), depth LESS_EQUAL", MeshDepthMode::LessEqual,
+     false, 0},
+    {"conditions evaluated by the back (COND_PREDICATE), depth LESS_EQUAL",
+     MeshDepthMode::LessEqual, false, 1},
+    {"conditions ignored, every draw runs, depth LESS_EQUAL", MeshDepthMode::LessEqual, false, 2},
+    {"conditions ignored, depth ALWAYS", MeshDepthMode::Always, false, 2},
 }};
 
 std::optional<MeshTestFlags> PollMeshAutoTest() {
@@ -483,6 +488,7 @@ std::optional<MeshTestFlags> PollMeshAutoTest() {
     if (phase >= total_phases) {
         if (current_phase != total_phases) {
             current_phase = total_phases;
+            Nx2Sampler::g_cond_test.store(-1, std::memory_order_relaxed);
             LOG_INFO(Render_Vulkan, "mesh test auto: finished after {} phases", total_phases);
         }
         return std::nullopt;
@@ -491,6 +497,7 @@ std::optional<MeshTestFlags> PollMeshAutoTest() {
     if (phase != current_phase) {
         current_phase = phase;
         captured = false;
+        Nx2Sampler::g_cond_test.store(entry.cond, std::memory_order_relaxed);
         LOG_INFO(Render_Vulkan, "mesh test auto: phase {} of {}: {}", phase, total_phases,
                  entry.name);
     }
@@ -1137,6 +1144,29 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
                 is_indexed ? "vkCmdDrawIndexed" : "vkCmdDraw", params, VK_SUCCESS);
         }
     });
+}
+
+void RasterizerVulkan::NoteConditionalSkip(bool indirect, bool is_indexed, u32 instance_count) {
+    // The draw never reaches PrepareDraw, so without this it leaves no trace anywhere.
+    static std::atomic<u64> total{};
+    if (const u64 n = total.fetch_add(1, std::memory_order_relaxed);
+        n == 0 || (n + 1) % 20000 == 0) {
+        LOG_INFO(Render_Vulkan, "{} draws switched off by the render enable condition so far",
+                 n + 1);
+    }
+    if (!VideoCommon::Nx2Diag::Active()) {
+        return;
+    }
+    const auto& draw_state = maxwell3d->draw_manager.draw_state;
+    if (indirect) {
+        g_diag_draw = {"indirect",
+                       static_cast<u32>(maxwell3d->draw_manager.indirect_state.max_draw_counts), 0};
+    } else {
+        g_diag_draw = {is_indexed ? "indexed" : "draw",
+                       is_indexed ? draw_state.index_buffer.count : draw_state.vertex_buffer.count,
+                       instance_count};
+    }
+    DiagRecordDraw(*maxwell3d, *gpu_memory, "cond-off", false);
 }
 
 void RasterizerVulkan::DrawIndirect() {

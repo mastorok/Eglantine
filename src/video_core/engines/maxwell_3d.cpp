@@ -9,7 +9,9 @@
 #include <atomic>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <optional>
+#include <fmt/ranges.h>
 #include "common/nx2_sampler.h"
 #include "common/assert.h"
 #include "common/bit_util.h"
@@ -657,11 +659,42 @@ void Maxwell3D::ProcessQueryGet() {
 }
 
 void Maxwell3D::ProcessQueryCondition() {
+    // EDEN_NX2_COND_RENDER=1: ignore the render enable conditions, every draw runs. A test for
+    // pictures with objects missing (Ocarina of Time's foliage): if they come back, a condition
+    // had switched their draws off.
+    static const Nx2Sampler::Knob always_knob = Nx2Sampler::MakeKnob("COND_RENDER", 0);
+    // The first evaluations of every mode and outcome go to the log, then one in 50000.
+    const auto note = [this](const char* path, const Regs::ReportSemaphore::Compare* cmp) {
+        static std::array<std::atomic<u64>, 16> counts{};
+        const u32 mode = static_cast<u32>(regs.render_enable.mode);
+        const size_t slot = (std::min<u32>(mode, 7) << 1) | (execute_on ? 1U : 0U);
+        const u64 n = counts[slot].fetch_add(1, std::memory_order_relaxed);
+        if (n < 3 || (n + 1) % 50000 == 0) {
+            LOG_INFO(HW_GPU,
+                     "render enable ({}): override {} mode {} address {:#x} -> draws {} (n={}){}",
+                     path, static_cast<u32>(regs.render_enable_override), mode,
+                     regs.render_enable.Address(), execute_on ? "on" : "OFF", n + 1,
+                     cmp == nullptr
+                         ? std::string{}
+                         : fmt::format(" words {:#x} {:#x} {:#x} {:#x} {:#x} {:#x}",
+                                       cmp->initial_sequence, cmp->initial_mode, cmp->unknown1,
+                                       cmp->unknown2, cmp->current_sequence, cmp->current_mode));
+        }
+    };
+    const int cond_test = Nx2Sampler::g_cond_test.load(std::memory_order_relaxed);
+    if (cond_test >= 0 ? cond_test == 2 : always_knob.Get() != 0) {
+        execute_on = true;
+        note("forced", nullptr);
+        return;
+    }
     if (rasterizer->AccelerateConditionalRendering()) {
         execute_on = true;
+        note("host", nullptr);
         return;
     }
     const GPUVAddr condition_address{regs.render_enable.Address()};
+    Regs::ReportSemaphore::Compare cmp{};
+    bool operands_read = false;
     switch (regs.render_enable_override) {
     case Regs::RenderEnable::Override::AlwaysRender:
         execute_on = true;
@@ -670,6 +703,14 @@ void Maxwell3D::ProcessQueryCondition() {
         execute_on = false;
         break;
     case Regs::RenderEnable::Override::UseRenderEnable: {
+        if (regs.render_enable.mode >= Regs::RenderEnable::Mode::Conditional &&
+            regs.render_enable.mode <= Regs::RenderEnable::Mode::IfNotEqual) {
+            // Report words wait in the query cache until a fence, and the caches belong to the
+            // thread running this (the split's back): ReadBlock flushes every cache over the
+            // range (CacheType::All), the query cache included, before the words are compared.
+            memory_manager.ReadBlock(condition_address, &cmp, sizeof(cmp));
+            operands_read = true;
+        }
         switch (regs.render_enable.mode) {
         case Regs::RenderEnable::Mode::True: {
             execute_on = true;
@@ -680,21 +721,15 @@ void Maxwell3D::ProcessQueryCondition() {
             break;
         }
         case Regs::RenderEnable::Mode::Conditional: {
-            Regs::ReportSemaphore::Compare cmp;
-            memory_manager.ReadBlock(condition_address, &cmp, sizeof(cmp));
             execute_on = cmp.initial_sequence != 0U && cmp.initial_mode != 0U;
             break;
         }
         case Regs::RenderEnable::Mode::IfEqual: {
-            Regs::ReportSemaphore::Compare cmp;
-            memory_manager.ReadBlock(condition_address, &cmp, sizeof(cmp));
             execute_on = cmp.initial_sequence == cmp.current_sequence &&
                          cmp.initial_mode == cmp.current_mode;
             break;
         }
         case Regs::RenderEnable::Mode::IfNotEqual: {
-            Regs::ReportSemaphore::Compare cmp;
-            memory_manager.ReadBlock(condition_address, &cmp, sizeof(cmp));
             execute_on = cmp.initial_sequence != cmp.current_sequence ||
                          cmp.initial_mode != cmp.current_mode;
             break;
@@ -708,6 +743,7 @@ void Maxwell3D::ProcessQueryCondition() {
         break;
     }
     }
+    note(operands_read ? "memory" : "register", operands_read ? &cmp : nullptr);
 }
 
 void Maxwell3D::ProcessCounterReset() {
@@ -848,6 +884,10 @@ struct Maxwell3D::FrontState {
     Regs::ShadowRamControl control{};
     u32 executing_macro{};
     std::vector<u32> parameters;
+    /// EDEN_NX2_COND_PREDICATE: per macro and first parameter, the render enable mode the macro
+    /// sets from the Compare words it reads (IfEqual or IfNotEqual), or 0 for any other macro.
+    std::map<u64, u32> predicate_macros;
+    u64 predicate_generation{~u64{0}};
     u64 calls{};
     /// A method the draw manager handles was sent since the back last ran DrawDeferred: only
     /// then can it have a deferred instanced draw to issue at the end of a macro.
@@ -1130,6 +1170,21 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
     auto& engine = GetNativeMacroEngine();
     const auto positions = GetNativeMacroPositions();
     const u32 start = positions[((method - MacroRegistersStart) >> 1) % positions.size()];
+    // EDEN_NX2_COND_PREDICATE=1 (port of Eglantine d3612f82b1 by kraibse, Fritchii EXP53): NVN's
+    // conditional render macro DMA-reads the six Compare words at an address and sets
+    // render_enable.mode from them. The front reads them from guest memory, but the report
+    // words wait in the query cache (owned by the back) until a fence, so it saw stale ones: in
+    // Ocarina of Time the objects whose occlusion query "found nothing" (foliage colour passes)
+    // were switched off for good. It also drained the split on every call. For such a macro the
+    // front skips the read, feeds six zero words and writes the address with mode IfNotEqual: the
+    // back evaluates the same condition in order, after the query cache wrote its words out.
+    static const Nx2Sampler::Knob predicate_knob = Nx2Sampler::MakeKnob("COND_PREDICATE", 0);
+    const int cond_test = Nx2Sampler::g_cond_test.load(std::memory_order_relaxed);
+    const u32 predicate_mode =
+        (cond_test >= 0 ? cond_test == 1 : predicate_knob.Get() != 0) && fs.parameters.size() == 3
+            ? PredicateMacroMode(fs, method)
+            : 0U;
+    const bool predicate = predicate_mode != 0;
     {
         VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Macro};
         engine.native_interpreter.active_dram = &native_data_ram;
@@ -1145,10 +1200,31 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
                 if (address >= MacroRegistersStart) {
                     return false;
                 }
+                if (predicate && address == MAXWELL3D_REG_INDEX(render_enable.mode)) {
+                    FrontWrite(split, fs, MAXWELL3D_REG_INDEX(render_enable.address_high),
+                               fs.regs[0x154] & 0x1ffffff, true, true);
+                    FrontWrite(split, fs, MAXWELL3D_REG_INDEX(render_enable.address_low),
+                               fs.regs[0x155], true, true);
+                    FrontWrite(split, fs, address, predicate_mode, true, true);
+                    return true;
+                }
                 FrontWrite(split, fs, address, value, true, true);
                 // MME_DMA_READ (into data RAM) and MME_DMA_READ_FIFOED (into the load FIFO).
                 if (address == 0x157 || address == 0x158) {
-                    FrontDmaRead(split, fs, address, value);
+                    if (predicate && address == 0x158) {
+                        // The back reads the words when it evaluates the condition: the macro
+                        // only has to consume six.
+                        fs.parameters.insert(fs.parameters.end(), value, 0U);
+                        static std::atomic<u64> skipped{};
+                        if (const u64 n = skipped.fetch_add(1, std::memory_order_relaxed);
+                            n == 0 || (n + 1) % 100000 == 0) {
+                            LOG_INFO(HW_GPU,
+                                     "Conditional render macro (COND_PREDICATE): {} reads left to the back",
+                                     n + 1);
+                        }
+                    } else {
+                        FrontDmaRead(split, fs, address, value);
+                    }
                 }
                 return true;
             });
@@ -1169,6 +1245,100 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
 #else
     fs.executing_macro = 0;
     fs.parameters.clear();
+#endif
+}
+
+u32 Maxwell3D::PredicateMacroMode(FrontState& fs, u32 method) {
+#ifdef ARCHITECTURE_x86_64
+    auto& engine = GetNativeMacroEngine();
+    const auto positions = GetNativeMacroPositions();
+    if (positions.empty() || engine.native_execution_failed || fs.parameters.size() != 3) {
+        return 0;
+    }
+    const size_t index = ((method - MacroRegistersStart) >> 1) % positions.size();
+    // The macro may behave differently for another first parameter (a mode): one verdict per pair.
+    const u32 first_parameter = fs.parameters[0];
+    const u64 key = (u64{static_cast<u32>(index)} << 32) | first_parameter;
+    if (fs.predicate_generation != engine.native_code_generation) {
+        fs.predicate_generation = engine.native_code_generation;
+        fs.predicate_macros.clear();
+    }
+    if (const auto known = fs.predicate_macros.find(key); known != fs.predicate_macros.end()) {
+        return known->second;
+    }
+    if (fs.predicate_macros.size() >= 256) {
+        return 0; // A first parameter that keeps changing is not a mode.
+    }
+    // Dry run against a copy of the data RAM, feeding test words when the macro asks for six. It
+    // must write exactly the DMA address, the read of six words and render_enable.mode, and the
+    // mode must be what IfNotEqual (or IfEqual) makes of the Compare words for every test vector.
+    constexpr u32 address_high = 0x21, address_low = 0x13d60da0;
+    constexpr std::array<std::array<u32, 6>, 8> vectors{{
+        {0, 0, 0, 0, 0, 0}, {1, 0, 0, 0, 0, 0}, {0, 0, 0, 0, 1, 0}, {1, 0, 0, 0, 1, 0},
+        {0, 1, 0, 0, 0, 0}, {0, 0, 0, 0, 0, 1}, {5, 0, 0, 0, 0, 0}, {2, 3, 7, 9, 2, 3},
+    }};
+    if (!engine.native_jit) {
+        engine.native_jit = std::make_shared<TuringMacroJit>();
+    }
+    engine.native_jit->Prepare(engine.native_code, engine.native_code_generation);
+    bool written_as_expected = true;
+    bool not_equal_form = true; // mode 1 (render) when the words differ, else 0
+    bool equal_form = true;     // mode 1 (render) when the words are equal, else 0
+    std::array<u32, vectors.size()> modes{};
+    for (size_t i = 0; i < vectors.size() && written_as_expected; ++i) {
+        std::vector<u32> parameters{first_parameter, address_high, address_low};
+        std::vector<u32> scratch_ram(native_data_ram.begin(), native_data_ram.end());
+        std::vector<std::pair<u32, u32>> writes;
+        const auto result = engine.native_jit->Execute(
+            positions[index], parameters, std::span<u32>{scratch_ram},
+            [&fs](u32 address) { return address < Regs::NUM_REGS ? fs.regs[address] : 0U; },
+            [&](u32 address, u32 value) {
+                if (address >= MacroRegistersStart || writes.size() >= 16) {
+                    return false;
+                }
+                writes.emplace_back(address, value);
+                if (address == 0x158 && value == 6) {
+                    parameters.insert(parameters.end(), vectors[i].begin(), vectors[i].end());
+                }
+                return true;
+            });
+        written_as_expected = result.success && writes.size() == 4 && writes[0].first == 0x154 &&
+                              writes[0].second == address_high && writes[1].first == 0x155 &&
+                              writes[1].second == address_low &&
+                              writes[2] == std::pair<u32, u32>{0x158, 6} &&
+                              writes[3].first == MAXWELL3D_REG_INDEX(render_enable.mode);
+        if (written_as_expected) {
+            const auto& w = vectors[i];
+            const bool differ = w[0] != w[4] || w[1] != w[5];
+            modes[i] = writes[3].second;
+            not_equal_form = not_equal_form && modes[i] == (differ ? 1U : 0U);
+            equal_form = equal_form && modes[i] == (differ ? 0U : 1U);
+        }
+    }
+    u32 verdict = 0;
+    if (written_as_expected && not_equal_form) {
+        verdict = static_cast<u32>(Regs::RenderEnable::Mode::IfNotEqual);
+    } else if (written_as_expected && equal_form) {
+        verdict = static_cast<u32>(Regs::RenderEnable::Mode::IfEqual);
+    }
+    fs.predicate_macros.emplace(key, verdict);
+    static std::atomic<u32> logged{};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+        LOG_INFO(HW_GPU,
+                 "Native macro {:#x} (first parameter {:#x}): {} (COND_PREDICATE; modes for the "
+                 "test vectors: {})",
+                 method, first_parameter,
+                 verdict == 0 ? "not a render-enable predicate, runs as before"
+                 : verdict == static_cast<u32>(Regs::RenderEnable::Mode::IfNotEqual)
+                     ? "render-enable predicate, the back evaluates IfNotEqual"
+                     : "render-enable predicate, the back evaluates IfEqual",
+                 fmt::join(modes, " "));
+    }
+    return verdict;
+#else
+    static_cast<void>(fs);
+    static_cast<void>(method);
+    return 0;
 #endif
 }
 

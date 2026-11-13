@@ -3391,6 +3391,11 @@ private:
                     bool is_last_call, bool from_macro);
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
     void FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 count);
+    /// The render enable mode (IfEqual or IfNotEqual) the macro at `method` sets from the six
+    /// Compare words it DMA-reads, when it is NVN's conditional render and does nothing else; 0
+    /// for any other macro. Dry runs on copies, cached per macro, first parameter and code
+    /// generation. Eglantine d3612f82b1 (kraibse), Fritchii EXP53.
+    u32 PredicateMacroMode(FrontState& state, u32 method);
     void FrontVerify(VideoCommon::GpuSplit& split, FrontState& state);
     void FinishFrontMacro(Core::System& system);
     std::unique_ptr<FrontState> front;

@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <thread>
 
 #include "core/file_sys/errors.h"
@@ -35,8 +36,16 @@ Result IStorage::Read(
     R_UNLESS(length >= 0, FileSys::ResultInvalidSize);
     R_UNLESS(offset >= 0, FileSys::ResultInvalidOffset);
 
+    // EDEN_NX2_READ_THROTTLE=0 (boot): no pacing of game file reads. Upstream added the pacing for
+    // video freezes in other games (Eden #4525), but it holds every read back to one per 1.6 ms or
+    // more on the one file system thread: area loads and streaming wait for it (Fritchii measured
+    // 36-151 ms of sleep at boot and area loads in Ocarina of Time). Default unchanged.
+    static const bool throttle = [] {
+        const char* const value = std::getenv("EDEN_NX2_READ_THROTTLE");
+        return value == nullptr || value[0] != '0';
+    }();
     const auto now = std::chrono::steady_clock::now();
-    if (now < next_read_tick) {
+    if (throttle && now < next_read_tick) {
         std::this_thread::sleep_for(next_read_tick - now);
     }
     next_read_tick = std::chrono::steady_clock::now() +

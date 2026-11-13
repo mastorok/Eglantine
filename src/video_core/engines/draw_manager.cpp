@@ -319,6 +319,8 @@ void Maxwell3D::DrawManager::ProcessDraw(Maxwell3D& maxwell3d, bool draw_indexed
     UpdateTopology(maxwell3d);
     if (maxwell3d.ShouldExecute()) {
         maxwell3d.rasterizer->Draw(draw_indexed, instance_count);
+    } else {
+        maxwell3d.rasterizer->NoteConditionalSkip(false, draw_indexed, instance_count);
     }
 }
 
@@ -328,6 +330,8 @@ void Maxwell3D::DrawManager::ProcessDrawIndirect(Maxwell3D& maxwell3d) {
     UpdateTopology(maxwell3d);
     if (maxwell3d.ShouldExecute()) {
         maxwell3d.rasterizer->DrawIndirect();
+    } else {
+        maxwell3d.rasterizer->NoteConditionalSkip(true, indirect_state.is_indexed, 0);
     }
 }
 } // namespace Tegra::Engines

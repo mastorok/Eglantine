@@ -365,6 +365,48 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
         }
     }
 
+    // Ocarina of Time (Switch 2): Occlusion Off (EDEN_NX2_OCCLUSION_OFF=1; cLohan's community patch,
+    // Lichii#641, as ported by Fritchii). Six `ldrb w8, [x0]` read the game's occlusion setting;
+    // turned into `mov w8, wzr` the game creates no z-prepass and no samples-passed queries, so it
+    // sends no occlusion reports and no conditional renders: every candidate object is drawn, and
+    // the pictures no longer depend on a stale query read (foliage colour passes switched off by
+    // their own prepass query). Opt-in until a run shows it is better than the unpatched game.
+    if (name == "main" && process.GetProgramId() == 0x0400486024DEC000ULL) {
+        const char* const occlusion_env = std::getenv("EDEN_NX2_OCCLUSION_OFF");
+        if (occlusion_env != nullptr && occlusion_env[0] == '1') {
+            constexpr std::array<u8, 20> BuildId{0xE0, 0xF3, 0xCC, 0xFA, 0xF5, 0x00, 0x65,
+                                                 0xAE, 0x4E, 0xA0, 0x1E, 0xB5, 0xAE, 0xB1,
+                                                 0x3B, 0x1A, 0x45, 0xDA, 0x33, 0x48};
+            constexpr u32 LdrbW8X0 = 0x39400008; // ldrb w8, [x0]
+            constexpr u32 MovW8Wzr = 0x2A1F03E8; // mov w8, wzr
+            constexpr std::array<size_t, 6> sites{0x11ACE68, 0x11B828C, 0x11B82A4,
+                                                  0x11ACEC8, 0x11B82DC, 0x11B82F4};
+            const auto& text = nso_header.segments[0];
+            u8* const image = codeset.memory.data() + module_start;
+            const auto read_word = [image](size_t offset) {
+                u32 value;
+                std::memcpy(&value, image + offset, sizeof(value));
+                return value;
+            };
+            bool match = std::equal(BuildId.begin(), BuildId.end(), nso_header.build_id.begin());
+            for (const size_t site : sites) {
+                match = match && site + sizeof(u32) <= text.size &&
+                        module_start + site + sizeof(u32) <= codeset.memory.size() &&
+                        read_word(site) == LdrbW8X0;
+            }
+            if (match) {
+                for (const size_t site : sites) {
+                    std::memcpy(image + site, &MovW8Wzr, sizeof(MovW8Wzr));
+                }
+                LOG_INFO(Loader, "Ocarina of Time: Occlusion Off patch applied ({} sites)",
+                         sites.size());
+            } else {
+                LOG_WARNING(Loader, "Ocarina of Time Occlusion Off patch skipped "
+                                    "(unsupported build or instructions)");
+            }
+        }
+    }
+
 #ifdef HAS_NCE
     // If we are computing the process code layout and using nce backend, patch.
     const auto& code = codeset.CodeSegment();

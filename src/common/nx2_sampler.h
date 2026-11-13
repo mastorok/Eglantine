@@ -148,6 +148,10 @@ inline std::atomic<std::uint64_t> g_indirect_draws{0};
 inline std::atomic<std::uint64_t> g_dispatches{0};
 inline std::atomic<std::uint64_t> g_list_waits{0};      // GPU-written command list reads that waited
 inline std::atomic<std::uint64_t> g_list_wait_us{0};
+// Render enable conditions, set by the automatic mesh test (EDEN_NX2_MESH_TEST_AUTO) phase by phase:
+// -1 the settings decide (EDEN_NX2_COND_PREDICATE / EDEN_NX2_COND_RENDER), 0 neither, 1 the back
+// evaluates NVN's conditional render macro, 2 every condition is ignored.
+inline std::atomic<int> g_cond_test{-1};
 // Audio: output buffers the sink found empty (the game heard a repeated sample) and DSP render
 // ticks that came late.
 inline std::atomic<std::uint64_t> g_audio_underruns{0};

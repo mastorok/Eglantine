@@ -53,6 +53,11 @@ public:
     /// Dispatches an indirect draw invocation
     virtual void DrawIndirect() {}
 
+    /// A draw the render enable condition switched off (diagnostics: shown in the draw lists).
+    virtual void NoteConditionalSkip([[maybe_unused]] bool indirect,
+                                     [[maybe_unused]] bool is_indexed,
+                                     [[maybe_unused]] u32 instance_count) {}
+
     /// Dispatches an draw texture invocation
     virtual void DrawTexture() = 0;
 
