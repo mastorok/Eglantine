@@ -7,6 +7,9 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdlib>
+#include <mutex>
+#include <optional>
+#include <unordered_map>
 
 #include "common/nx2_sampler.h"
 #include "common/assert.h"
@@ -76,6 +79,81 @@ long long AcquireSkipLevel() {
     return VideoCommon::GpuSplit::Get().Active() ? knob.Get() : 0;
 }
 
+// EDEN_NX2_ACQ_PREDICT=1: the releases this thread parsed and queued for the back but the back has
+// not run yet are remembered by address. An acquire that the value queued last would meet is
+// passed at once, without draining the back to see it land: the back runs in order, so everything
+// parsed after the acquire runs after that release, which is all the drain would have bought
+// (writers it does not know of are what EDEN_NX2_ACQ_VERIFY checks: every n-th prediction drains
+// and reads anyway and counts a wrong one in acq_pred_wrong).
+bool AcquirePredictionOn() {
+    static const Nx2Sampler::Knob knob = Nx2Sampler::MakeKnob("ACQ_PREDICT", 0);
+    return VideoCommon::GpuSplit::Get().Active() && knob.Get() != 0;
+}
+
+class QueuedReleases {
+public:
+    static QueuedReleases& Get() {
+        static QueuedReleases instance;
+        return instance;
+    }
+
+    // Front: a release of `payload` to `address` (of address space `space`) goes to the back.
+    void Add(u32 space, GPUVAddr address, u32 payload) {
+        std::scoped_lock lock{mutex};
+        auto& entry = entries[Key(space, address)];
+        entry.payload = payload;
+        ++entry.queued;
+    }
+
+    // Back: that release has run, so the memory holds it (or a later one).
+    void Done(u32 space, GPUVAddr address) {
+        std::scoped_lock lock{mutex};
+        const auto found = entries.find(Key(space, address));
+        if (found != entries.end() && --found->second.queued == 0) {
+            entries.erase(found);
+        }
+    }
+
+    // Front: the value the semaphore will hold once the queued releases ran, if any is queued.
+    std::optional<u32> Predicted(u32 space, GPUVAddr address) {
+        std::scoped_lock lock{mutex};
+        const auto found = entries.find(Key(space, address));
+        if (found == entries.end() || found->second.queued == 0) {
+            return std::nullopt;
+        }
+        return found->second.payload;
+    }
+
+private:
+    struct Entry {
+        u32 payload{};
+        u32 queued{};
+    };
+
+    static u64 Key(u32 space, GPUVAddr address) {
+        return (static_cast<u64>(space) << 48) ^ address;
+    }
+
+    std::mutex mutex;
+    std::unordered_map<u64, Entry> entries;
+};
+
+// A release of `payload` to `address` for the back, remembered for the predictions above while it
+// is queued. The rasterizer call is `run`.
+template <typename Run>
+void QueueRelease(DmaPusher& dma_pusher, GPUVAddr address, u32 payload, Run&& run) {
+    if (!AcquirePredictionOn()) {
+        OnBack(std::forward<Run>(run));
+        return;
+    }
+    const u32 space = dma_pusher.memory_manager.GetID();
+    QueuedReleases::Get().Add(space, address, payload);
+    OnBack([run = std::forward<Run>(run), space, address] {
+        run();
+        QueuedReleases::Get().Done(space, address);
+    });
+}
+
 // Whether the memory of a semaphore may be read as it is, without the back's queued work: the
 // page holds no copy the GPU wrote (those wait in the buffer cache until flushed).
 bool CanLookAtSemaphore(DmaPusher& dma_pusher, GPUVAddr address) {
@@ -112,8 +190,26 @@ bool AcquireMet(DmaPusher& dma_pusher, GPUVAddr address, const Matches& matches)
             return true;
         }
     }
+    bool predicted = false;
+    if (!(looked && met_before) && AcquirePredictionOn()) {
+        if (const auto value = QueuedReleases::Get().Predicted(dma_pusher.memory_manager.GetID(),
+                                                               address);
+            value && matches(*value)) {
+            static u32 predictions{}; // The puller runs on the one GPU thread.
+            const auto every = static_cast<u32>(std::max<long long>(verify_knob.Get(), 0));
+            if (every == 0 || ++predictions % every != 0) {
+                Nx2Sampler::g_acq_predicted.fetch_add(1, std::memory_order_relaxed);
+                VideoCommon::GpuSplit::Get().PublishIfBackIdle();
+                return true;
+            }
+            predicted = true;
+        }
+    }
     DrainBack();
     const bool met = matches(ReadSemaphoreWord(dma_pusher, address));
+    if (predicted && !met) {
+        Nx2Sampler::g_acq_pred_wrong.fetch_add(1, std::memory_order_relaxed);
+    }
     if (looked) {
         auto& counter = met_before ? (met ? Nx2Sampler::g_acq_same : Nx2Sampler::g_acq_wrong)
                                    : (met ? Nx2Sampler::g_acq_needed : Nx2Sampler::g_acq_waits);
@@ -151,13 +247,26 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
     Nx2Sampler::g_resume_polls.fetch_add(1, std::memory_order_relaxed);
     u32 current{};
     bool looked = false;
-    if (const long long level = AcquireSkipLevel();
-        level >= 1 && CanLookAtSemaphore(dma_pusher, pending_acquire->address)) {
-        current = dma_pusher.memory_manager.Read<u32>(pending_acquire->address);
-        if (pending_acquire->Matches(current)) {
-            Nx2Sampler::g_resume_skips.fetch_add(1, std::memory_order_relaxed);
-            looked = true;
-        } else if (level >= 2) {
+    if (const long long level = AcquireSkipLevel(); level >= 1) {
+        const bool can_look = CanLookAtSemaphore(dma_pusher, pending_acquire->address);
+        if (can_look) {
+            current = dma_pusher.memory_manager.Read<u32>(pending_acquire->address);
+            if (pending_acquire->Matches(current)) {
+                Nx2Sampler::g_resume_skips.fetch_add(1, std::memory_order_relaxed);
+                looked = true;
+            }
+        }
+        if (!looked && AcquirePredictionOn()) {
+            // A release queued for the back that meets the acquire: resume without the drain.
+            if (const auto value = QueuedReleases::Get().Predicted(
+                    dma_pusher.memory_manager.GetID(), pending_acquire->address);
+                value && pending_acquire->Matches(*value)) {
+                current = *value;
+                Nx2Sampler::g_resume_predicted.fetch_add(1, std::memory_order_relaxed);
+                looked = true;
+            }
+        }
+        if (!looked && can_look && level >= 2) {
             // Not there yet: what the back still has queued reaches memory without the front
             // waiting for it (the next poll sees it); it only has to be told about the work.
             VideoCommon::GpuSplit::Get().PublishIfBackIdle();
@@ -331,10 +440,18 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         if (mirror != 0) {
             LOG_DEBUG(HW_GPU, "Switch 2 semaphore {:#x}={:#x} mirrored to {:#x}", sequence_address, payload, mirror);
         }
-        OnBack([rasterizer = dma_pusher.rasterizer, sequence_address, mirror, properties, payload] {
+        if (mirror != 0 && AcquirePredictionOn()) {
+            QueuedReleases::Get().Add(dma_pusher.memory_manager.GetID(), mirror, payload);
+        }
+        QueueRelease(dma_pusher, sequence_address, payload,
+                     [rasterizer = dma_pusher.rasterizer, sequence_address, mirror, properties, payload,
+                      space = dma_pusher.memory_manager.GetID()] {
             rasterizer->Query(sequence_address, VideoCommon::QueryType::Payload, properties, payload, 0);
             if (mirror != 0) {
                 rasterizer->Query(mirror, VideoCommon::QueryType::Payload, properties, payload, 0);
+                if (AcquirePredictionOn()) {
+                    QueuedReleases::Get().Done(space, mirror);
+                }
             }
         });
     } else if (g_nx2_ampere) {
@@ -408,7 +525,8 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
 void Puller::ProcessSemaphoreRelease(DmaPusher& dma_pusher) {
     const GPUVAddr sequence_address{regs.semaphore_address.SemaphoreAddress()};
     const u32 payload = regs.semaphore_release;
-    OnBack([rasterizer = dma_pusher.rasterizer, sequence_address, payload] {
+    QueueRelease(dma_pusher, sequence_address, payload,
+                 [rasterizer = dma_pusher.rasterizer, sequence_address, payload] {
         rasterizer->Query(sequence_address, VideoCommon::QueryType::Payload,
                           VideoCommon::QueryPropertiesFlags::IsAFence, payload, 0);
     });
@@ -437,7 +555,8 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
     const u32 payload = regs.reg_array[0x19];
     const u32 operation = argument & 7;
     if (operation == 1) { // RELEASE
-        OnBack([rasterizer = dma_pusher.rasterizer, address, payload] {
+        QueueRelease(dma_pusher, address, payload,
+                     [rasterizer = dma_pusher.rasterizer, address, payload] {
             rasterizer->Query(address, VideoCommon::QueryType::Payload,
                               VideoCommon::QueryPropertiesFlags::IsAFence, payload, 0);
         });

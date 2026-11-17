@@ -946,6 +946,7 @@ struct StallJob {
     StallCounters before{};
     StallCounters after{};
     std::string threads;
+    bool ongoing{}; ///< The stall has not ended: the process may be hung (EDEN_NX2_HANG_MS)
 };
 
 class StallReporter {
@@ -976,6 +977,12 @@ private:
                 job = std::move(queue.front());
                 queue.pop_front();
             }
+            if (job.ongoing) {
+                LOG_WARNING(Common,
+                            "nx2 hang: no present for {} ms yet at {:.1f} s; the stacks of the last "
+                            "sampling window follow",
+                            job.gap_ms, job.at_seconds);
+            }
             ReportStall(job.index, job.at_seconds, job.gap_ms, job.rounds, job.groups, job.samples,
                         job.before, job.after, job.threads);
         }
@@ -1000,6 +1007,13 @@ void StallLoop(unsigned threshold_ms) {
     static StallReporter* const reporter = new StallReporter; // lives as long as the process
     constexpr unsigned MaxReports = 400;
     constexpr unsigned MaxRounds = 600;
+    // A stall that lasts this long is reported while it goes on, with fresh stacks, then again every
+    // 8 s (at most 6 times): a hang that ends the process never reaches the report at its end.
+    static const Knob hang_knob = MakeKnob("HANG_MS", 4000);
+    const long long hang_ns = std::max<long long>(hang_knob.Get(), 500) * 1'000'000LL;
+    long long hang_at = 0;
+    bool hang_window = false;
+    unsigned hang_reports = 0;
     std::vector<StallTarget> targets;
     std::vector<Sample> samples;
     std::string threads;
@@ -1030,6 +1044,9 @@ void StallLoop(unsigned threshold_ms) {
             stalling = true;
             stall_from = last;
             rounds = 0;
+            hang_at = last + hang_ns;
+            hang_window = false;
+            hang_reports = 0;
             samples.clear();
             threads = CollectStallTargets(targets);
             if (listed) {
@@ -1069,9 +1086,36 @@ void StallLoop(unsigned threshold_ms) {
             stalling = false;
             continue;
         }
+        if (!hang_window && now >= hang_at && hang_reports < 6) {
+            hang_window = true;
+            rounds = 0;
+            samples.clear();
+        }
         if (rounds < MaxRounds) {
             SampleStallRound(targets, samples);
             ++rounds;
+        }
+        if (hang_window && rounds >= 150) {
+            hang_window = false;
+            ++hang_reports;
+            hang_at = now + 8'000'000'000LL;
+            StallJob job;
+            job.index = reports + 1;
+            job.at_seconds =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - g_process_start)
+                    .count();
+            job.gap_ms = (now - stall_from) / 1'000'000;
+            job.rounds = rounds;
+            for (const StallTarget& target : targets) {
+                job.groups.push_back(target.group);
+            }
+            job.samples = samples;
+            job.before = before;
+            job.after = ReadCounters();
+            job.ongoing = true;
+            reporter->Push(std::move(job));
+            rounds = MaxRounds; // No sampling until the next window
+            samples.clear();
         }
     }
 }
@@ -1649,14 +1693,14 @@ void NotePresent(long long frame_us, long long fence_us, long long composite_us,
             "t_s,frame_ms,fence_ms,composite_ms,pace_ms,astc_decodes,pipelines_built,pipeline_ms,"
             "sparse_binds,sparse_ms,sparse_call_ms,images_created,images_deleted,gc_ms,"
             "tc_used_mib,tc_expected_mib,tc_critical_mib,gc_mode,del_gc,del_gc_download,del_unmap,"
-            "del_join,created_replace,gc_finish_ms,list_waits,list_wait_ms,recr_30,recr_150,recr_600,recr_old,ab,draws,indirect,dispatches,writer_waits,writer_wait_ms,drains,drain_ms,back_idles,back_idle_ms,trust_skips,trust_violations,sem_drains,sem_drain_ms,dma_drains,dma_drain_ms,acq_checks,acq_skips,acq_same,acq_needed,acq_waits,acq_wrong,acq_written,acq_exec,resume_polls,resume_skips,audio_underruns,audio_late_ticks\n";
+            "del_join,created_replace,gc_finish_ms,list_waits,list_wait_ms,recr_30,recr_150,recr_600,recr_old,ab,draws,indirect,dispatches,writer_waits,writer_wait_ms,drains,drain_ms,back_idles,back_idle_ms,trust_skips,trust_violations,sem_drains,sem_drain_ms,dma_drains,dma_drain_ms,acq_checks,acq_skips,acq_same,acq_needed,acq_waits,acq_wrong,acq_written,acq_exec,resume_polls,resume_skips,audio_underruns,audio_late_ticks,acq_predicted,acq_pred_wrong,resume_predicted\n";
     }
     if (!frames.file.is_open()) {
         return;
     }
     const StallCounters counters = ReadCounters();
     frames.pending += fmt::format("{:.3f},{:.2f},{:.2f},{:.2f},{:.2f},{},{},{:.1f},{},{:.1f},{:.1f},{},{},{:.1f},"
-                                  "{},{},{},{},{},{},{},{},{},{:.1f},{},{:.1f},{},{},{},{},{},{},{},{},{},{:.1f},{},{:.1f},{},{:.1f},{},{},{},{:.1f},{},{:.1f},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+                                  "{},{},{},{},{},{},{},{},{},{:.1f},{},{:.1f},{},{},{},{},{},{},{},{},{},{:.1f},{},{:.1f},{},{:.1f},{},{},{},{:.1f},{},{:.1f},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
                                   std::chrono::duration<double>(now - g_process_start).count(),
                                   frame_us / 1000.0, fence_us / 1000.0, composite_us / 1000.0,
                                   pace_us / 1000.0, counters.astc, counters.pipelines,
@@ -1700,7 +1744,10 @@ void NotePresent(long long frame_us, long long fence_us, long long composite_us,
                                   g_resume_polls.load(std::memory_order_relaxed),
                                   g_resume_skips.load(std::memory_order_relaxed),
                                   g_audio_underruns.load(std::memory_order_relaxed),
-                                  g_audio_late_ticks.load(std::memory_order_relaxed));
+                                  g_audio_late_ticks.load(std::memory_order_relaxed),
+                                  g_acq_predicted.load(std::memory_order_relaxed),
+                                  g_acq_pred_wrong.load(std::memory_order_relaxed),
+                                  g_resume_predicted.load(std::memory_order_relaxed));
     if (++frames.lines % 150 == 0) {
         frames.Flush();
     }

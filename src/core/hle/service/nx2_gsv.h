@@ -3149,6 +3149,7 @@ private:
         u64 address{};
         Nx2DecoderImageLayout layout{};
         bool block_linear{};
+        bool gpu_read{};
         {
             std::scoped_lock lk{m_objects->mutex};
             const auto image = m_objects->images.find(image_id);
@@ -3156,8 +3157,11 @@ private:
                 return {m_width, m_height};
             }
             layout = Nx2CalculateDecoderImageLayout(image->second.preference.data());
-            block_linear = image->second.gpu_read &&
+            // EDEN_NX2_VDEC_LINEAR=1: write the RGB images pitch-linear whoever reads them.
+            static const bool force_linear = std::getenv("EDEN_NX2_VDEC_LINEAR") != nullptr;
+            block_linear = image->second.gpu_read && !force_linear &&
                            layout.format != Tegra::Host1x::Nx2PictureFormat::Nv12;
+            gpu_read = image->second.gpu_read;
             const auto memory = m_objects->memories.find(image->second.memory);
             if (memory != m_objects->memories.end() && memory->second.address != 0) {
                 address = memory->second.address + image->second.offset;
@@ -3181,10 +3185,13 @@ private:
             Tegra::Texture::SwizzleTexture(m_tiled, bytes, 4, static_cast<u32>(layout.pitch / 4),
                                            layout.height, 1, 4, 0, 1, true);
             memory.WriteBlock(address, m_tiled.data(), m_tiled.size());
-            if (const auto device =
-                    Nvidia::Devices::Nx2GpuMemoryRegistry::Get().DeviceAddressOf(address)) {
+            const auto device = Nvidia::Devices::Nx2GpuMemoryRegistry::Get().DeviceAddressOf(address);
+            if (device) {
                 system.GPU().InvalidateRegion(*device, m_tiled.size());
             }
+            DumpFrame(bytes, layout, width, height);
+            LogFrame("block-linear RGBA", bytes, layout, image_id, width, height, gpu_read,
+                     device.value_or(0), address);
             return {width, height};
         }
         decoder->Render(*frame.picture, layout.format, width, height, layout.pitch,
@@ -3201,6 +3208,9 @@ private:
         if (device) {
             system.GPU().InvalidateRegion(*device, layout.size);
         }
+        LogFrame(layout.format == Tegra::Host1x::Nx2PictureFormat::Nv12 ? "NV12 pitch-linear"
+                                                                         : "RGB pitch-linear",
+                 bytes, layout, image_id, width, height, gpu_read, device.value_or(0), address);
         if (layout.format == Tegra::Host1x::Nx2PictureFormat::Nv12) {
             // The chroma plane can have a GPU mapping of its own, which the range above misses:
             // its texture then keeps the first frame's chroma and the movie plays in grey.
@@ -3219,6 +3229,34 @@ private:
             }
         }
         return {width, height};
+    }
+
+    // What WriteImage put in an image, for the first frames of a session and every 600th: how it was
+    // laid out, whether the GPU has the image mapped, and a coarse look at the pixels (the mean of
+    // 1024 samples, and the first words), to tell a frame of zeros from a picture the game then
+    // shows wrong.
+    void LogFrame(const char* how, const std::vector<u8>& bytes, const Nx2DecoderImageLayout& layout,
+                  u32 image_id, u32 width, u32 height, bool gpu_read, u64 device, u64 address) {
+        if (m_logged_frames >= 6 && (m_frames_out % 600) != 0) {
+            return;
+        }
+        ++m_logged_frames;
+        const size_t step = std::max<size_t>(bytes.size() / 1024, 1);
+        u64 sum = 0;
+        u32 samples = 0;
+        for (size_t i = 0; i < bytes.size(); i += step, ++samples) {
+            sum += bytes[i];
+        }
+        u32 first[2]{};
+        if (bytes.size() >= sizeof(first)) {
+            std::memcpy(first, bytes.data(), sizeof(first));
+        }
+        LOG_INFO(Service,
+                 "nx2:vdecsvc frame {} in image {}: {} {}x{} pitch {} format {} (image size {:#x}), "
+                 "GPU reads it {}, device {:#x} at {:#x}, mean byte {:.1f}, first words {:08x} {:08x}",
+                 m_frames_out + 1, image_id, how, width, height, layout.pitch,
+                 static_cast<u32>(layout.format), layout.size, gpu_read ? "yes" : "not yet", device,
+                 address, samples != 0 ? static_cast<double>(sum) / samples : 0.0, first[0], first[1]);
     }
 
     // EDEN_NX2_VDEC_DUMP=<dir>: save the luma of every 120th decoded frame, a quarter of its size,
@@ -3260,6 +3298,7 @@ private:
     u32 m_sync_base{};            ///< Its value before the first frame
     std::vector<u8> m_tiled;      ///< Decode thread: block-linear copy of a frame (WriteImage)
     bool m_logged_planes{};       ///< Decode thread: the NV12 plane mappings were logged once
+    u32 m_logged_frames{};        ///< Decode thread: frames LogFrame has described
 
     // Shared with the decode thread.
     std::mutex m_mutex;

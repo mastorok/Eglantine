@@ -142,6 +142,12 @@ inline std::atomic<std::uint64_t> g_acq_written{0};
 inline std::atomic<std::uint64_t> g_acq_exec{0};
 inline std::atomic<std::uint64_t> g_resume_polls{0};
 inline std::atomic<std::uint64_t> g_resume_skips{0};
+// EDEN_NX2_ACQ_PREDICT: acquires (and polls of suspended channels) met by a release this thread
+// parsed and queued for the back but the back had not run yet, so no drain was needed; and, of the
+// acquires that were drained and read anyway to check, how many the prediction had got wrong.
+inline std::atomic<std::uint64_t> g_acq_predicted{0};
+inline std::atomic<std::uint64_t> g_acq_pred_wrong{0};
+inline std::atomic<std::uint64_t> g_resume_predicted{0};
 // Draws, indirect draws and compute dispatches the rasterizer ran (calls, not primitives).
 inline std::atomic<std::uint64_t> g_draws{0};
 inline std::atomic<std::uint64_t> g_indirect_draws{0};
