@@ -1,0 +1,1368 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#include <optional>
+#include <array>
+#include <cstdlib>
+#include <chrono>
+#include <atomic>
+#include <memory>
+#include <new>
+#include <utility>
+
+#include "game_settings.h"
+#include "common/cpu_features.h"
+#include "audio_core/audio_core.h"
+#include "common/fs/fs.h"
+#include "common/literals.h"
+#include "common/logging.h"
+#include "common/memory_detect.h"
+#include "common/nx2_sampler.h"
+#include "common/adpf.h"
+#include "common/settings.h"
+#include "common/settings_enums.h"
+#include "common/shutdown_progress.h"
+#include "common/string_util.h"
+#include "core/arm/exclusive_monitor.h"
+#include "core/core.h"
+
+#include "launch_timestamp_cache.h"
+#include "core/core_timing.h"
+#include "core/cpu_manager.h"
+#include "core/debugger/debugger.h"
+#include "core/debugger/nx2_debug_tools.h"
+#include "core/device_memory.h"
+#include "core/file_sys/card_image.h"
+#include "core/file_sys/content_archive.h"
+#include "core/file_sys/fs_filesystem.h"
+#include "core/file_sys/nup_container.h"
+#include "core/file_sys/patch_manager.h"
+#include "core/file_sys/program_metadata.h"
+#include "core/file_sys/registered_cache.h"
+#include "core/file_sys/romfs_factory.h"
+#include "core/file_sys/savedata_factory.h"
+#include "core/file_sys/submission_package.h"
+#include "core/file_sys/vfs/vfs_concat.h"
+#include "core/file_sys/vfs/vfs_real.h"
+#include "core/gpu_dirty_memory_manager.h"
+#include "core/hle/kernel/k_memory_manager.h"
+#include "core/hle/kernel/k_process.h"
+#include "core/hle/kernel/k_resource_limit.h"
+#include "core/hle/kernel/k_scheduler.h"
+#include "core/hle/kernel/k_system_control.h"
+#include "core/hle/kernel/kernel.h"
+#include "core/hle/kernel/nx2_thread_stats.h"
+#include "core/hle/kernel/physical_core.h"
+#include "core/hle/service/acc/profile_manager.h"
+#include "core/hle/service/am/applet_manager.h"
+#include "core/hle/service/am/frontend/applets.h"
+#include "core/hle/service/am/process_creation.h"
+#include "core/hle/service/apm/apm_controller.h"
+#include "core/hle/service/filesystem/filesystem.h"
+#include "core/hle/service/filesystem/fsp/fs_read_trace.h"
+#include "core/hle/service/glue/glue_manager.h"
+#include "core/hle/service/glue/time/static.h"
+#include "core/hle/service/glue/time/time_zone_binary.h"
+#include "core/hle/service/psc/time/static.h"
+#include "core/hle/service/psc/time/steady_clock.h"
+#include "core/hle/service/psc/time/system_clock.h"
+#include "core/hle/service/psc/time/time_zone_service.h"
+#include "core/hle/service/service.h"
+#include "core/hle/service/services.h"
+#include "core/hle/service/set/system_settings_server.h"
+#include "core/hle/service/sm/sm.h"
+#include "core/internal_network/local_redirect.h"
+#include "core/internal_network/network.h"
+#include "core/loader/loader.h"
+#include "core/loader/nx.h"
+#include "core/memory.h"
+#include "core/memory/cheat_engine.h"
+#include "core/perf_stats.h"
+#include "core/reporter.h"
+#include "core/tools/freezer.h"
+#include "core/tools/renderdoc.h"
+#include "hid_core/hid_core.h"
+#include "network/network.h"
+#include "video_core/host1x/host1x.h"
+#include "video_core/nx2_debug_control.h"
+#include "video_core/nx2_stutter_trace.h"
+#include "video_core/renderer_base.h"
+#include "video_core/video_core.h"
+
+namespace Core {
+
+std::atomic<u64> g_nx2_present_count{};
+static_assert(std::atomic<u64>::is_always_lock_free);
+std::array<std::atomic<u64>, 4096> g_nx2_present_times_ns{};
+
+void RecordGuestPresent() {
+    const u64 present = g_nx2_present_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    const u64 present_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               std::chrono::steady_clock::now().time_since_epoch())
+                               .count();
+    g_nx2_present_times_ns[present % g_nx2_present_times_ns.size()].store(
+        present_ns, std::memory_order_relaxed);
+}
+
+FileSys::VirtualFile GetGameFileFromPath(const FileSys::VirtualFilesystem& vfs,
+                                         const std::string& path) {
+    // To account for split 00+01+etc files.
+    std::string dir_name;
+    std::string filename;
+    Common::SplitPath(path, &dir_name, &filename, nullptr);
+
+    if (filename == "00") {
+        const auto dir = vfs->OpenDirectory(dir_name, FileSys::OpenMode::Read);
+        std::vector<FileSys::VirtualFile> concat;
+
+        for (u32 i = 0; i < 0x10; ++i) {
+            const auto file_name = fmt::format("{:02X}", i);
+            auto next = dir->GetFile(file_name);
+
+            if (next != nullptr) {
+                concat.push_back(std::move(next));
+            } else {
+                next = dir->GetFile(file_name);
+
+                if (next == nullptr) {
+                    break;
+                }
+
+                concat.push_back(std::move(next));
+            }
+        }
+
+        return FileSys::ConcatenatedVfsFile::MakeConcatenatedFile(dir->GetName(),
+                                                                  std::move(concat));
+    }
+
+    if (Common::FS::IsDir(path)) {
+        return vfs->OpenFile(path + "/main", FileSys::OpenMode::Read);
+    }
+
+    return vfs->OpenFile(path, FileSys::OpenMode::Read);
+}
+
+namespace {
+
+// The program id from a Switch 2 program's main.npdm, if it is one.
+std::optional<u64> Switch2ProgramId(FileSys::ProgramMetadata& metadata,
+                                    const FileSys::VirtualFile& npdm) {
+    if (npdm == nullptr || metadata.Load(npdm) != Loader::ResultStatus::Success ||
+        !metadata.IsSwitch2()) {
+        return std::nullopt;
+    }
+    return metadata.GetTitleID();
+}
+
+} // namespace
+
+// Detect the platform and program before initializing the kernel memory layout and guest clock.
+std::optional<u64> FindSwitch2Program(const FileSys::VirtualFile& file, u64 program_id,
+                                      std::size_t program_index) {
+    FileSys::ProgramMetadata metadata;
+    if (FileSys::NupContainer::IsNupFile(file)) {
+        FileSys::NupContainer nup{file};
+        if (nup.GetStatus() != Loader::ResultStatus::Success) {
+            return std::nullopt;
+        }
+        const auto base = nup.FindBasePackage();
+        const auto update = nup.FindBestUpdatePackage();
+        std::optional<std::size_t> program;
+        if (update && nup.GetExeFSDir(*update) != nullptr) {
+            program = update;
+        } else if (base && nup.GetExeFSDir(*base) != nullptr) {
+            program = base;
+        }
+        const auto exefs = program ? nup.GetExeFSDir(*program) : nullptr;
+        const auto npdm = exefs != nullptr ? exefs->GetFile("main.npdm") : nullptr;
+        return Switch2ProgramId(metadata, npdm);
+    }
+    const auto type = file != nullptr ? Loader::IdentifyFile(file) : Loader::FileType::Unknown;
+    if (type == Loader::FileType::NX) {
+        const auto found = Loader::AppLoader_NX::ReadProgramPlatform(file, program_id);
+        return found && found->platform == 2 ? std::optional{found->program_id} : std::nullopt;
+    }
+    if (type == Loader::FileType::XCI || type == Loader::FileType::XCZ) {
+        const FileSys::XCI xci{file, program_id, program_index};
+        if (xci.GetStatus() != Loader::ResultStatus::Success) {
+            return std::nullopt;
+        }
+        const auto partition = xci.GetSecurePartitionNSP();
+        const auto program = partition != nullptr
+                                 ? partition->GetNCA(xci.GetProgramTitleID(),
+                                                     FileSys::ContentRecordType::Program)
+                                 : nullptr;
+        const auto exefs = program != nullptr ? program->GetExeFS() : nullptr;
+        const auto npdm = exefs != nullptr ? exefs->GetFile("main.npdm") : nullptr;
+        return Switch2ProgramId(metadata, npdm);
+    }
+    if (type == Loader::FileType::NSP || type == Loader::FileType::NSZ) {
+        const FileSys::NSP nsp{file, program_id, program_index};
+        if (nsp.GetStatus() != Loader::ResultStatus::Success) {
+            return std::nullopt;
+        }
+        auto exefs = nsp.GetExeFS();
+        if (!nsp.IsExtractedType()) {
+            const auto program =
+                nsp.GetNCA(nsp.GetProgramTitleID(), FileSys::ContentRecordType::Program);
+            exefs = program != nullptr ? program->GetExeFS() : nullptr;
+        }
+        const auto npdm = exefs != nullptr ? exefs->GetFile("main.npdm") : nullptr;
+        return Switch2ProgramId(metadata, npdm);
+    }
+    if (type == Loader::FileType::NCA) {
+        const FileSys::NCA nca{file};
+        const auto exefs = nca.GetStatus() == Loader::ResultStatus::Success ? nca.GetExeFS() : nullptr;
+        const auto npdm = exefs != nullptr ? exefs->GetFile("main.npdm") : nullptr;
+        return Switch2ProgramId(metadata, npdm);
+    }
+    const auto dir = file != nullptr ? file->GetContainingDirectory() : nullptr;
+    const auto npdm = dir != nullptr ? dir->GetFile("main.npdm") : nullptr;
+    return Switch2ProgramId(metadata, npdm);
+}
+
+struct System::Impl {
+    explicit Impl(System& system, Service::Account::ProfileStorage profile_storage)
+        : kernel{system}, fs_controller{system}, hid_core{kernel}, cpu_manager{system},
+          reporter{system, profile_storage == Service::Account::ProfileStorage::Scratch
+                               ? Reporter::FSAccessLogPolicy::Disabled
+                               : Reporter::FSAccessLogPolicy::Disk},
+          applet_manager{system}, frontend_applets{system},
+          profile_manager{std::make_shared<Service::Account::ProfileManager>(profile_storage)} {}
+
+    u64 program_id;
+
+    bool Initialize(System& system) {
+        try {
+            device_memory.emplace();
+        } catch (const std::bad_alloc&) {
+            LOG_CRITICAL(Core, "Failed to allocate guest memory");
+        }
+        if (device_memory && !device_memory->buffer.BackingBasePointer()) {
+            device_memory.reset();
+        }
+
+        is_multicore = Settings::values.use_multi_core.GetValue();
+        memory_layout = Settings::values.memory_layout_mode.GetValue();
+
+        core_timing.SetMulticore(is_multicore);
+        core_timing.Initialize([&system]() { system.RegisterHostThread(); });
+
+        // Create a default fs if one doesn't already exist.
+        if (virtual_filesystem == nullptr) {
+            virtual_filesystem = std::make_shared<FileSys::RealVfsFilesystem>();
+        }
+        if (content_provider == nullptr) {
+            content_provider = std::make_unique<FileSys::ContentProviderUnion>();
+        }
+
+        // Create default implementations of applets if one is not provided.
+        frontend_applets.SetDefaultAppletsIfMissing();
+
+        auto const is_async_gpu = Settings::values.use_asynchronous_gpu_emulation.GetValue();
+
+        kernel.SetMulticore(is_multicore);
+        cpu_manager.SetMulticore(is_multicore);
+        cpu_manager.SetAsyncGpu(is_async_gpu);
+        return device_memory.has_value();
+    }
+
+    void ReinitializeIfNecessary(System& system) {
+        const bool must_reinitialize =
+            !device_memory.has_value() ||
+            is_multicore != Settings::values.use_multi_core.GetValue() ||
+            memory_layout != Settings::values.memory_layout_mode.GetValue();
+
+        if (!must_reinitialize) {
+            return;
+        }
+
+        LOG_DEBUG(Kernel, "Re-initializing");
+
+        is_multicore = Settings::values.use_multi_core.GetValue();
+        memory_layout = Settings::values.memory_layout_mode.GetValue();
+
+        Initialize(system);
+    }
+
+    void RefreshTime(System& system) {
+        if (!system.IsPoweredOn()) {
+            return;
+        }
+
+        // The settings and time services start on the emulated cores, which only run once the
+        // game has finished loading (shaders included). Waiting for them here froze the UI
+        // thread for the whole loading screen when settings were applied during it. If they
+        // are not up yet there is nothing to refresh: they read the current settings when
+        // they start.
+        auto& manager = system.ServiceManager();
+        auto settings_service =
+            manager.GetService<Service::Set::ISystemSettingsServer>("set:sys");
+        auto static_service_a =
+            manager.GetService<Service::Glue::Time::StaticService>("time:a");
+        auto static_service_s =
+            manager.GetService<Service::PSC::Time::StaticService>("time:s");
+        if (!settings_service || !static_service_a || !static_service_s) {
+            LOG_INFO(Core, "Time services not started yet, they will use the current settings");
+            return;
+        }
+
+        std::shared_ptr<Service::PSC::Time::SystemClock> user_clock;
+        static_service_a->GetStandardUserSystemClock(&user_clock);
+
+        std::shared_ptr<Service::PSC::Time::SystemClock> local_clock;
+        static_service_a->GetStandardLocalSystemClock(&local_clock);
+
+        std::shared_ptr<Service::PSC::Time::SystemClock> network_clock;
+        static_service_s->GetStandardNetworkSystemClock(&network_clock);
+
+        std::shared_ptr<Service::Glue::Time::TimeZoneService> timezone_service;
+        static_service_a->GetTimeZoneService(&timezone_service);
+
+        Service::PSC::Time::LocationName name{};
+        auto new_name = Settings::GetTimeZoneString(Settings::values.time_zone_index.GetValue());
+        std::memcpy(name.data(), new_name.data(), (std::min)(name.size(), new_name.size()));
+
+        timezone_service->SetDeviceLocationName(name);
+
+        s64 time_offset = 0;
+        if (Settings::values.custom_rtc_enabled) {
+            time_offset = Settings::values.custom_rtc_offset.GetValue();
+        }
+
+        const auto posix_time = std::chrono::system_clock::now().time_since_epoch();
+        const s64 current_time =
+            std::chrono::duration_cast<std::chrono::seconds>(posix_time).count();
+        const s64 target_time = current_time + time_offset;
+        const u64 new_time = static_cast<u64>((std::max<s64>)(0, target_time));
+
+        Service::PSC::Time::SystemClockContext context{};
+        settings_service->SetUserSystemClockContext(context);
+        user_clock->SetCurrentTime(new_time);
+
+        local_clock->SetCurrentTime(new_time);
+
+        network_clock->GetSystemClockContext(&context);
+        settings_service->SetNetworkSystemClockContext(context);
+        network_clock->SetCurrentTime(new_time);
+    }
+
+    void Run() {
+        std::unique_lock<std::mutex> lk(suspend_guard);
+
+        kernel.SuspendEmulation(false);
+        core_timing.SyncPause(false);
+        is_paused.store(false, std::memory_order_relaxed);
+    }
+
+    void Pause() {
+        std::unique_lock<std::mutex> lk(suspend_guard);
+
+        core_timing.SyncPause(true);
+        kernel.SuspendEmulation(true);
+        is_paused.store(true, std::memory_order_relaxed);
+    }
+
+    bool IsPaused() const {
+        return is_paused.load(std::memory_order_relaxed);
+    }
+
+    std::unique_lock<std::mutex> StallApplication() {
+        std::unique_lock<std::mutex> lk(suspend_guard);
+        kernel.SuspendEmulation(true);
+        core_timing.SyncPause(true);
+        return lk;
+    }
+
+    void UnstallApplication() {
+        if (!IsPaused()) {
+            core_timing.SyncPause(false);
+            kernel.SuspendEmulation(false);
+        }
+    }
+
+    void SetNVDECActive(bool is_nvdec_active) {
+        nvdec_active = is_nvdec_active;
+    }
+
+    bool GetNVDECActive() {
+        return nvdec_active;
+    }
+
+    void InitializeDebugger(System& system, u16 port) {
+        debugger.emplace(system, port);
+    }
+
+    SystemResultStatus InitializeKernel(System& system) {
+        LOG_DEBUG(Core, "initialized OK");
+
+        // ShutdownMainProcess releases it after a Switch 2 game; create it before the check below
+        // so an empty slot alone does not rerun the full Initialize.
+        if (guest_memory_released) {
+            guest_memory_released = false;
+            try {
+                device_memory.emplace();
+            } catch (const std::bad_alloc&) {
+                LOG_CRITICAL(Core, "Failed to allocate guest memory");
+            }
+            if (device_memory && !device_memory->buffer.BackingBasePointer()) {
+                device_memory.reset();
+            }
+        }
+
+        // Setting changes may require a full system reinitialization (e.g., disabling multicore).
+        ReinitializeIfNecessary(system);
+        if (!device_memory) {
+            LOG_CRITICAL(Core, "Not enough host memory to start the guest kernel");
+            return SystemResultStatus::ErrorMemoryAllocation;
+        }
+        Kernel::Nx2ThreadStats::ReadSwitch();
+        Service::FileSystem::ReadTraceScope::ReadSwitch();
+        kernel.Initialize();
+        return SystemResultStatus::Success;
+    }
+
+    SystemResultStatus InitializeForGpuReplay(System& system, Frontend::EmuWindow& emu_window,
+                                              u64 replay_program_id) {
+        if (const auto result = InitializeKernel(system); result != SystemResultStatus::Success) {
+            return result;
+        }
+        host1x_core.emplace(system);
+        VideoCore::CreateGPU(gpu_core, emu_window, system);
+        if (!gpu_core) {
+            // As Load does: the kernel is up, and destroying it without its shutdown crashes.
+            ShutdownMainProcess();
+            return SystemResultStatus::ErrorVideoCore;
+        }
+        is_powered_on = true;
+        perf_stats.emplace(replay_program_id);
+        return SystemResultStatus::Success;
+    }
+
+    SystemResultStatus SetupForApplicationProcess(
+        System& system, Frontend::EmuWindow& emu_window,
+        std::shared_ptr<const Service::SystemDataView> isolated_system_data = {}) {
+        if (profile_manager->IsScratch() != (isolated_system_data != nullptr)) {
+            LOG_ERROR(Core, "Isolated system data and a scratch profile must be selected together");
+            return SystemResultStatus::ErrorSystemFiles;
+        }
+
+        std::shared_ptr<Service::Glue::Time::TimeZoneBinary> isolated_time_zone;
+        u64 isolated_process_id{};
+        if (isolated_system_data) {
+            constexpr u64 NativeHomeProgramId = 0x0400000000001000;
+            const auto* process = kernel.ApplicationProcess();
+            if (!process || !process->IsSwitch2() || process->IsApplication() ||
+                process->GetProgramId() != NativeHomeProgramId || process->GetProcessId() == 0) {
+                LOG_ERROR(Core, "Isolated system data requires the native HOME process");
+                return SystemResultStatus::ErrorSystemFiles;
+            }
+            isolated_process_id = process->GetProcessId();
+            isolated_time_zone = std::make_shared<Service::Glue::Time::TimeZoneBinary>(system);
+            const auto result = isolated_time_zone->Mount(isolated_system_data);
+            if (result.IsFailure()) {
+                LOG_ERROR(Core, "Cannot mount isolated time-zone data: {:#x}", result.raw);
+                return SystemResultStatus::ErrorSystemFiles;
+            }
+        }
+
+        host1x_core.emplace(system);
+        VideoCore::CreateGPU(gpu_core, emu_window, system);
+        if (!gpu_core)
+            return SystemResultStatus::ErrorVideoCore;
+
+        audio_core.emplace(system);
+
+        service_manager = std::make_shared<Service::SM::ServiceManager>(kernel);
+        services.emplace(service_manager, system, stop_event.get_token(),
+                         std::move(isolated_system_data), std::move(isolated_time_zone),
+                         isolated_process_id);
+
+        is_powered_on = true;
+        exit_locked = false;
+        exit_requested = false;
+
+        if (Settings::values.enable_renderdoc_hotkey) {
+            renderdoc_api.emplace();
+        }
+
+        LOG_DEBUG(Core, "Initialized OK");
+
+        return SystemResultStatus::Success;
+    }
+
+    SystemResultStatus Load(System& system, Frontend::EmuWindow& emu_window, const std::string& filepath, Service::AM::FrontendAppletParameters& params) {
+        if (profile_manager->IsScratch()) {
+            return SystemResultStatus::ErrorSystemFiles;
+        }
+
+        VideoCommon::StutterTrace::BootMarker("boot_start");
+        if (params.launch_type == Service::AM::LaunchType::FrontendInitiated) {
+            fs_controller.InitTempStorage();
+        }
+
+        const std::optional<u64> switch2_program_id =
+            virtual_filesystem != nullptr
+                ? FindSwitch2Program(GetGameFileFromPath(virtual_filesystem, filepath),
+                                     params.program_id, params.program_index)
+                : std::nullopt;
+        const bool switch2_program = switch2_program_id.has_value();
+        Kernel::KSystemControl::SetApplicationProgramId(switch2_program_id.value_or(0));
+        Settings::SetCurrentProgramIsSwitch2(switch2_program);
+        Settings::SetAstcRecompressionOverride(std::nullopt);
+        Network::LocalRedirect::Configure();
+
+        if (const auto ram = Common::GetHostRam();
+            switch2_program && Common::IsBelowSwitch2RamMinimum(ram)) {
+            using namespace Common::Literals;
+            LOG_WARNING(Core,
+                        "Low host RAM: {:.3g} GB {}; Switch 2 titles need at least 16 GB (32 GB "
+                        "recommended)",
+                        static_cast<f64>(ram.bytes) / f64{1_GiB},
+                        ram.installed ? "installed" : "usable");
+        }
+
+        // Switch 2 titles size their heap from the total memory and need the 12 GiB layout. Set it
+        // as a per-game value, so RestoreGlobalState brings back the configured layout afterwards.
+        if (switch2_program &&
+            Settings::values.memory_layout_mode.GetValue() != Settings::MemoryLayout::Memory_12Gb) {
+            LOG_INFO(Core, "Switch 2 program: using the 12 GiB memory layout");
+            Settings::values.memory_layout_mode.SetGlobal(false);
+            Settings::values.memory_layout_mode.SetValue(Settings::MemoryLayout::Memory_12Gb);
+        }
+
+        // The Switch 2 counter runs at 31.25 MHz and its SDK converts ticks with that constant
+        // (nn::os::GetSystemTickFrequency, TickManager::ConvertToTimeSpan/ConvertToTick). At 19.2 MHz
+        // every tick-based time in the game was off by 1.63x: elapsed times read short and a frame
+        // deadline in ticks waited ~27 ms. EDEN_NX2_CNTFRQ=<Hz> overrides it (A/B tests).
+        static const u64 forced_cntfrq = [] {
+            const char* value = std::getenv("EDEN_NX2_CNTFRQ");
+            return value != nullptr ? std::strtoull(value, nullptr, 10) : 0ULL;
+        }();
+        const u64 cntfrq = forced_cntfrq != 0 ? forced_cntfrq
+                           : switch2_program  ? Common::WallClock::Switch2CNTFRQ
+                                              : Common::WallClock::CNTFRQ;
+        Common::g_wall_clock.SetGuestCNTFRQ(cntfrq);
+        LOG_INFO(Core, "Guest counter frequency: {} Hz", cntfrq);
+        // The guest clocks derive from the host TSC calibration (or the OS clock). A wrong rate
+        // there skews every guest timer by a constant factor (#105), so record what was measured:
+        // tsc vs the CPUID base/max frequency is a sanity check at a glance.
+#ifdef ARCHITECTURE_x86_64
+        LOG_INFO(Core, "Host clock: tsc {} Hz, cpu base {} MHz, max {} MHz, invariant {}",
+                 Common::g_cpu_caps.tsc_frequency, Common::g_cpu_caps.base_frequency,
+                 Common::g_cpu_caps.max_frequency, Common::g_cpu_caps.invariant_tsc);
+#endif
+
+        const auto kernel_result = InitializeKernel(system);
+        if (kernel_result != SystemResultStatus::Success) {
+            return kernel_result;
+        }
+
+        if (params.applet_type == Service::AM::AppletType::Application) {
+            current_application_filepath = filepath;
+        }
+
+        const auto file = GetGameFileFromPath(virtual_filesystem, filepath);
+
+        // Create the application process
+        Loader::ResultStatus load_result{};
+        std::vector<u8> control;
+        auto process = Service::AM::CreateApplicationProcess(control, app_loader, load_result, system, file, params.program_id, params.program_index);
+        if (load_result != Loader::ResultStatus::Success) {
+            LOG_CRITICAL(Core, "Failed to load ROM (Error {})!", load_result);
+            // Its destructor finalizes the KProcess through the kernel: free it before the kernel
+            // shuts down, as a normal stop does.
+            process.reset();
+            ShutdownMainProcess();
+            return SystemResultStatus(u32(SystemResultStatus::ErrorLoader) + u32(load_result));
+        }
+
+        if (!app_loader) {
+            LOG_CRITICAL(Core, "Failed to obtain loader for {}!", filepath);
+            // The kernel is already initialized. Left running, it is destroyed with the global
+            // System after main() returns, when device memory is already gone, and exit crashes.
+            process.reset();
+            ShutdownMainProcess();
+            return SystemResultStatus::ErrorGetLoader;
+        }
+
+        if (app_loader->ReadProgramId(params.program_id) != Loader::ResultStatus::Success) {
+            LOG_ERROR(Core, "Failed to find program id for ROM!");
+        }
+
+        std::string name = "Unknown program";
+        if (app_loader->ReadTitle(name) != Loader::ResultStatus::Success) {
+            LOG_ERROR(Core, "Failed to read title for ROM!");
+        }
+
+        LOG_INFO(Core, "Loading {} ({:016X}) ...", name, params.program_id);
+
+        // Expose program id to dump sites and other global readers.
+        Settings::SetCurrentProgramID(params.program_id);
+
+        // Track launch time for frontend launches
+        LaunchTimestampCache::SaveLaunchTimestamp(params.program_id);
+
+        // Make the process created be the application
+        kernel.SetApplicationProcess(process->GetHandle());
+
+        // Set up the rest of the system.
+        SystemResultStatus init_result{SetupForApplicationProcess(system, emu_window)};
+        if (init_result != SystemResultStatus::Success) {
+            LOG_CRITICAL(Core, "Failed to initialize system (Error {})!", int(init_result));
+            process.reset();
+            ShutdownMainProcess();
+            return init_result;
+        }
+        // Waiting for GPU before initializing CPU
+        cpu_manager.Initialize();
+
+        // Initialize cheat engine
+        if (cheat_engine) {
+            cheat_engine->Initialize();
+        }
+
+        // Register with applet manager
+        // All threads are started, begin main process execution, now that we're in the clear
+        applet_manager.CreateAndInsertByFrontendAppletParameters(std::move(process), params);
+
+        if (Settings::values.gamecard_inserted) {
+            if (Settings::values.gamecard_current_game) {
+                fs_controller.SetGameCard(GetGameFileFromPath(virtual_filesystem, filepath));
+            } else if (!Settings::values.gamecard_path.GetValue().empty()) {
+                const auto& gamecard_path = Settings::values.gamecard_path.GetValue();
+                fs_controller.SetGameCard(GetGameFileFromPath(virtual_filesystem, gamecard_path));
+            }
+        }
+
+        perf_stats.emplace(params.program_id);
+        // Reset counters and set time origin to current frame
+        GetAndResetPerfStats();
+        perf_stats->BeginSystemFrame();
+
+        const FileSys::PatchManager pm(params.program_id, system.GetFileSystemController(), system.GetContentProvider());
+        auto const metadata = pm.GetControlMetadata();
+        std::string title_version = metadata.first != nullptr ? metadata.first->GetVersionString() : "";
+
+        if (app_loader->ReadProgramId(program_id) != Loader::ResultStatus::Success) {
+            LOG_ERROR(Core, "Failed to find program id for ROM");
+        }
+
+        GameSettings::LoadOverrides(program_id, gpu_core->Renderer());
+        if (auto room_member = Network::GetRoomMember().lock()) {
+            Network::GameInfo game_info;
+            game_info.name = name;
+            game_info.id = params.program_id;
+            game_info.version = title_version;
+            room_member->SendGameInfo(game_info);
+        }
+        VideoCore::Nx2Debug::BeginSession();
+        debug_service = Nx2Debug::MaybeStartService(system, name, params.program_id);
+        Nx2Sampler::StartFromEnvironment();
+        return SystemResultStatus::Success;
+    }
+
+    void ShutdownMainProcess() {
+        VideoCore::Nx2Debug::EndSession();
+        debug_service.reset();
+        SetShuttingDown(true);
+        Common::ADPF::Shutdown();
+
+        // Reset per-game flags
+        Settings::values.use_squashed_iterated_blend = false;
+
+        // The cheat VM runs on the timer thread, which keeps running through the teardown, and
+        // reads keys through the service manager and memory through the process. Freed below,
+        // they crashed it (a null ServiceManager at a stop, #1950). Its destructor waits for a
+        // run in progress.
+        cheat_engine.reset();
+
+        // Once powered off, services stop writing replies, so a guest thread whose IPC call
+        // completes would read its own request back and abort (2010-0212, a Userspace PANIC on
+        // every stop). Keep guest threads from running again first; the wait for running ones
+        // comes after the GPU has released any that it holds in host code.
+        kernel.RequestSuspendEmulation();
+        is_powered_on = false;
+        exit_locked = false;
+        exit_requested = false;
+        if (gpu_core)
+            gpu_core->NotifyShutdown();
+
+        stop_event.request_stop();
+        core_timing.SyncPause(false);
+        Network::CancelPendingSocketOperations();
+        kernel.SuspendEmulation(true);
+        if (service_manager) {
+            // Services on host threads that still wait for one on the guest cores give up (after
+            // a close during the boot shader load, the guest cores never started).
+            service_manager->Close();
+        }
+        kernel.CloseServices();
+        applet_manager.DropPendingProcess();
+        kernel.ShutdownCores();
+        // Each step done tells the frontend the teardown still moves (see
+        // Common::ShutdownProgress); the GPU's (pipeline caches) reports its own steps.
+        Common::NoteShutdownProgress();
+        services.reset();
+        service_manager.reset();
+        fs_controller.Reset();
+        core_timing.ClearPendingEvents();
+        app_loader.reset();
+        Common::NoteShutdownProgress();
+        audio_core.reset();
+        Common::NoteShutdownProgress();
+        gpu_core.reset();
+        Common::NoteShutdownProgress();
+        host1x_core.reset();
+        perf_stats.reset();
+        cpu_manager.Shutdown();
+        debugger.reset();
+        {
+            // The general channel's event is a kernel object made on first use. Left for ~Impl,
+            // it closed at exit() on a kernel already shut down (SIGSEGV in KAutoObject::Close).
+            // Its queued data stays for the next kernel, which remakes the event.
+            std::scoped_lock lk{general_channel_mutex};
+            general_channel_event.reset();
+            general_channel_context.reset();
+        }
+        kernel.Shutdown();
+        stop_event = {};
+        Network::RestartSocketOperations();
+
+        if (auto room_member = Network::GetRoomMember().lock()) {
+            Network::GameInfo game_info{};
+            room_member->SendGameInfo(game_info);
+        }
+
+        // Reset all glue registrations
+        arp_manager.ResetAll();
+
+        // The guest RAM section keeps every page the game touched until it is destroyed (up to
+        // 12 GiB), and the next Load reuses it. Switch 2 only: Switch 1 keeps its behaviour.
+        // InitializeKernel creates it again, sized for the next game.
+        if (Settings::CurrentProgramIsSwitch2()) {
+            device_memory.reset();
+            guest_memory_released = true;
+        }
+
+        LOG_DEBUG(Core, "Shutdown OK");
+    }
+
+    bool IsShuttingDown() const {
+        return is_shutting_down;
+    }
+
+    void SetShuttingDown(bool shutting_down) {
+        is_shutting_down = shutting_down;
+    }
+
+    Loader::ResultStatus GetGameName(std::string& out) const {
+        return app_loader ? app_loader->ReadTitle(out) : Loader::ResultStatus::ErrorNotInitialized;
+    }
+
+    PerfStatsResults GetAndResetPerfStats() {
+        if (!perf_stats) {
+            return {};
+        }
+        return perf_stats->GetAndResetStats(core_timing.GetGlobalTimeUs());
+    }
+
+    Timing::CoreTiming core_timing;
+    Kernel::KernelCore kernel;
+    /// RealVfsFilesystem instance
+    FileSys::VirtualFilesystem virtual_filesystem;
+    Service::FileSystem::FileSystemController fs_controller;
+    Core::HID::HIDCore hid_core;
+    CpuManager cpu_manager;
+    Reporter reporter;
+    /// Applets
+    Service::AM::AppletManager applet_manager;
+    Service::AM::Frontend::FrontendAppletHolder frontend_applets;
+    /// APM (Performance) services
+    Service::APM::Controller apm_controller{core_timing};
+    /// Service State
+    Service::Glue::ARPManager arp_manager;
+    std::shared_ptr<Service::Account::ProfileManager> profile_manager;
+    /// Network instance
+    Network::NetworkInstance network_instance;
+    Core::SpeedLimiter speed_limiter;
+    ExecuteProgramCallback execute_program_callback;
+    LaunchInNewSessionCallback launch_in_new_session_callback;
+    ExitCallback exit_callback;
+    ApplicationChangedCallback application_changed_callback;
+
+    std::optional<Service::Services> services;
+    std::optional<Core::Debugger> debugger;
+    std::optional<Service::KernelHelpers::ServiceContext> general_channel_context;
+    std::optional<Service::Event> general_channel_event;
+    std::optional<Core::PerfStats> perf_stats;
+    std::optional<Tegra::Host1x::Host1x> host1x_core;
+    std::optional<Core::DeviceMemory> device_memory;
+    bool guest_memory_released{};
+    std::optional<AudioCore::AudioCore> audio_core;
+    std::optional<Memory::CheatEngine> cheat_engine;
+    std::optional<Tools::Freezer> memory_freezer;
+    std::optional<Tools::RenderdocAPI> renderdoc_api;
+    std::optional<Tegra::GPU> gpu_core;
+
+    std::array<Core::GPUDirtyMemoryManager, Core::Hardware::NUM_CPU_CORES> gpu_dirty_memory_managers;
+    std::vector<std::vector<u8>> user_channel;
+    std::vector<std::vector<u8>> general_channel;
+
+    std::array<u64, Core::Hardware::NUM_CPU_CORES> dynarmic_ticks{};
+    std::array<u8, 0x20> build_id{};
+
+    std::string current_application_filepath;
+
+    /// Service manager
+    std::shared_ptr<Service::SM::ServiceManager> service_manager;
+    /// ContentProviderUnion instance
+    std::unique_ptr<FileSys::ContentProviderUnion> content_provider;
+    /// AppLoader used to load the current executing application
+    std::unique_ptr<Loader::AppLoader> app_loader;
+    std::stop_source stop_event;
+
+    mutable std::mutex suspend_guard;
+    std::mutex general_channel_mutex;
+    std::atomic_bool is_paused{};
+    std::atomic_bool is_shutting_down{};
+    std::atomic_bool is_powered_on{};
+    bool is_multicore : 1 = false;
+    Settings::MemoryLayout memory_layout{Settings::MemoryLayout::Memory_4Gb};
+    bool exit_locked : 1 = false;
+    bool exit_requested : 1 = false;
+    bool nvdec_active : 1 = false;
+    /// EDEN_NX2_DEBUG_SERVER; the last member, so it stops before anything it reads goes away.
+    std::unique_ptr<Nx2Debug::Service> debug_service;
+
+    void EnsureGeneralChannelInitialized(System& system) {
+        if (!general_channel_event) {
+            general_channel_context.emplace(system, "GeneralChannel");
+            general_channel_event.emplace(*general_channel_context);
+            if (!general_channel.empty()) {
+                general_channel_event->Signal(kernel);
+            }
+        }
+    }
+};
+
+System::System() : System{Service::Account::ProfileStorage::Shared} {}
+
+System::System(Service::Account::ProfileStorage profile_storage)
+    : impl{std::make_unique<Impl>(*this, profile_storage)} {}
+
+System::~System() = default;
+
+CpuManager& System::GetCpuManager() {
+    return impl->cpu_manager;
+}
+
+const CpuManager& System::GetCpuManager() const {
+    return impl->cpu_manager;
+}
+
+bool System::Initialize() {
+    return impl->Initialize(*this);
+}
+
+void System::Run() {
+    impl->Run();
+}
+
+void System::Pause() {
+    impl->Pause();
+}
+
+bool System::IsPaused() const {
+    return impl->IsPaused();
+}
+
+void System::ShutdownMainProcess() {
+    impl->ShutdownMainProcess();
+}
+
+bool System::IsShuttingDown() const {
+    return impl->IsShuttingDown();
+}
+
+void System::SetShuttingDown(bool shutting_down) {
+    impl->SetShuttingDown(shutting_down);
+}
+
+void System::DetachDebugger() {
+    if (impl->debugger) {
+        impl->debugger->NotifyShutdown();
+    }
+}
+
+std::unique_lock<std::mutex> System::StallApplication() {
+    return impl->StallApplication();
+}
+
+void System::UnstallApplication() {
+    impl->UnstallApplication();
+}
+
+void System::SetNVDECActive(bool is_nvdec_active) {
+    impl->SetNVDECActive(is_nvdec_active);
+}
+
+bool System::GetNVDECActive() {
+    return impl->GetNVDECActive();
+}
+
+void System::InitializeDebugger() {
+    impl->InitializeDebugger(*this, Settings::values.gdbstub_port.GetValue());
+}
+
+SystemResultStatus System::InitializeForGpuReplay(Frontend::EmuWindow& emu_window,
+                                                  u64 program_id) {
+    return impl->InitializeForGpuReplay(*this, emu_window, program_id);
+}
+
+SystemResultStatus System::Load(Frontend::EmuWindow& emu_window, const std::string& filepath,
+                                Service::AM::FrontendAppletParameters& params) {
+    return impl->Load(*this, emu_window, filepath, params);
+}
+
+bool System::IsPoweredOn() const {
+    return impl->is_powered_on.load(std::memory_order::relaxed);
+}
+
+void System::PrepareReschedule(const u32 core_index) {
+    impl->kernel.PrepareReschedule(core_index);
+}
+
+size_t System::GetCurrentHostThreadID() const {
+    return impl->kernel.GetCurrentHostThreadID();
+}
+
+std::span<GPUDirtyMemoryManager> System::GetGPUDirtyMemoryManager() {
+    return impl->gpu_dirty_memory_managers;
+}
+
+void System::GatherGPUDirtyMemory(std::function<void(PAddr, size_t)>& callback) {
+    for (auto& manager : impl->gpu_dirty_memory_managers) {
+        manager.Gather(callback);
+    }
+}
+
+PerfStatsResults System::GetAndResetPerfStats() {
+    return impl->GetAndResetPerfStats();
+}
+
+Kernel::PhysicalCore& System::CurrentPhysicalCore() {
+    return impl->kernel.CurrentPhysicalCore();
+}
+
+const Kernel::PhysicalCore& System::CurrentPhysicalCore() const {
+    return impl->kernel.CurrentPhysicalCore();
+}
+
+/// Gets the global scheduler
+Kernel::GlobalSchedulerContext& System::GlobalSchedulerContext() {
+    return impl->kernel.GlobalSchedulerContext();
+}
+
+/// Gets the global scheduler
+const Kernel::GlobalSchedulerContext& System::GlobalSchedulerContext() const {
+    return impl->kernel.GlobalSchedulerContext();
+}
+
+Kernel::KProcess* System::ApplicationProcess() {
+    return impl->kernel.ApplicationProcess();
+}
+
+Core::DeviceMemory& System::DeviceMemory() {
+    return *impl->device_memory;
+}
+
+const Core::DeviceMemory& System::DeviceMemory() const {
+    return *impl->device_memory;
+}
+
+const Kernel::KProcess* System::ApplicationProcess() const {
+    return impl->kernel.ApplicationProcess();
+}
+
+Memory::Memory& System::ApplicationMemory() {
+    return impl->kernel.ApplicationProcess()->GetMemory();
+}
+
+const Core::Memory::Memory& System::ApplicationMemory() const {
+    return impl->kernel.ApplicationProcess()->GetMemory();
+}
+
+Tegra::GPU& System::GPU() {
+    return *impl->gpu_core;
+}
+
+const Tegra::GPU& System::GPU() const {
+    return *impl->gpu_core;
+}
+
+Tegra::Host1x::Host1x& System::Host1x() {
+    return *impl->host1x_core;
+}
+
+const Tegra::Host1x::Host1x& System::Host1x() const {
+    return *impl->host1x_core;
+}
+
+VideoCore::RendererBase& System::Renderer() {
+    return impl->gpu_core->Renderer();
+}
+
+const VideoCore::RendererBase& System::Renderer() const {
+    return impl->gpu_core->Renderer();
+}
+
+Kernel::KernelCore& System::Kernel() {
+    return impl->kernel;
+}
+
+const Kernel::KernelCore& System::Kernel() const {
+    return impl->kernel;
+}
+
+HID::HIDCore& System::HIDCore() {
+    return impl->hid_core;
+}
+
+const HID::HIDCore& System::HIDCore() const {
+    return impl->hid_core;
+}
+
+AudioCore::AudioCore& System::AudioCore() {
+    return *impl->audio_core;
+}
+
+const AudioCore::AudioCore& System::AudioCore() const {
+    return *impl->audio_core;
+}
+
+Timing::CoreTiming& System::CoreTiming() {
+    return impl->core_timing;
+}
+
+const Timing::CoreTiming& System::CoreTiming() const {
+    return impl->core_timing;
+}
+
+Core::PerfStats& System::GetPerfStats() {
+    return *impl->perf_stats;
+}
+
+const Core::PerfStats& System::GetPerfStats() const {
+    return *impl->perf_stats;
+}
+
+Core::SpeedLimiter& System::SpeedLimiter() {
+    return impl->speed_limiter;
+}
+
+const Core::SpeedLimiter& System::SpeedLimiter() const {
+    return impl->speed_limiter;
+}
+
+u64 System::GetApplicationProcessProgramID() const {
+    const auto* const process = impl->kernel.ApplicationProcess();
+    return process != nullptr ? process->GetProgramId() : 0;
+}
+
+u64 System::GetProgramIdForProcessId(u64 process_id) const {
+    auto process = impl->kernel.GetProcessByProcessId(process_id);
+    return process.IsNull() ? 0 : process->GetProgramId();
+}
+
+u64 System::ResolveCallerProgramId(u64 process_id) const {
+    if (const auto program_id = this->GetProgramIdForProcessId(process_id); program_id != 0) {
+        return program_id;
+    }
+
+    const auto fallback = this->GetApplicationProcessProgramID();
+    LOG_WARNING(Core,
+                "Could not resolve caller process_id={}, falling back to application {:016X}",
+                process_id, fallback);
+    return fallback;
+}
+
+Loader::ResultStatus System::GetGameName(std::string& out) const {
+    return impl->GetGameName(out);
+}
+
+Loader::AppLoader& System::GetAppLoader() {
+    return *impl->app_loader;
+}
+
+const Loader::AppLoader& System::GetAppLoader() const {
+    return *impl->app_loader;
+}
+
+void System::SetFilesystem(FileSys::VirtualFilesystem vfs) {
+    impl->virtual_filesystem = std::move(vfs);
+}
+
+FileSys::VirtualFilesystem System::GetFilesystem() const {
+    return impl->virtual_filesystem;
+}
+
+void System::RegisterCheatList(const std::vector<Memory::CheatEntry>& list,
+                               const std::array<u8, 32>& build_id, u64 main_region_begin,
+                               u64 main_region_size) {
+    impl->cheat_engine.emplace(*this, list, build_id);
+    impl->cheat_engine->SetMainMemoryParameters(main_region_begin, main_region_size);
+}
+
+void System::SetFrontendAppletSet(Service::AM::Frontend::FrontendAppletSet&& set) {
+    impl->frontend_applets.SetFrontendAppletSet(std::move(set));
+}
+
+Service::AM::Frontend::FrontendAppletHolder& System::GetFrontendAppletHolder() {
+    return impl->frontend_applets;
+}
+
+const Service::AM::Frontend::FrontendAppletHolder& System::GetFrontendAppletHolder() const {
+    return impl->frontend_applets;
+}
+
+Service::AM::AppletManager& System::GetAppletManager() {
+    return impl->applet_manager;
+}
+
+void System::SetContentProvider(std::unique_ptr<FileSys::ContentProviderUnion> provider) {
+    impl->content_provider = std::move(provider);
+}
+
+FileSys::ContentProvider& System::GetContentProvider() {
+    return *impl->content_provider;
+}
+
+const FileSys::ContentProvider& System::GetContentProvider() const {
+    return *impl->content_provider;
+}
+
+FileSys::ContentProviderUnion& System::GetContentProviderUnion() {
+    return *impl->content_provider;
+}
+
+const FileSys::ContentProviderUnion& System::GetContentProviderUnion() const {
+    return *impl->content_provider;
+}
+
+Service::FileSystem::FileSystemController& System::GetFileSystemController() {
+    return impl->fs_controller;
+}
+
+const Service::FileSystem::FileSystemController& System::GetFileSystemController() const {
+    return impl->fs_controller;
+}
+
+void System::RegisterContentProvider(FileSys::ContentProviderUnionSlot slot,
+                                     FileSys::ContentProvider* provider) {
+    impl->content_provider->SetSlot(slot, provider);
+}
+
+const Reporter& System::GetReporter() const {
+    return impl->reporter;
+}
+
+Service::Glue::ARPManager& System::GetARPManager() {
+    return impl->arp_manager;
+}
+
+const Service::Glue::ARPManager& System::GetARPManager() const {
+    return impl->arp_manager;
+}
+
+Service::APM::Controller& System::GetAPMController() {
+    return impl->apm_controller;
+}
+
+const Service::APM::Controller& System::GetAPMController() const {
+    return impl->apm_controller;
+}
+
+Service::Account::ProfileManager& System::GetProfileManager() {
+    return *impl->profile_manager;
+}
+
+const Service::Account::ProfileManager& System::GetProfileManager() const {
+    return *impl->profile_manager;
+}
+
+std::shared_ptr<Service::Account::ProfileManager> System::GetScratchProfileManager() const {
+    return impl->profile_manager->IsScratch() ? impl->profile_manager : nullptr;
+}
+
+void System::SetExitLocked(bool locked) {
+    impl->exit_locked = locked;
+}
+
+bool System::GetExitLocked() const {
+    return impl->exit_locked;
+}
+
+void System::SetExitRequested(bool requested) {
+    impl->exit_requested = requested;
+}
+
+bool System::GetExitRequested() const {
+    return impl->exit_requested;
+}
+
+void System::SetApplicationProcessBuildID(const CurrentBuildProcessID& id) {
+    impl->build_id = id;
+}
+
+const System::CurrentBuildProcessID& System::GetApplicationProcessBuildID() const {
+    return impl->build_id;
+}
+
+Service::SM::ServiceManager& System::ServiceManager() {
+    return *impl->service_manager;
+}
+
+const Service::SM::ServiceManager& System::ServiceManager() const {
+    return *impl->service_manager;
+}
+
+void System::RegisterCoreThread(std::size_t id) {
+    impl->kernel.RegisterCoreThread(id);
+}
+
+void System::RegisterHostThread() {
+    impl->kernel.RegisterHostThread();
+}
+
+bool System::IsMulticore() const {
+    return impl->is_multicore;
+}
+
+bool System::DebuggerEnabled() const {
+    return Settings::values.use_gdbstub.GetValue();
+}
+
+Core::Debugger& System::GetDebugger() {
+    return *impl->debugger;
+}
+
+const Core::Debugger& System::GetDebugger() const {
+    return *impl->debugger;
+}
+
+Tools::RenderdocAPI& System::GetRenderdocAPI() {
+    return *impl->renderdoc_api;
+}
+
+void System::RunServer(std::unique_ptr<Service::ServerManager>&& server_manager) {
+    return impl->kernel.RunServer(std::move(server_manager));
+}
+
+void System::RegisterExecuteProgramCallback(ExecuteProgramCallback&& callback) {
+    impl->execute_program_callback = std::move(callback);
+}
+
+void System::ExecuteProgram(std::size_t program_index) {
+    if (impl->execute_program_callback) {
+        impl->execute_program_callback(program_index);
+    } else {
+        LOG_CRITICAL(Core, "execute_program_callback must be initialized by the frontend");
+    }
+}
+
+void System::RegisterLaunchInNewSessionCallback(LaunchInNewSessionCallback&& callback) {
+    impl->launch_in_new_session_callback = std::move(callback);
+}
+
+bool System::LaunchInNewSession(u64 program_id) {
+    if (!impl->launch_in_new_session_callback) {
+        return false;
+    }
+    impl->launch_in_new_session_callback(program_id);
+    return true;
+}
+
+const std::string& System::GetCurrentApplicationFilePath() const {
+    return impl->current_application_filepath;
+}
+
+/// @brief Gets a reference to the user channel stack.
+/// It is used to transfer data between programs.
+std::vector<std::vector<u8>>& System::GetUserChannel() {
+    return impl->user_channel;
+}
+
+std::vector<std::vector<u8>>& System::GetGeneralChannel() {
+    return impl->general_channel;
+}
+
+void System::PushGeneralChannelData(std::vector<u8>&& data) {
+    std::scoped_lock lk{impl->general_channel_mutex};
+    impl->EnsureGeneralChannelInitialized(*this);
+    const bool was_empty = impl->general_channel.empty();
+    impl->general_channel.push_back(std::move(data));
+    if (was_empty) {
+        impl->general_channel_event->Signal(impl->kernel);
+    }
+}
+
+bool System::TryPopGeneralChannel(std::vector<u8>& out_data) {
+    std::scoped_lock lk{impl->general_channel_mutex};
+    if (impl->general_channel.empty()) {
+        return false;
+    }
+    impl->EnsureGeneralChannelInitialized(*this);
+    out_data = std::move(impl->general_channel.back());
+    impl->general_channel.pop_back();
+    if (impl->general_channel.empty()) {
+        impl->general_channel_event->Clear(impl->kernel);
+    }
+    return true;
+}
+
+Service::Event& System::GetGeneralChannelEvent() {
+    std::scoped_lock lk{impl->general_channel_mutex};
+    impl->EnsureGeneralChannelInitialized(*this);
+    return *impl->general_channel_event;
+}
+
+void System::RegisterExitCallback(ExitCallback&& callback) {
+    impl->exit_callback = std::move(callback);
+}
+
+void System::Exit() {
+    if (impl->exit_callback) {
+        impl->exit_callback();
+    } else {
+        LOG_CRITICAL(Core, "exit_callback must be initialized by the frontend");
+    }
+}
+
+void System::RegisterApplicationChangedCallback(ApplicationChangedCallback&& callback) {
+    impl->application_changed_callback = std::move(callback);
+}
+
+void System::NotifyApplicationChanged(u64 program_id) {
+    //LOG_DEBUG(Core, "Running application changed to {:016X}", program_id);
+
+    if (impl->gpu_core) {
+        impl->gpu_core->NotifyApplicationChanged(program_id);
+    }
+    if (impl->application_changed_callback) {
+        impl->application_changed_callback(program_id);
+    }
+}
+
+void System::ApplySettings() {
+    impl->RefreshTime(*this);
+
+    if (IsPoweredOn()) {
+        Renderer().RefreshBaseSettings();
+        // Frontends switch docked/handheld through the settings; let the running game know.
+        GetAppletManager().OperationModeChanged();
+    }
+}
+
+} // namespace Core

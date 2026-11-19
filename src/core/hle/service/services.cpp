@@ -1,0 +1,179 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#include "core/hle/service/services.h"
+
+#include <functional>
+#include <utility>
+
+#include "core/hle/service/acc/acc.h"
+#include "core/hle/service/am/am.h"
+#include "core/hle/service/aoc/addon_content_manager.h"
+#include "core/hle/service/apm/apm.h"
+#include "core/hle/service/audio/audio.h"
+#include "core/hle/service/bcat/bcat.h"
+#include "core/hle/service/bpc/bpc.h"
+#include "core/hle/service/btdrv/btdrv.h"
+#include "core/hle/service/btm/btm.h"
+#include "core/hle/service/caps/caps.h"
+#include "core/hle/service/erpt/erpt.h"
+#include "core/hle/service/es/es.h"
+#include "core/hle/service/eupld/eupld.h"
+#include "core/hle/service/fatal/fatal.h"
+#include "core/hle/service/fgm/fgm.h"
+#include "core/hle/service/filesystem/filesystem.h"
+#include "core/hle/service/friend/friend.h"
+#include "core/hle/service/glue/glue.h"
+#include "core/hle/service/grc/grc.h"
+#include "core/hle/service/gpio/gpio.h"
+#include "core/hle/service/hid/hid.h"
+#include "core/hle/service/ipc_helpers.h"
+#include "core/hle/service/i2c/i2c.h"
+#include "core/hle/service/jit/jit.h"
+#include "core/hle/service/lbl/lbl.h"
+#include "core/hle/service/ldn/ldn.h"
+#include "core/hle/service/ldr/ldr.h"
+#include "core/hle/service/lm/lm.h"
+#include "core/hle/service/mig/mig.h"
+#include "core/hle/service/mii/mii.h"
+#include "core/hle/service/mm/mm_u.h"
+#include "core/hle/service/mnpp/mnpp.h"
+#include "core/hle/service/ncm/ncm.h"
+#include "core/hle/service/nfc/nfc.h"
+#include "core/hle/service/nfp/nfp.h"
+#include "core/hle/service/ngc/ngc.h"
+#include "core/hle/service/nifm/nifm.h"
+#include "core/hle/service/nim/nim.h"
+#include "core/hle/service/npns/npns.h"
+#include "core/hle/service/ns/ns.h"
+#include "core/hle/service/nvdrv/nvdrv.h"
+#include "core/hle/service/nvnflinger/nvnflinger.h"
+#include "core/hle/service/olsc/olsc.h"
+#include "core/hle/service/omm/omm.h"
+#include "core/hle/service/pcie/pcie.h"
+#include "core/hle/service/pctl/pctl.h"
+#include "core/hle/service/pcv/pcv.h"
+#include "core/hle/service/pm/pm.h"
+#include "core/hle/service/prepo/prepo.h"
+#include "core/hle/service/psc/psc.h"
+#include "core/hle/service/ptm/ptm.h"
+#include "core/hle/service/ro/ro.h"
+#include "core/hle/service/service.h"
+#include "core/hle/service/set/settings.h"
+#include "core/hle/service/sm/sm.h"
+#include "core/hle/service/sockets/sockets.h"
+#include "core/hle/service/spl/spl_module.h"
+#include "core/hle/service/ssl/ssl.h"
+#include "core/hle/service/wlan/wlan.h"
+#include "core/hle/service/tma/tma.h"
+#include "core/hle/service/usb/usb.h"
+#include "core/hle/service/vi/vi.h"
+
+namespace Service {
+
+Services::Services(std::shared_ptr<SM::ServiceManager>& sm, Core::System& system,
+                   std::stop_token token,
+                   std::shared_ptr<const SystemDataView> isolated_system_data,
+                   std::shared_ptr<Glue::Time::TimeZoneBinary> isolated_time_zone,
+                   u64 isolated_process_id) {
+    auto& kernel = system.Kernel();
+
+    if (!isolated_system_data && isolated_process_id == 0) {
+        system.GetFileSystemController().CreateFactories(*system.GetFilesystem(), false);
+    }
+
+    // Just a quick C++ lesson
+    // Capturing lambdas will silently create new variables for the objects referenced via <ident> = <expr>
+    // and create a `auto&` sorts of for `&`; with all your usual reference shenanigans.
+    // Do not be confused, `std::function<>` will allocate into the heap and will do so most of the time
+    // The heap is where we'd expect our "stored" values to be placed at.
+    //
+    // Eventually we'd need a "heapless" solution so the overhead is nil - but again a good starting point
+    // is removing all the cold clones ;)
+
+    // BEGONE cold clones of lambdas, for I have merged you all into a SINGLE lambda instead of
+    // spamming lambdas like it's some kind of lambda calculus class
+    // audio and vi wait in sm for services from the guest cores: they are kept, and joined before
+    // the service manager is destroyed (see ~Services).
+    audio_worker = kernel.RunOnHostCoreProcess("audio", [&system] { Audio::LoopProcess(system); });
+    kernel.RunOnHostCoreProcess("FS", [&system, isolated_system_data, isolated_process_id] {
+        FileSystem::LoopProcess(system, isolated_system_data, isolated_process_id);
+    }).detach();
+    for (auto const& e : std::vector<std::pair<std::string_view, void (*)(Core::System&)>>{
+        {"ldn",        &LDN::LoopProcess},
+        {"nvservices", &Nvidia::LoopProcess},
+        {"bsdsocket",  &Sockets::LoopProcess},
+    })
+        kernel.RunOnHostCoreProcess(std::string(e.first), [&system, f = e.second] { f(system); }).detach();
+    vi_worker = kernel.RunOnHostCoreProcess("vi", [&, token] { VI::LoopProcess(system, token); });
+    // Avoid cold clones of lambdas -- succintly
+    for (auto& [name, run] :
+         std::vector<std::pair<std::string_view, std::function<void(Core::System&)>>>{
+        {"sm",         &SM::LoopProcess},
+        {"account",    &Account::LoopProcess},
+        {"am",         &AM::LoopProcess},
+        {"aoc",        &AOC::LoopProcess},
+        {"apm",        &APM::LoopProcess},
+        {"bcat",       &BCAT::LoopProcess},
+        {"bpc",        &BPC::LoopProcess},
+        {"btdrv",      &BtDrv::LoopProcess},
+        {"btm",        &BTM::LoopProcess},
+        {"capsrv",     &Capture::LoopProcess},
+        {"erpt",       &ERPT::LoopProcess},
+        {"es",         &ES::LoopProcess},
+        {"eupld",      &EUPLD::LoopProcess},
+        {"fatal",      &Fatal::LoopProcess},
+        {"fgm",        &FGM::LoopProcess},
+        {"friends",    &Friend::LoopProcess},
+        {"settings",   [isolated_system_data](Core::System& s) {
+                           Set::LoopProcess(s, isolated_system_data);
+                       }},
+        {"psc",        &PSC::LoopProcess},
+        {"glue",       [time_zone = std::move(isolated_time_zone)](Core::System& s) {
+                           Glue::LoopProcess(s, time_zone);
+                       }},
+        {"grc",        &GRC::LoopProcess},
+        {"hid",        &HID::LoopProcess},
+        {"jit",        &JIT::LoopProcess},
+        {"lbl",        &LBL::LoopProcess},
+        {"Loader",     &LDR::LoopProcess},
+        {"LogManager.Prod", &LM::LoopProcess},
+        {"mig",        &Migration::LoopProcess},
+        {"mii",        &Mii::LoopProcess},
+        {"mm",         &MM::LoopProcess},
+        {"mnpp",       &MNPP::LoopProcess},
+        {"NCM",        &NCM::LoopProcess},
+        {"nfc",        &NFC::LoopProcess},
+        {"nfp",        &NFP::LoopProcess},
+        {"ngc",        &NGC::LoopProcess},
+        {"nifm",       &NIFM::LoopProcess},
+        {"nim",        &NIM::LoopProcess},
+        {"nvnflinger", &Nvnflinger::LoopProcess},
+        {"npns",       &NPNS::LoopProcess},
+        {"ns",         [isolated_system_data](Core::System& s) {
+                           NS::LoopProcess(s, isolated_system_data.get());
+                       }},
+        {"olsc",       &OLSC::LoopProcess},
+        {"omm",        &OMM::LoopProcess},
+        {"pcie",       &PCIe::LoopProcess},
+        {"pctl",       &PCTL::LoopProcess},
+        {"pcv",        &PCV::LoopProcess},
+        {"prepo",      &PlayReport::LoopProcess},
+        {"ProcessManager", &PM::LoopProcess},
+        {"ptm",        &PTM::LoopProcess},
+        {"ro",         &RO::LoopProcess},
+        {"spl",        &SPL::LoopProcess},
+        {"ssl",        &SSL::LoopProcess},
+        {"wlan",       &WLAN::LoopProcess},
+        {"tma",        &TMA::LoopProcess},
+        {"usb",        &USB::LoopProcess},
+        {"i2c",        &I2C::LoopProcess},
+        {"gpio",        &GPIO::LoopProcess},
+    })
+        kernel.RunOnGuestCoreProcess(std::string(name),
+                                     [&system, loop = std::move(run)] { loop(system); });
+}
+
+} // namespace Service

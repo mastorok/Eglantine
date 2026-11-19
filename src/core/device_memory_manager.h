@@ -1,0 +1,345 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#pragma once
+
+#include <array>
+#include <atomic>
+#include <bit>
+#include <deque>
+#include <memory>
+#include <mutex>
+#include <source_location>
+#include <vector>
+#include <span>
+#include <unordered_map>
+
+#include "common/common_types.h"
+#include "common/range_mutex.h"
+#include "common/scratch_buffer.h"
+#include "common/thread_worker.h"
+#include "common/sparse_large_vector.h"
+
+namespace Core {
+
+constexpr size_t DEVICE_PAGEBITS = 12ULL;
+constexpr size_t DEVICE_PAGESIZE = 1ULL << DEVICE_PAGEBITS;
+constexpr size_t DEVICE_PAGEMASK = DEVICE_PAGESIZE - 1ULL;
+
+class DeviceMemory;
+
+namespace Memory {
+class Memory;
+}
+
+template <typename DTraits>
+struct DeviceMemoryManagerAllocator;
+
+struct Asid {
+    size_t id;
+};
+
+template <typename Traits>
+class DeviceMemoryManager {
+    using DeviceInterface = typename Traits::DeviceInterface;
+    using DeviceMethods = typename Traits::DeviceMethods;
+
+public:
+    DeviceMemoryManager(const DeviceMemory& device_memory);
+    ~DeviceMemoryManager();
+
+    static constexpr bool HAS_FLUSH_INVALIDATION = true;
+    static constexpr size_t AS_BITS = Traits::device_virtual_bits;
+
+    void BindInterface(DeviceInterface* device_inter);
+
+    /// Marks the memory behind [address, address + size) cold (Common::HostMemory::HintCold),
+    /// from a low-priority thread: data the host GPU has its own copy of, e.g. uploaded textures.
+    /// Only while the host is short of RAM (Common::IsHostLowOnMemory).
+    void HintCold(DAddr address, size_t size);
+
+    DAddr Allocate(size_t size);
+    void AllocateFixed(DAddr start, size_t size);
+    void Free(DAddr start, size_t size);
+
+    void Map(DAddr address, VAddr virtual_address, size_t size, Asid asid, bool track = false);
+
+    void Unmap(DAddr address, size_t size);
+
+    /// Device pages without memory that keep the bytes written to them until Map gives them
+    /// memory, which then holds those bytes (a Switch 2 sparse block waiting for its memory).
+    /// Reads see the kept bytes meanwhile; Unmap drops them.
+    void KeepWrites(DAddr address, size_t size);
+    /// Read or write [address, +size) when it has kept pages (or pages mapped meanwhile): mapped
+    /// pages as usual, the others from the kept bytes. False, doing nothing that counts, when it
+    /// has neither.
+    bool ReadKept(DAddr address, void* dest_pointer, size_t size);
+    bool WriteKept(DAddr address, const void* src_pointer, size_t size);
+
+    void TrackContinuityImpl(DAddr address, VAddr virtual_address, size_t size, Asid asid);
+    void TrackContinuity(DAddr address, VAddr virtual_address, size_t size, Asid asid) {
+        std::scoped_lock lk(mapping_guard);
+        TrackContinuityImpl(address, virtual_address, size, asid);
+    }
+
+    /// Changes whenever Map or Unmap ran: host pointers GetPointer returned before are only good
+    /// while it stays the same.
+    [[nodiscard]] u64 TranslationGeneration() const noexcept {
+        return translation_generation.load(std::memory_order_acquire);
+    }
+
+    // Write / Read
+    template <typename T>
+    T* GetPointer(DAddr address);
+
+    template <typename T>
+    const T* GetPointer(DAddr address) const;
+
+    template <typename Func>
+    void ApplyOpOnPAddr(PAddr address, Common::ScratchBuffer<u32>& buffer, Func&& operation) {
+        DAddr subbits = DAddr(address & page_mask);
+        const u32 base = compressed_device_addr[(address >> page_bits)];
+        if ((base >> MULTI_FLAG_BITS) == 0) [[likely]] {
+            const DAddr d_address = (DAddr(base) << page_bits) + subbits;
+            operation(d_address);
+            return;
+        }
+        InnerGatherDeviceAddresses(buffer, address);
+        for (u32 value : buffer) {
+            operation((DAddr(value) << page_bits) + subbits);
+        }
+    }
+
+    /// Whether p points into the emulated physical memory, the only memory with device addresses.
+    bool IsPhysicalPointer(const u8* p) const {
+        return (GetRawPhysicalAddr(p) >> page_bits) < compressed_device_addr.size();
+    }
+
+    template <typename Func>
+    void ApplyOpOnPointer(const u8* p, Common::ScratchBuffer<u32>& buffer, Func&& operation) {
+        PAddr address = GetRawPhysicalAddr<u8>(p);
+        ApplyOpOnPAddr(address, buffer, operation);
+    }
+
+    PAddr GetPhysicalRawAddressFromDAddr(DAddr address) const {
+        PAddr subbits = PAddr(address & page_mask);
+        auto paddr = tracked_entries[(address >> page_bits)].compressed_physical_ptr;
+        if (paddr == 0) {
+            return 0;
+        }
+        return (PAddr(paddr - 1) << page_bits) + subbits;
+    }
+
+    template <typename T>
+    void Write(DAddr address, T value);
+
+    template <typename T>
+    T Read(DAddr address) const;
+
+    u8* GetSpan(const DAddr src_addr, const std::size_t size);
+    const u8* GetSpan(const DAddr src_addr, const std::size_t size) const;
+
+    void ReadBlock(DAddr address, void* dest_pointer, size_t size,
+                   std::source_location caller = std::source_location::current());
+    void ReadBlockUnsafe(DAddr address, void* dest_pointer, size_t size,
+                         std::source_location caller = std::source_location::current());
+    void WriteBlock(DAddr address, const void* src_pointer, size_t size);
+    void WriteBlockUnsafe(DAddr address, const void* src_pointer, size_t size);
+
+    Asid RegisterProcess(Memory::Memory* memory);
+    void UnregisterProcess(Asid id);
+
+    /// Snapshot for unmapped-read reports: the process this device page was last mapped under
+    /// (Asid.id + 1, or 0 when no mapping was recorded). Lock-free and diagnostic-only: a stale
+    /// view would only change a log line.
+    [[nodiscard]] u32 MappingProvenanceForDiagnostics(DAddr address) const {
+        return mapping_asid_plus1.GetOrDefault(address >> page_bits)
+            .load(std::memory_order_acquire);
+    }
+
+    /// Snapshot for unmapped-read reports: how many processes are registered right now.
+    [[nodiscard]] size_t LiveProcessCountForDiagnostics() const {
+        return live_process_count.load(std::memory_order_acquire);
+    }
+
+    void UpdatePagesCachedCount(DAddr addr, size_t size, s32 delta);
+
+    // New batch API to update multiple ranges with a single lock acquisition.
+    void UpdatePagesCachedBatch(std::span<const std::pair<DAddr, size_t>> ranges, s32 delta);
+
+    /// Held by a thread from before it drops the lock it untracked pages under until it has
+    /// applied their count changes (RasterizerVulkan::OnCPUWrite). Unmap waits for every holder
+    /// after invalidating the range: a change applied once the page has no backing is lost, and
+    /// the page would keep its count and never be protected again.
+    void BeginDeferredCachedUpdates() {
+        deferred_cached_updates.fetch_add(1, std::memory_order_relaxed);
+    }
+    void EndDeferredCachedUpdates() {
+        deferred_cached_updates.fetch_sub(1, std::memory_order_release);
+    }
+
+    /// Traps the next guest CPU read of these pages, to learn which GPU writes the CPU reads.
+    void ArmReadTraps(DAddr addr, size_t size);
+
+private:
+    struct TranslationEntry {
+        DAddr guest_page{};
+        u8* host_ptr{};
+    };
+
+    /// A thread's last four page translations of one manager. Several threads read through
+    /// them (the GPU thread, the fencing thread, service threads): one cache shared by all was
+    /// cleared by Map on a service thread between the GPU thread's null check of an entry and
+    /// its use, and the GPU thread copied from address 0 (title 1 crashed every few minutes).
+    struct TranslationCache {
+        const void* owner{};
+        u64 generation{};
+        std::array<TranslationEntry, 4> slots{};
+        u32 cursor{};
+    };
+    static inline thread_local TranslationCache t_cache{};
+
+    /// This thread's translations, emptied when Map or Unmap ran since they were made.
+    TranslationCache& Translations() {
+        const u64 current = translation_generation.load(std::memory_order_acquire);
+        if (t_cache.owner != this || t_cache.generation != current) {
+            t_cache = TranslationCache{.owner = this, .generation = current};
+        }
+        return t_cache;
+    }
+
+    // Internal helper that performs the update assuming the caller already holds the necessary lock.
+    void UpdatePagesCachedCountNoLock(DAddr addr, size_t size, s32 delta);
+
+private:
+    static constexpr size_t device_virtual_bits = Traits::device_virtual_bits;
+    static constexpr size_t device_as_size = 1ULL << device_virtual_bits;
+    static constexpr size_t physical_min_bits = 32;
+    static constexpr size_t physical_max_bits = 35; // covers the 12 GiB layout plus nx2 graphics server memory
+    static constexpr size_t page_bits = 12;
+    static constexpr size_t page_size = 1ULL << page_bits;
+    static constexpr size_t page_mask = page_size - 1ULL;
+    static constexpr u32 physical_address_base = 1U << page_bits;
+    static constexpr u32 MULTI_FLAG_BITS = 31;
+    static constexpr u32 MULTI_FLAG = 1U << MULTI_FLAG_BITS;
+    static constexpr u32 MULTI_MASK = ~MULTI_FLAG;
+
+    template <typename T>
+    T* GetPointerFromRaw(PAddr addr) {
+        return reinterpret_cast<T*>(physical_base + addr);
+    }
+
+    template <typename T>
+    const T* GetPointerFromRaw(PAddr addr) const {
+        return reinterpret_cast<T*>(physical_base + addr);
+    }
+
+    template <typename T>
+    PAddr GetRawPhysicalAddr(const T* ptr) const {
+        return static_cast<PAddr>(reinterpret_cast<uintptr_t>(ptr) - physical_base);
+    }
+
+    void WalkBlock(const DAddr addr, const std::size_t size, auto on_unmapped, auto on_memory,
+                   auto increment);
+
+    void CutContinuityAt(size_t page);
+
+    void InnerGatherDeviceAddresses(Common::ScratchBuffer<u32>& buffer, PAddr address);
+
+    std::unique_ptr<DeviceMemoryManagerAllocator<Traits>> impl;
+
+    const uintptr_t physical_base;
+    const DeviceMemory* device_memory_ptr;
+    DeviceInterface* device_inter;
+    std::unique_ptr<Common::ThreadWorker> cold_hint_worker;
+
+    struct TrackedEntry {
+        VAddr cpu_backing_address;
+        u32 continuity_tracker;
+        u32 compressed_physical_ptr;
+    };
+    Common::SparseLargeVector<u32> compressed_device_addr;
+    Common::SparseLargeVector<TrackedEntry> tracked_entries;
+    /// Asid.id + 1 of the process the last Map of each device page was attributed to; 0 when no
+    /// mapping was recorded (also the value a never-committed page reads back as). Kept out of
+    /// TrackedEntry so that struct's element size stays a divisor of the host page size, which
+    /// SparseLargeVector::CommitRegion's page math assumes. Atomic because unmapped-read reports
+    /// snapshot it without mapping_guard while Map/Unmap write it holding that guard.
+    Common::SparseLargeVector<std::atomic<u32>> mapping_asid_plus1;
+
+    // Process memory interfaces
+
+    std::deque<size_t> id_pool;
+    std::deque<Memory::Memory*> registered_processes;
+    /// How many processes are registered right now. Atomic because unmapped-read reports read it
+    /// on the read thread while nvdrv session open/close register and unregister processes
+    /// without a lock shared with these reads.
+    std::atomic<size_t> live_process_count{0};
+
+    // Memory protection management
+
+    static constexpr size_t guest_max_as_bits = 39;
+    static constexpr size_t guest_as_size = 1ULL << guest_max_as_bits;
+    static constexpr size_t guest_mask = guest_as_size - 1ULL;
+    static constexpr size_t asid_start_bit = guest_max_as_bits;
+
+    std::pair<Asid, VAddr> ExtractCPUBacking(size_t page_index) {
+        auto content = tracked_entries[page_index].cpu_backing_address;
+        const VAddr address = content & guest_mask;
+        const Asid asid{static_cast<size_t>(content >> asid_start_bit)};
+        return std::make_pair(asid, address);
+    }
+
+    constexpr void InsertCPUBacking(size_t page_index, VAddr address, Asid asid) {
+        tracked_entries.GetUnchecked(page_index).cpu_backing_address = address | (asid.id << asid_start_bit);
+    }
+
+    /// Starts past every earlier manager's: one built where a destroyed one was must not match
+    /// the translations a thread kept for that one (Translations compares owner and generation).
+    static inline std::atomic<u64> next_generation_base{1};
+    /// Bumped by Map and Unmap
+    std::atomic<u64> translation_generation{next_generation_base.fetch_add(1ULL << 32)};
+    using CounterType = u8;
+    using CounterAtomicType = std::atomic_uint8_t;
+    static constexpr size_t subentries = 8 / sizeof(CounterType);
+    static constexpr size_t subentries_mask = subentries - 1;
+    static constexpr size_t subentries_shift =
+        std::countr_zero(sizeof(u64)) - std::countr_zero(sizeof(CounterType));
+    class CounterEntry final {
+    public:
+        CounterEntry() = default;
+
+        CounterAtomicType& Count(std::size_t page) {
+            return values[page & subentries_mask];
+        }
+
+        const CounterAtomicType& Count(std::size_t page) const {
+            return values[page & subentries_mask];
+        }
+
+    private:
+        std::array<CounterAtomicType, subentries> values{};
+    };
+    static_assert(sizeof(CounterEntry) == subentries * sizeof(CounterType),
+                  "CounterEntry should be 8 bytes!");
+
+    static constexpr size_t num_counter_entries =
+        (1ULL << (device_virtual_bits - page_bits)) / subentries;
+    using CachedPages = std::array<CounterEntry, num_counter_entries>;
+    std::unique_ptr<CachedPages> cached_pages;
+    Common::RangeMutex counter_guard;
+    std::mutex mapping_guard;
+    std::atomic<u32> deferred_cached_updates{};
+
+    /// Taken before mapping_guard. The pages KeepWrites keeps, by device page; null reads zero.
+    std::mutex kept_mutex;
+    std::atomic<size_t> kept_count{};
+    using KeptPage = std::array<u8, size_t{1} << page_bits>;
+    std::unordered_map<size_t, std::unique_ptr<KeptPage>> kept_pages;
+
+
+};
+
+} // namespace Core

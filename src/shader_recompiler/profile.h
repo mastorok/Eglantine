@@ -1,0 +1,146 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#pragma once
+
+#include "common/common_types.h"
+
+namespace Shader {
+
+enum class Stage : u32;
+
+struct Profile {
+    u32 supported_spirv{0x00010000};
+    bool unified_descriptor_binding{};
+    bool support_descriptor_aliasing{};
+    bool support_int8{};
+    bool support_uniform_and_storage_buffer_8bit{};
+    bool support_storage_buffer_8bit{};
+    bool support_int16{};
+    bool support_uniform_and_storage_buffer_16bit{};
+    bool support_storage_buffer_16bit{};
+    bool support_int64{};
+    bool support_vertex_instance_id{};
+    bool support_float_controls{};
+    bool support_separate_denorm_behavior{};
+    bool support_separate_rounding_mode{};
+    bool support_fp16_denorm_preserve{};
+    /// The device converts to fp16 with round-to-nearest-even when asked (RoundingModeRTE 16).
+    bool support_fp16_rounding_rte{};
+    /// fp16 and fp64 float controls must be set identically (independence 32_BIT_ONLY), and the
+    /// device supports the fp64 counterparts of the fp16 modes above.
+    bool fp16_float_controls_shared_with_fp64{};
+    /// fp16 float controls can differ from fp32 ones (neither independence is NONE).
+    bool fp16_float_controls_independent_of_fp32{};
+    bool support_fp64_rounding_rte{};
+    bool support_fp64_denorm_preserve{};
+    bool support_fp32_denorm_preserve{};
+    bool support_fp16_denorm_flush{};
+    bool support_fp32_denorm_flush{};
+    bool support_fp16_signed_zero_nan_preserve{};
+    bool support_fp32_signed_zero_nan_preserve{};
+    bool support_fp64_signed_zero_nan_preserve{};
+    bool support_explicit_workgroup_layout{};
+    bool support_workgroup_layout_8bit_access{};
+    bool support_workgroup_layout_16bit_access{};
+    bool support_shader_quad_control{};
+    bool support_quad_shuffles{};
+    bool support_vote{};
+    bool support_shuffle_relative{};
+    u32 supported_subgroup_stages{0x7F};
+    bool support_viewport_index_layer_non_geometry{};
+    bool support_viewport_mask{};
+    bool support_typeless_image_loads{};
+    bool support_demote_to_helper_invocation{};
+    bool support_int64_atomics{};
+    bool support_shared_int64_atomics{};
+    bool support_derivative_control{};
+    bool support_geometry_shader_passthrough{};
+    bool support_native_ndc{};
+    bool support_gl_nv_gpu_shader_5{};
+    bool support_gl_amd_gpu_shader_half_float{};
+    bool support_gl_texture_shadow_lod{};
+    bool support_gl_warp_intrinsics{};
+    bool support_gl_variable_aoffi{};
+    bool support_gl_sparse_textures{};
+    bool support_gl_derivative_control{};
+    bool support_scaled_attributes{};
+    bool support_multi_viewport{};
+    bool support_geometry_streams{};
+    bool support_sampled_image_array_nonuniform_indexing{};
+    bool support_storage_image_array_nonuniform_indexing{};
+    bool support_uniform_texel_buffer_array_nonuniform_indexing{};
+    bool support_storage_texel_buffer_array_nonuniform_indexing{};
+    /// Routed global memory accesses pick their storage buffer with OpSelect on a NonUniform
+    /// variable pointer instead of one branch per candidate buffer. NVIDIA's driver hangs on the
+    /// branch chain (#619). AMD lowers the NonUniform access to a waterfall loop, which spills in
+    /// vertex and mesh shaders that already use every register, so it keeps the chain.
+    bool select_global_memory_buffer{};
+
+    bool warp_size_potentially_larger_than_guest{};
+
+    bool lower_left_origin_mode{};
+    /// Fragment outputs have to be declared even if they are not written to avoid undefined values.
+    /// See Ori and the Blind Forest's main menu for reference.
+    bool need_declared_frag_colors{};
+    /// Prevents fast math optimizations that may cause inaccuracies
+    bool need_fastmath_off{};
+    /// Some GPU vendors use a different rounding precision when calculating texture pixel
+    /// coordinates with the 16.8 format in the ImageGather instruction than the Maxwell
+    /// architecture. Applying an offset does fix this mismatching rounding behaviour.
+    bool need_gather_subpixel_offset{};
+
+    /// OpFClamp is broken and OpFMax + OpFMin should be used instead
+    bool has_broken_spirv_clamp{};
+    /// The Position builtin needs to be wrapped in a struct when used as an input
+    bool has_broken_spirv_position_input{};
+    /// Offset image operands with an unsigned type do not work
+    bool has_broken_unsigned_image_offsets{};
+    /// Signed instructions with unsigned data types are misinterpreted
+    bool has_broken_signed_operations{};
+    /// Float controls break when fp16 is enabled
+    bool has_broken_fp16_float_controls{};
+    /// Shared memory limit for compute shaders in bytes (0 = unknown).
+    u32 max_compute_shared_memory_size{};
+    /// Declaring fp32 denorm flush to zero miscompiles on some drivers
+    bool has_broken_fp32_denorm_flush{};
+    /// Dynamic vec4 indexing is broken on some OpenGL drivers
+    bool has_gl_component_indexing_bug{};
+    /// The precise type qualifier is broken in the fragment stage of some drivers
+    bool has_gl_precise_bug{};
+    /// Some drivers do not properly support floatBitsToUint when used on cbufs
+    bool has_gl_cbuf_ftou_bug{};
+    /// Some drivers poorly optimize boolean variable references
+    bool has_gl_bool_ref_bug{};
+    /// Ignores SPIR-V ordered vs unordered using GLSL semantics
+    bool ignore_nan_fp_comparisons{};
+    /// Some drivers have broken support for OpVectorExtractDynamic on subgroup mask inputs
+    bool has_broken_spirv_subgroup_mask_vector_extract_dynamic{};
+    bool has_broken_spirv_subgroup_shuffle{};
+    bool has_broken_spirv_fragment_shuffle{};
+    /// The guest's HMMA.16816.F16 runs on a cooperative matrix, in compute shaders
+    bool support_cooperative_hmma{};
+    /// Without the above, HMMA runs on 16x16x16 cooperative matrices through shared memory
+    bool support_cooperative_hmma_16x16x16{};
+    u32 max_subgroup_size{};
+
+    u32 gl_max_compute_smem_size{};
+
+    /// Maxwell and earlier nVidia architectures have broken robust support
+    bool has_broken_robust{};
+    /// RADV before Mesa 26.2.5 keeps stale vertex user SGPR state when a mesh shader without the
+    /// grid size or draw index is bound, and the next mesh draw hangs the GPU (Mesa MR 45092).
+    /// Native mesh shaders read the grid size there so that RADV gives them that SGPR.
+    bool has_broken_mesh_user_sgprs{};
+
+    u64 min_ssbo_alignment{};
+    u32 max_user_clip_distances{};
+
+    bool SupportsSubgroupStage(Stage stage) const {
+        return (supported_subgroup_stages & (1u << static_cast<u32>(stage))) != 0;
+    }
+};
+
+} // namespace Shader

@@ -1,0 +1,1231 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#pragma once
+
+#include <algorithm>
+#include <array>
+#include <map>
+#include <memory>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "common/common_types.h"
+#include "common/settings_common.h"
+#include "common/settings_enums.h"
+#include "common/settings_input.h"
+#include "common/settings_setting.h"
+
+namespace Settings {
+
+const char* TranslateCategory(Settings::Category category);
+
+struct ResolutionScalingInfo {
+    u32 up_scale{1};
+    u32 down_shift{0};
+    f32 up_factor{1.0f};
+    f32 down_factor{1.0f};
+    bool active{};
+    bool downscale{};
+
+    s32 ScaleUp(s32 value) const {
+        if (value == 0) {
+            return 0;
+        }
+        return (std::max)((value * static_cast<s32>(up_scale)) >> static_cast<s32>(down_shift), 1);
+    }
+
+    u32 ScaleUp(u32 value) const {
+        if (value == 0U) {
+            return 0U;
+        }
+        return (std::max)((value * up_scale) >> down_shift, 1U);
+    }
+};
+
+#ifndef CANNOT_EXPLICITLY_INSTANTIATE
+// Instantiate the classes elsewhere (settings.cpp) to reduce compiler/linker work
+// TODO(crueter): Move new enums here
+#define SETTING(TYPE, RANGED) extern template class Setting<TYPE, RANGED>
+#define SWITCHABLE(TYPE, RANGED) extern template class SwitchableSetting<TYPE, RANGED>
+
+SETTING(AudioEngine, false);
+SETTING(bool, false);
+SETTING(int, false);
+SETTING(s32, false);
+SETTING(std::string, false);
+SETTING(std::string, false);
+SETTING(u16, false);
+SWITCHABLE(AnisotropyMode, true);
+SWITCHABLE(AntiAliasing, false);
+SWITCHABLE(OotAntiAliasing, false);
+SWITCHABLE(NvidiaDlssQuality, false);
+SWITCHABLE(NvidiaDlssPreset, false);
+SWITCHABLE(HdrMode, false);
+SWITCHABLE(HdrSwapchain, false);
+SWITCHABLE(AspectRatio, true);
+SWITCHABLE(AstcDecodeMode, true);
+SWITCHABLE(AstcRecompression, true);
+SWITCHABLE(AudioMode, true);
+SWITCHABLE(CpuBackend, true);
+SWITCHABLE(CpuAccuracy, true);
+SWITCHABLE(FullscreenMode, true);
+SWITCHABLE(GpuAccuracy, true);
+SWITCHABLE(Language, true);
+SWITCHABLE(MemoryLayout, true);
+SWITCHABLE(NvdecEmulation, false);
+SWITCHABLE(Region, true);
+SWITCHABLE(RendererBackend, true);
+SWITCHABLE(ScalingFilter, false);
+SWITCHABLE(SpirvOptimizeMode, true);
+SWITCHABLE(TimeZone, true);
+SETTING(VSyncMode, true);
+SWITCHABLE(bool, false);
+SWITCHABLE(int, false);
+SWITCHABLE(int, true);
+SWITCHABLE(s64, false);
+SWITCHABLE(u16, true);
+SWITCHABLE(u32, false);
+SWITCHABLE(u8, false);
+SWITCHABLE(u8, true);
+
+// Used in UISettings
+// TODO see if we can move this to uisettings.h
+SWITCHABLE(ConfirmStop, true);
+
+#undef SETTING
+#undef SWITCHABLE
+#endif
+
+/**
+ * The InputSetting class allows for getting a reference to either the global or custom members.
+ * This is required as we cannot easily modify the values of user-defined types within containers
+ * using the SetValue() member function found in the Setting class. The primary purpose of this
+ * class is to store an array of 10 PlayerInput structs for both the global and custom setting and
+ * allows for easily accessing and modifying both settings.
+ */
+template <typename Type>
+class InputSetting final {
+public:
+    InputSetting() = default;
+    explicit InputSetting(Type val) : Setting<Type>(val) {}
+    ~InputSetting() = default;
+    void SetGlobal(bool to_global) {
+        use_global = to_global;
+    }
+    [[nodiscard]] bool UsingGlobal() const {
+        return use_global;
+    }
+    [[nodiscard]] Type& GetValue(bool need_global = false) {
+        if (use_global || need_global) {
+            return global;
+        }
+        return custom;
+    }
+
+private:
+    bool use_global{true}; ///< The setting's global state
+    Type global{};         ///< The setting
+    Type custom{};         ///< The custom setting value
+};
+
+struct TouchFromButtonMap {
+    std::string name;
+    std::vector<std::string> buttons;
+};
+
+struct Values {
+    Linkage linkage{};
+
+    // Applet
+    SwitchableSetting<AppletMode> cabinet_applet_mode{linkage, AppletMode::LLE, "cabinet_applet_mode",
+                                            Category::LibraryApplet};
+    SwitchableSetting<AppletMode> controller_applet_mode{linkage, AppletMode::HLE, "controller_applet_mode",
+                                               Category::LibraryApplet};
+    Setting<AppletMode> data_erase_applet_mode{linkage, AppletMode::HLE, "data_erase_applet_mode",
+                                               Category::LibraryApplet};
+    SwitchableSetting<AppletMode> error_applet_mode{linkage, AppletMode::LLE, "error_applet_mode",
+                                          Category::LibraryApplet};
+    Setting<AppletMode> net_connect_applet_mode{linkage, AppletMode::LLE, "net_connect_applet_mode",
+                                                Category::LibraryApplet};
+    SwitchableSetting<AppletMode> player_select_applet_mode{
+                                                  linkage, AppletMode::LLE, "player_select_applet_mode", Category::LibraryApplet};
+    SwitchableSetting<AppletMode> swkbd_applet_mode{linkage, AppletMode::HLE, "swkbd_applet_mode",
+                                          Category::LibraryApplet};
+    SwitchableSetting<AppletMode> mii_edit_applet_mode{linkage, AppletMode::LLE, "mii_edit_applet_mode",
+                                             Category::LibraryApplet};
+    SwitchableSetting<AppletMode> web_applet_mode{linkage, AppletMode::HLE, "web_applet_mode",
+                                        Category::LibraryApplet};
+    Setting<AppletMode> shop_applet_mode{linkage, AppletMode::HLE, "shop_applet_mode",
+                                         Category::LibraryApplet};
+    SwitchableSetting<AppletMode> photo_viewer_applet_mode{
+                                                 linkage, AppletMode::LLE, "photo_viewer_applet_mode", Category::LibraryApplet};
+    SwitchableSetting<AppletMode> offline_web_applet_mode{linkage, AppletMode::LLE, "offline_web_applet_mode",
+                                                Category::LibraryApplet};
+    Setting<AppletMode> login_share_applet_mode{linkage, AppletMode::HLE, "login_share_applet_mode",
+                                                Category::LibraryApplet};
+    Setting<AppletMode> wifi_web_auth_applet_mode{
+                                                  linkage, AppletMode::HLE, "wifi_web_auth_applet_mode", Category::LibraryApplet};
+    Setting<AppletMode> my_page_applet_mode{linkage, AppletMode::LLE, "my_page_applet_mode",
+                                            Category::LibraryApplet};
+    SwitchableSetting<bool> enable_overlay{linkage, false, "enable_overlay", Category::LibraryApplet};
+
+    // Audio
+    SwitchableSetting<AudioEngine> sink_id{linkage,
+#ifdef __ANDROID__
+                                           AudioEngine::Sdl3,
+#else
+                                           AudioEngine::Auto,
+#endif
+                                           "output_engine", Category::Audio, Specialization::RuntimeList};
+    SwitchableSetting<std::string> audio_output_device_id{
+                                                          linkage, "auto", "output_device", Category::Audio, Specialization::RuntimeList};
+    SwitchableSetting<std::string> audio_input_device_id{
+                                                         linkage, "auto", "input_device", Category::Audio, Specialization::RuntimeList};
+    SwitchableSetting<AudioMode, true> sound_index{
+                                                   linkage,       AudioMode::Stereo,
+                                                   "sound_index", Category::SystemAudio, Specialization::Default, true,
+                                                   true};
+    SwitchableSetting<u8, true> volume{linkage,
+                                       100,
+                                       0,
+                                       200,
+                                       "volume",
+                                       Category::Audio,
+                                       Specialization::Scalar | Specialization::Percentage,
+                                       true,
+                                       true};
+    Setting<bool, false> audio_muted{
+                                     linkage, false, "audio_muted", Category::Audio, Specialization::Default, true, true};
+    Setting<bool, false> dump_audio_commands{
+                                             linkage, false, "dump_audio_commands", Category::Audio, Specialization::Default, false};
+
+    Setting<u16, true> microphone_volume{linkage, 100, 0, 200, "microphone_volume",
+                                        Category::Controls};
+
+    // Core
+    SwitchableSetting<bool> use_multi_core{linkage, true, "use_multi_core", Category::Core};
+    SwitchableSetting<MemoryLayout, true> memory_layout_mode{linkage,
+                                                             MemoryLayout::Memory_4Gb,
+                                                             "memory_layout_mode",
+                                                             Category::Core,
+                                                             Specialization::Default,
+                                                             true};
+    SwitchableSetting<bool> use_speed_limit{
+                                            linkage, true, "use_speed_limit", Category::Core, Specialization::Paired, true, true};
+
+    SwitchableSetting<u16, true> speed_limit{linkage,
+                                             100,
+                                             0,
+                                             9999,
+                                             "speed_limit",
+                                             Category::Core,
+                                             Specialization::Countable | Specialization::Percentage,
+                                             true,
+                                             true,
+                                             &use_speed_limit};
+
+    SwitchableSetting<u16, true> slow_speed_limit{linkage,
+                                             50,
+                                             0,
+                                             9999,
+                                             "slow_speed_limit",
+                                             Category::Core,
+                                             Specialization::Countable | Specialization::Percentage,
+                                             true,
+                                             true};
+
+    SwitchableSetting<u16, true> turbo_speed_limit{linkage,
+                                             200,
+                                             0,
+                                             9999,
+                                             "turbo_speed_limit",
+                                             Category::Core,
+                                             Specialization::Countable | Specialization::Percentage,
+                                             true,
+                                             true};
+
+    // The currently used speed mode.
+    Setting<SpeedMode> current_speed_mode{linkage, SpeedMode::Standard, "current_speed_mode", Category::Core, Specialization::Default, false, true};
+
+    SwitchableSetting<bool> sync_core_speed{linkage, false, "sync_core_speed", Category::Core,
+                                            Specialization::Default};
+
+    // Cpu
+    SwitchableSetting<CpuBackend, true> cpu_backend{linkage,
+#ifdef HAS_NCE
+                                                    CpuBackend::Nce,
+#else
+                                                    CpuBackend::Dynarmic,
+#endif
+                                                    CpuBackend::Dynarmic,
+#ifdef HAS_NCE
+                                                    CpuBackend::Nce,
+#else
+                                                    CpuBackend::Dynarmic,
+#endif
+                                                    "cpu_backend",
+                                                    Category::Cpu};
+    SwitchableSetting<CpuAccuracy, true> cpu_accuracy{linkage, CpuAccuracy::Auto,
+                                                      "cpu_accuracy", Category::Cpu};
+    SwitchableSetting<CpuClock> cpu_clock{linkage,
+                                              CpuClock::Normal,
+                                              "fast_cpu_time",
+                                              Category::System,
+                                              Specialization::Default,
+                                              true,
+                                              true};
+
+    SwitchableSetting<bool> use_custom_cpu_ticks{linkage,
+                                                 false,
+                                                 "use_custom_cpu_ticks",
+                                                 Category::Cpu,
+                                                 Specialization::Paired,
+                                                 true,
+                                                 true};
+
+    SwitchableSetting<u32, true> cpu_ticks{linkage,
+                                           16000,
+                                           77,
+                                           65535,
+                                           "cpu_ticks",
+                                           Category::Cpu,
+                                           Specialization::Countable,
+                                           true,
+                                           true,
+                                           &use_custom_cpu_ticks};
+
+    Setting<bool> cpuopt_page_tables{linkage, true, "cpuopt_page_tables", Category::CpuDebug};
+    Setting<bool> cpuopt_block_linking{linkage, true, "cpuopt_block_linking", Category::CpuDebug};
+    Setting<bool> cpuopt_return_stack_buffer{linkage, true, "cpuopt_return_stack_buffer",
+                                             Category::CpuDebug};
+    Setting<bool> cpuopt_fast_dispatcher{linkage, true, "cpuopt_fast_dispatcher",
+                                         Category::CpuDebug};
+    Setting<bool> cpuopt_context_elimination{linkage, true, "cpuopt_context_elimination",
+                                             Category::CpuDebug};
+    Setting<bool> cpuopt_const_prop{linkage, true, "cpuopt_const_prop", Category::CpuDebug};
+    Setting<bool> cpuopt_misc_ir{linkage, true, "cpuopt_misc_ir", Category::CpuDebug};
+    Setting<bool> cpuopt_reduce_misalign_checks{linkage, true, "cpuopt_reduce_misalign_checks",
+                                                Category::CpuDebug};
+    SwitchableSetting<bool> cpuopt_fastmem{linkage, true, "cpuopt_fastmem", Category::CpuDebug};
+    SwitchableSetting<bool> cpuopt_fastmem_exclusives{linkage, true, "cpuopt_fastmem_exclusives",
+                                                      Category::CpuDebug};
+    Setting<bool> cpuopt_recompile_exclusives{linkage, true, "cpuopt_recompile_exclusives",
+                                              Category::CpuDebug};
+    Setting<bool> cpuopt_ignore_memory_aborts{linkage, true, "cpuopt_ignore_memory_aborts",
+                                              Category::CpuDebug};
+
+    SwitchableSetting<bool> cpuopt_unsafe_host_mmu{linkage,
+#if !defined(__APPLE__) && !defined(__linux__) && !defined(__ANDROID__) && !defined(_WIN32)
+                                        false,
+#else
+                                        true,
+#endif
+                                        "cpuopt_unsafe_host_mmu",
+                                        Category::CpuUnsafe};
+    SwitchableSetting<bool> cpuopt_unsafe_unfuse_fma{linkage, true, "cpuopt_unsafe_unfuse_fma",
+                                                     Category::CpuUnsafe};
+    SwitchableSetting<bool> cpuopt_unsafe_reduce_fp_error{
+                                                          linkage, true, "cpuopt_unsafe_reduce_fp_error", Category::CpuUnsafe};
+    SwitchableSetting<bool> cpuopt_unsafe_ignore_standard_fpcr{
+                                                               linkage, true, "cpuopt_unsafe_ignore_standard_fpcr", Category::CpuUnsafe};
+    SwitchableSetting<bool> cpuopt_unsafe_inaccurate_nan{
+                                                         linkage, true, "cpuopt_unsafe_inaccurate_nan", Category::CpuUnsafe};
+    SwitchableSetting<bool> cpuopt_unsafe_fastmem_check{
+                                                        linkage, true, "cpuopt_unsafe_fastmem_check", Category::CpuUnsafe};
+    SwitchableSetting<bool> cpuopt_unsafe_ignore_global_monitor{
+                                                                linkage, true, "cpuopt_unsafe_ignore_global_monitor", Category::CpuUnsafe};
+
+    // Renderer
+    // Off: the game always renders SDR. On: HDR whenever the surface offers an HDR format.
+    // Auto: HDR while the monitor showing the game runs in HDR, where the host can tell (Windows;
+    // elsewhere SDR). The game is told HDR only while the swapchain really presents HDR.
+    SwitchableSetting<HdrMode> hdr_mode{linkage, HdrMode::Off, "hdr_mode", Category::Renderer};
+    // HDR10: 10-bit PQ BT.2020 swapchain. scRGB: 16-bit float linear BT.709, for displays or
+    // drivers that band with 10-bit (reported on NVIDIA in fullscreen).
+    SwitchableSetting<HdrSwapchain> hdr_swapchain{linkage, HdrSwapchain::Hdr10, "hdr_swapchain",
+                                                  Category::Renderer};
+    SwitchableSetting<u16, true> hdr_reference_white{linkage, 0, 0, 1000, "hdr_reference_white",
+                                                  Category::Renderer, Specialization::Scalar};
+    SwitchableSetting<u16, true> hdr_peak_luminance{linkage, 0, 0, 10000, "hdr_peak_luminance",
+                                                 Category::Renderer, Specialization::Scalar};
+    SwitchableSetting<RendererBackend, true> renderer_backend{linkage,
+#if defined(__sun__) || defined(__managarm__)
+        RendererBackend::OpenGL_GLSL,
+#else
+        RendererBackend::Vulkan,
+#endif
+        "backend", Category::Renderer};
+    SwitchableSetting<u32> vulkan_device{linkage, 0, "vulkan_device", Category::Renderer, Specialization::RuntimeList};
+
+    // Graphics Settings
+    ResolutionScalingInfo resolution_info{};
+    SwitchableSetting<ResolutionSetup> resolution_setup{linkage, ResolutionSetup::Res1X,
+                                                        "resolution_setup", Category::Renderer};
+
+    SwitchableSetting<VSyncMode, true> vsync_mode{linkage,
+                                                  VSyncMode::Fifo,
+                                                  "use_vsync",
+                                                  Category::Renderer,
+                                                  Specialization::RuntimeList,
+                                                  true,
+                                                  true};
+
+    // Lichii: caps how often the game's own compositor presents, so the game itself is paced to
+    // this rate instead of only the display. 0 keeps the game's vblank and swap interval.
+    SwitchableSetting<u32, true> fps_limit{linkage,
+                                           0,
+                                           0,
+                                           480,
+                                           "fps_limit",
+                                           Category::Renderer,
+                                           Specialization::Countable,
+                                           true,
+                                           true};
+
+    SwitchableSetting<ScalingFilter> scaling_filter{linkage,
+                                                    ScalingFilter::ScaleForce,
+                                                    "scaling_filter",
+                                                    Category::Renderer,
+                                                    Specialization::Default,
+                                                    true,
+                                                    true};
+    // A Switch 2 game's own DLSS network (translated) in place of AMD FSR 3.1, where it runs and
+    // its output passes the checks.
+    SwitchableSetting<bool> game_dlss_network{linkage, false, "game_dlss_network",
+                                              Category::Renderer};
+    SwitchableSetting<int, true> fsr_sharpening_slider{linkage,
+#ifdef __ANDROID__
+                                                       0,
+#else
+                                                       25,
+#endif
+                                                       0,
+                                                       200,
+                                                       "fsr_sharpening_slider",
+                                                       Category::Renderer,
+                                                       Specialization::Scalar |
+                                                           Specialization::Percentage,
+                                                       true,
+                                                       true};
+    // Switch 2 VSync event rate. Games start frames on it, so above 60 only games with a
+    // real-time step (e.g. the Ocarina "FPS Unlock" built-in) keep their speed.
+    SwitchableSetting<u16, true> frame_rate_limit{linkage,
+                                                  60,
+                                                  30,
+                                                  240,
+                                                  "nx2_frame_rate_limit",
+                                                  Category::Renderer,
+                                                  Specialization::Scalar,
+                                                  true,
+                                                  false};
+    // NVIDIA DLSS (through NVIDIA Streamline) in place of a game's DLSS.
+    SwitchableSetting<bool> nvidia_dlss{linkage, false, "nvidia_dlss", Category::Renderer};
+    SwitchableSetting<NvidiaDlssQuality> nvidia_dlss_quality{linkage,
+                                                             NvidiaDlssQuality::Automatic,
+                                                             "nvidia_dlss_quality",
+                                                             Category::Renderer,
+                                                             Specialization::Default,
+                                                             true,
+                                                             true};
+    SwitchableSetting<NvidiaDlssPreset> nvidia_dlss_preset{linkage,
+                                                           NvidiaDlssPreset::M,
+                                                           "nvidia_dlss_preset",
+                                                           Category::Renderer,
+                                                           Specialization::Default,
+                                                           true,
+                                                           true};
+    SwitchableSetting<bool> ocarina_fsr{linkage, false, "ocarina_fsr", Category::Renderer};
+    // AMD FSR 4 in place of FSR 3.1 where FSR replaces a game's upscaler (Windows, AMD's driver).
+    SwitchableSetting<bool> amd_fsr4{linkage, false, "amd_fsr4", Category::Renderer};
+    SwitchableSetting<AspectRatio, true> aspect_ratio{linkage,
+                                                      AspectRatio::R16_9,
+                                                      "aspect_ratio",
+                                                      Category::Renderer,
+                                                      Specialization::Default,
+                                                      true,
+                                                      true};
+
+    SwitchableSetting<AntiAliasing> anti_aliasing{linkage,
+                                                  AntiAliasing::Fxaa,
+                                                  "anti_aliasing",
+                                                  Category::Renderer,
+                                                  Specialization::Default,
+                                                  true,
+                                                  true};
+    // The Legend of Zelda: Ocarina of Time's own anti-aliasing network and its sharpening output
+    // pass, or the tonemapped image as the game renders it (video_core/oot_network.h).
+    SwitchableSetting<OotAntiAliasing> oot_anti_aliasing{linkage, OotAntiAliasing::Game,
+                                                         "oot_anti_aliasing", Category::Renderer};
+
+    SwitchableSetting<std::string> post_shader_chain{linkage,
+                                                     std::string(),
+                                                     "post_shader_chain",
+                                                     Category::Renderer,
+                                                     Specialization::Default,
+                                                     true,
+                                                     true};
+
+    SwitchableSetting<std::string> post_shader_preset{linkage,
+                                                      std::string(),
+                                                      "post_shader_preset",
+                                                      Category::Renderer,
+                                                      Specialization::Default,
+                                                      true,
+                                                      true};
+
+    SwitchableSetting<bool> post_shader_enabled{linkage,
+                                                true,
+                                                "post_shader_enabled",
+                                                Category::Renderer,
+                                                Specialization::Default,
+                                                true,
+                                                true};
+
+    SwitchableSetting<bool> frame_gen{linkage, false, "frame_gen", Category::Renderer,
+                                      Specialization::Default, true, false};
+
+    SwitchableSetting<FrameGenType> frame_gen_type{linkage,
+                                                   FrameGenType::Fsr3,
+                                                   "frame_gen_type",
+                                                   Category::Renderer,
+                                                   Specialization::Default,
+                                                   true,
+                                                   false,
+                                                   &frame_gen};
+
+    SwitchableSetting<u32, true> frame_gen_multiplier{linkage,
+                                                      2,
+                                                      2,
+                                                      4,
+                                                      "frame_gen_multiplier",
+                                                      Category::Renderer,
+                                                      Specialization::Countable,
+                                                      true,
+                                                      false,
+                                                      &frame_gen};
+
+    SwitchableSetting<u32, true> frame_gen_target_rate{linkage,
+                                                       0,
+                                                       0,
+                                                       240,
+                                                       "frame_gen_target_rate",
+                                                       Category::Renderer,
+                                                       Specialization::Countable,
+                                                       true,
+                                                       true,
+                                                       &frame_gen};
+
+    SwitchableSetting<bool> frame_gen_flow_scale_auto{linkage,
+                                                      true,
+                                                      "frame_gen_flow_scale_auto",
+                                                      Category::Renderer,
+                                                      Specialization::Default,
+                                                      true,
+                                                      false,
+                                                      &frame_gen};
+
+    SwitchableSetting<u32, true> frame_gen_flow_scale{linkage,
+                                                      75,
+                                                      25,
+                                                      100,
+                                                      "frame_gen_flow_scale",
+                                                      Category::Renderer,
+                                                      Specialization::Countable |
+                                                          Specialization::Percentage,
+                                                      true,
+                                                      true,
+                                                      &frame_gen};
+
+    SwitchableSetting<u32, true> frame_gen_queue_target{linkage,
+                                                        0,
+                                                        0,
+                                                        2,
+                                                        "frame_gen_queue_target",
+                                                        Category::Renderer,
+                                                        Specialization::Countable,
+                                                        true,
+                                                        false,
+                                                        &frame_gen};
+
+    SwitchableSetting<bool> frame_gen_dump_flow{linkage, false, "frame_gen_dump_flow",
+                                                Category::Renderer};
+
+    SwitchableSetting<bool> use_asynchronous_gpu_emulation{linkage, true, "use_asynchronous_gpu_emulation",
+                                                           Category::Renderer};
+    // *nix platforms may have issues with the borderless windowed fullscreen mode.
+    // Default to exclusive fullscreen on these platforms for now.
+    SwitchableSetting<FullscreenMode, true> fullscreen_mode{linkage,
+#ifdef _WIN32
+                                                            FullscreenMode::Borderless,
+#else
+                                                            FullscreenMode::Exclusive,
+#endif
+                                                            "fullscreen_mode",
+                                                            Category::Renderer,
+                                                            Specialization::Default,
+                                                            true,
+                                                            true};
+
+    SwitchableSetting<u8, false> bg_red{
+                                        linkage, 0, "bg_red", Category::Renderer, Specialization::Default, true, true};
+    SwitchableSetting<u8, false> bg_green{
+                                          linkage, 0, "bg_green", Category::Renderer, Specialization::Default, true, true};
+    SwitchableSetting<u8, false> bg_blue{
+                                         linkage, 0, "bg_blue", Category::Renderer, Specialization::Default, true, true};
+
+    SwitchableSetting<GpuAccuracy, true> gpu_accuracy{linkage,
+#ifdef __ANDROID__
+                                                      GpuAccuracy::Low,
+#else
+                                                      GpuAccuracy::High,
+#endif
+                                                      "gpu_accuracy",
+                                                      Category::RendererAdvanced,
+                                                      Specialization::Default,
+                                                      true,
+                                                      true};
+
+    GpuAccuracy current_gpu_accuracy{GpuAccuracy::High};
+
+    SwitchableSetting<DmaAccuracy, true> dma_accuracy{linkage,
+                                                      DmaAccuracy::Default,
+                                                      "dma_accuracy",
+                                                      Category::RendererAdvanced,
+                                                      Specialization::Default,
+                                                      true,
+                                                      true};
+
+    SwitchableSetting<GpuFenceBehavior, true> gpu_fence_behavior{linkage,
+                                                                 GpuFenceBehavior::Default,
+                                                                 GpuFenceBehavior::Default,
+                                                                 GpuFenceBehavior::Accurate,
+                                                                 "gpu_fence_behavior",
+                                                                 Category::RendererAdvanced,
+                                                                 Specialization::Default,
+                                                                 true,
+                                                                 true};
+
+    // How much of a native (Switch 2) compute program's storage binding a dispatch marks
+    // GPU-written. Its pointer carries no size, so the binding is up to 8 MiB; marking all of it
+    // defers the CPU's later writes to those pages (Ocarina of Time's white leaves) and has fences
+    // copy them back. Auto: the extent the shader's stores provably reach (the whole binding when
+    // unknown). Full: the whole binding (the behaviour before the store extent).
+    SwitchableSetting<NativeComputeWriteMark, true> native_compute_write_mark{
+        linkage,
+        NativeComputeWriteMark::Auto,
+        "native_compute_write_mark",
+        Category::RendererAdvanced,
+        Specialization::Default,
+        true,
+        true};
+
+    SwitchableSetting<VramUsageMode, true> vram_usage_mode{linkage,
+                                                           VramUsageMode::Conservative,
+                                                           "vram_usage_mode",
+                                                           Category::RendererAdvanced};
+
+    SwitchableSetting<NvdecEmulation> nvdec_emulation{linkage, NvdecEmulation::Cpu,
+                                                      "nvdec_emulation", Category::RendererAdvanced};
+
+    SwitchableSetting<AnisotropyMode, true> max_anisotropy{linkage,
+#ifdef __ANDROID__
+                                                           AnisotropyMode::Default,
+#else
+                                                           AnisotropyMode::Automatic,
+#endif
+                                                           "max_anisotropy",
+                                                           Category::RendererAdvanced};
+    SwitchableSetting<AstcDecodeMode, true> accelerate_astc{linkage,
+                                                            AstcDecodeMode::Gpu,
+                                                            "accelerate_astc",
+                                                            Category::RendererAdvanced};
+
+    SwitchableSetting<FramePacingMode, true> frame_pacing_mode{linkage,
+                                                               FramePacingMode::Target_Auto,
+                                                               FramePacingMode::Target_Auto,
+                                                               FramePacingMode::Target_120,
+                                                               "frame_pacing_mode",
+                                                               Category::RendererAdvanced,
+                                                               Specialization::Default,
+                                                               true,
+                                                               true};
+
+    // BC3 by default: GPUs without ASTC otherwise keep ASTC textures as RGBA8, four times the
+    // VRAM (Mario Kart World: 7.3-7.8 GB of an 8 GB card, the rest paged into system RAM).
+    SwitchableSetting<AstcRecompression, true> astc_recompression{linkage,
+                                                                  AstcRecompression::Bc3,
+                                                                  "astc_recompression",
+                                                                  Category::RendererAdvanced};
+
+
+    SwitchableSetting<bool> sync_memory_operations{linkage,
+                                                   false,
+                                                   "sync_memory_operations",
+                                                   Category::RendererAdvanced,
+                                                   Specialization::Default,
+                                                   true,
+                                                   true};
+
+    SwitchableSetting<bool> renderer_force_max_clock{linkage, false, "force_max_clock",
+                                                     Category::RendererAdvanced};
+
+    SwitchableSetting<bool> use_disk_shader_cache{linkage, true, "use_disk_shader_cache",
+                                                  Category::RendererAdvanced};
+
+    SwitchableSetting<bool> use_vulkan_driver_pipeline_cache{
+        linkage, true, "use_vulkan_driver_pipeline_cache", Category::RendererAdvanced,
+        Specialization::Default};
+
+    SwitchableSetting<NativeAsyncDraws> native_async_draws{linkage,
+                                                           NativeAsyncDraws::Bounded,
+                                                           "native_async_draws",
+                                                           Category::RendererAdvanced,
+                                                           Specialization::Default,
+                                                           true,
+                                                           true};
+
+    SwitchableSetting<u32, true> native_pipeline_wait_ms{linkage,
+                                                         8,
+                                                         1,
+                                                         100,
+                                                         "native_pipeline_wait_ms",
+                                                         Category::RendererAdvanced,
+                                                         Specialization::Countable,
+                                                         true,
+                                                         true};
+
+    // Precache shaders before the game starts: the compute programs in the game files are built on
+    // the loading screen, so the driver's cache holds them before the game first uses them.
+    // Ask: the desktop app asks at launch while the game has no finished precache; where nothing
+    // asks, as Off.
+    SwitchableSetting<PrecacheShaders> precache_shaders{linkage,
+                                                        PrecacheShaders::Off,
+                                                        "precache_shaders",
+                                                        Category::RendererAdvanced,
+                                                        Specialization::Default,
+                                                        true,
+                                                        true};
+
+    // Build every cached graphics pipeline while the game loads, not only those recent sessions
+    // used, and keep them built, up to the pipelines kept in memory (a quarter of the RAM).
+    SwitchableSetting<bool> build_all_cached_shaders{linkage, false, "build_all_cached_shaders",
+                                                     Category::RendererAdvanced};
+
+    SwitchableSetting<bool> enable_compute_pipelines{linkage, false, "enable_compute_pipelines",
+                                                     Category::RendererAdvanced};
+
+    SwitchableSetting<bool> use_video_framerate{linkage, false, "use_video_framerate",
+                                                Category::RendererAdvanced};
+
+    // Mario Kart World: select a fixed or dynamic in-game frame-rate mode (loader/nso.cpp).
+    SwitchableSetting<bool> mkw_30fps{linkage, false, "mkw_30fps", Category::RendererAdvanced};
+    SwitchableSetting<bool> mkw_60fps{linkage, false, "mkw_60fps", Category::RendererAdvanced};
+    SwitchableSetting<bool> mkw_60fps_fallback{linkage, true, "mkw_60fps_fallback",
+                                               Category::RendererAdvanced};
+    SwitchableSetting<bool> mkw_dynamic_fps{linkage, false, "mkw_dynamic_fps",
+                                            Category::RendererAdvanced};
+
+    // Hyrule Warriors: Age of Imprisonment: 30 FPS at normal game speed while 60 can't be held,
+    // or always (core/hle/service/nx2_frame_interval.h).
+    SwitchableSetting<bool> hyrule_dynamic_fps{linkage, false, "hyrule_dynamic_fps",
+                                               Category::RendererAdvanced, Specialization::Default,
+                                               true, true};
+    SwitchableSetting<bool> hyrule_30fps{linkage, false, "hyrule_30fps", Category::RendererAdvanced,
+                                         Specialization::Default, true, true};
+
+    SwitchableSetting<bool> use_reactive_flushing{linkage,
+#ifdef __ANDROID__
+                                                  false,
+#else
+                                                  true,
+#endif
+                                                  "use_reactive_flushing",
+                                                  Category::RendererAdvanced};
+
+    SwitchableSetting<bool> barrier_feedback_loops{linkage, true, "barrier_feedback_loops",
+                                                   Category::RendererAdvanced};
+
+    SwitchableSetting<bool> enable_buffer_history{linkage,
+                                                  false,
+                                                  "enable_buffer_history",
+                                                  Category::RendererAdvanced,
+                                                  Specialization::Default,
+                                                  true,
+                                                  true};
+
+#ifdef __ANDROID__
+    SwitchableSetting<bool> use_optimized_vertex_buffers{linkage,
+                                                 false,
+                                                 "use_optimized_vertex_buffers",
+                                                 Category::RendererAdvanced,
+                                                 Specialization::Default,
+                                                 true,
+                                                 true};
+#endif
+
+    // Renderer Hacks //
+    SwitchableSetting<GpuClock> gpu_clock{linkage,
+                                          GpuClock::Boost,
+                                          "fast_gpu_time",
+                                          Category::System,
+                                          Specialization::Default,
+                                          true,
+                                          true};
+
+    SwitchableSetting<bool> skip_cpu_inner_invalidation{linkage,
+                                                        false,
+                                                        "skip_cpu_inner_invalidation",
+                                                        Category::RendererHacks,
+                                                        Specialization::Default,
+                                                        true,
+                                                        true};
+    SwitchableSetting<bool> async_presentation{linkage,
+#ifdef __ANDROID__
+                                               true,
+#else
+                                               false,
+#endif
+                                               "async_presentation", Category::RendererHacks};
+
+    SwitchableSetting<bool> fix_bloom_effects{linkage, false, "fix_bloom_effects",
+                                                     Category::RendererHacks};
+
+    SwitchableSetting<bool> emulate_bgr565{linkage, false, "emulate_bgr565",
+                                            Category::RendererHacks};
+
+    SwitchableSetting<bool> use_asynchronous_shaders{linkage, true, "use_asynchronous_shaders",
+                                                     Category::RendererHacks};
+
+    SwitchableSetting<GpuUnswizzleSize> gpu_unswizzle_texture_size{linkage,
+                                                  GpuUnswizzleSize::Large,
+                                                  "gpu_unswizzle_texture_size",
+                                                  Category::RendererHacks,
+                                                  Specialization::Default};
+
+    SwitchableSetting<GpuUnswizzle> gpu_unswizzle_stream_size{linkage,
+                                                  GpuUnswizzle::Medium,
+                                                  "gpu_unswizzle_stream_size",
+                                                  Category::RendererHacks,
+                                                  Specialization::Default};
+
+    SwitchableSetting<GpuUnswizzleChunk> gpu_unswizzle_chunk_size{linkage,
+                                                  GpuUnswizzleChunk::Medium,
+                                                  "gpu_unswizzle_chunk_size",
+                                                  Category::RendererHacks,
+                                                  Specialization::Default};
+
+    SwitchableSetting<bool> gpu_unswizzle_enabled{linkage, false, "gpu_unswizzle_enabled",
+                                                  Category::RendererHacks};
+
+    SwitchableSetting<bool> pin_gpu_threads{linkage, true, "pin_gpu_threads",
+                                            Category::RendererHacks};
+
+    SwitchableSetting<ExtendedDynamicState> dyna_state{linkage,
+#if defined(__ANDROID__)
+                                           ExtendedDynamicState::Disabled,
+#elif defined(__APPLE__)
+                                           ExtendedDynamicState::Disabled,
+#else
+                                           ExtendedDynamicState::EDS2,
+#endif
+                                           "dyna_state",
+                                           Category::RendererExtensions};
+
+    SwitchableSetting<u32, true> sample_shading{linkage,
+                                                0,
+                                                0,
+                                                100,
+                                                "sample_shading_fraction",
+                                                Category::RendererExtensions,
+                                                Specialization::Scalar};
+
+    SwitchableSetting<bool> vertex_input_dynamic_state{linkage,
+#ifdef __ANDROID__
+                                                       false,
+#else
+                                                       true,
+#endif
+                                                       "vertex_input_dynamic_state", Category::RendererExtensions};
+
+    SwitchableSetting<MeshShaderMode> mesh_shaders{linkage, MeshShaderMode::Automatic,
+                                                   "mesh_shaders", Category::RendererExtensions};
+
+    Setting<bool> renderer_debug{linkage, false, "debug", Category::RendererDebug};
+    Setting<bool> renderer_shader_feedback{linkage, false, "shader_feedback",
+                                           Category::RendererDebug};
+    Setting<bool> enable_nsight_aftermath{linkage, false, "nsight_aftermath",
+                                          Category::RendererDebug};
+    Setting<bool> disable_shader_loop_safety_checks{
+                                                    linkage, false, "disable_shader_loop_safety_checks", Category::RendererDebug};
+    Setting<bool> enable_renderdoc_hotkey{linkage, false, "renderdoc_hotkey",
+                                          Category::RendererDebug};
+#if defined(__ANDROID__) && defined(ARCHITECTURE_arm64)
+    // Debug override for automatic BCn patching detection
+    Setting<bool> patch_old_qcom_drivers{linkage, false, "patch_old_qcom_drivers",
+                                         Category::RendererDebug};
+#endif
+    SwitchableSetting<bool> disable_buffer_reorder{linkage, false, "disable_buffer_reorder",
+                                         Category::RendererDebug,
+                                         Specialization::Default,
+                                                         true,
+                                                         true};
+
+    // System
+    SwitchableSetting<Language, true> language_index{linkage,
+                                                     Language::EnglishAmerican,
+                                                     "language_index",
+                                                     Category::System};
+    SwitchableSetting<Region, true> region_index{linkage, Region::Usa, "region_index", Category::System};
+    SwitchableSetting<TimeZone, true> time_zone_index{linkage, TimeZone::Auto, "time_zone_index", Category::System};
+    Setting<u32> serial_battery{linkage, 0, "serial_battery", Category::Debugging};
+    Setting<u32> serial_unit{linkage, 0, "serial_unit", Category::Debugging};
+    // Measured in seconds since epoch
+    SwitchableSetting<bool> custom_rtc_enabled{linkage, false, "custom_rtc_enabled", Category::System, Specialization::Paired, true, true};
+    SwitchableSetting<s64> custom_rtc{
+                                      linkage, 0,    "custom_rtc",       Category::System, Specialization::Time,
+                                      false,   true, &custom_rtc_enabled};
+    SwitchableSetting<s64, true> custom_rtc_offset{linkage,
+                                                   0,
+                                                   (std::numeric_limits<s64>::min)(),
+                                                   (std::numeric_limits<s64>::max)(),
+                                                   "custom_rtc_offset",
+                                                   Category::System,
+                                                   Specialization::Countable,
+                                                   true,
+                                                   true};
+    SwitchableSetting<bool> rng_seed_enabled{
+                                             linkage, false, "rng_seed_enabled", Category::System, Specialization::Paired, true, true};
+    SwitchableSetting<u32> rng_seed{
+                                    linkage, 0,    "rng_seed",       Category::System, Specialization::Hex,
+                                    true,    true, &rng_seed_enabled};
+    Setting<std::string> device_name{
+        linkage, "Eden", "device_name", Category::System, Specialization::Default, true, true};
+
+    Setting<s32> current_user{linkage, 0, "current_user", Category::System};
+
+    SwitchableSetting<ConsoleMode> use_docked_mode{linkage,
+                                                   ConsoleMode::Handheld,
+                                                   "use_docked_mode",
+                                                   Category::System,
+                                                   Specialization::Radio,
+                                                   true,
+                                                   true};
+
+    // Controls
+    InputSetting<std::array<PlayerInput, 10>> players;
+    Setting<bool> disable_wgi_xinput{
+        linkage, false, "disable_wgi_xinput", Category::Controls, Specialization::Default,
+// Only read/write disable_wgi_xinput on Windows platforms
+#ifdef _WIN32
+        true
+#else
+        false
+#endif
+    };
+    Setting<bool> enable_raw_input{
+        linkage, false, "enable_raw_input", Category::Controls, Specialization::Default,
+// Only read/write enable_raw_input on Windows platforms
+#ifdef _WIN32
+        true
+#else
+        false
+#endif
+    };
+    Setting<bool> controller_navigation{linkage, true, "controller_navigation", Category::Controls};
+    Setting<bool> enable_joycon_driver{linkage, true, "enable_joycon_driver", Category::Controls};
+    Setting<bool> enable_procon_driver{linkage, false, "enable_procon_driver", Category::Controls};
+
+    SwitchableSetting<bool> vibration_enabled{linkage, true, "vibration_enabled",
+                                              Category::Controls};
+    SwitchableSetting<bool> enable_accurate_vibrations{linkage, false, "enable_accurate_vibrations",
+                                                       Category::Controls};
+    // Only tested on Windows so far; on Linux (PipeWire) the haptics play through the speaker
+    Setting<bool> enable_dualsense_haptics{linkage,
+#ifdef _WIN32
+                                           true,
+#else
+                                           false,
+#endif
+                                           "enable_dualsense_haptics", Category::Controls};
+    Setting<bool> rumble_frequency_mapping{linkage, false, "rumble_frequency_mapping",
+                                           Category::Controls};
+    // Percent of each side's light rumble also played on the trigger motors, where a controller
+    // has them; 0 is off
+    Setting<u8, true> trigger_rumble_strength{linkage, 0, 0, 100, "trigger_rumble_strength",
+                                              Category::Controls};
+
+    SwitchableSetting<bool> motion_enabled{linkage, true, "motion_enabled", Category::Controls};
+    Setting<std::string> udp_input_servers{linkage, "127.0.0.1:26760", "udp_input_servers",
+                                           Category::Controls};
+    Setting<bool> enable_udp_controller{linkage, false, "enable_udp_controller",
+                                        Category::Controls};
+
+    Setting<bool> pause_tas_on_load{linkage, true, "pause_tas_on_load", Category::Controls};
+    Setting<bool> tas_enable{linkage, false, "tas_enable", Category::Controls};
+    Setting<bool> tas_loop{linkage, false, "tas_loop", Category::Controls};
+    Setting<bool> tas_show_recording_dialog{linkage, true, "tas_show_recording_dialog", Category::Controls};
+
+    Setting<bool> mouse_panning{
+                                linkage, false, "mouse_panning", Category::Controls, Specialization::Default, false};
+    Setting<u8, true> mouse_panning_sensitivity{
+                                                linkage, 50, 1, 100, "mouse_panning_sensitivity", Category::Controls};
+    Setting<bool> mouse_enabled{linkage, false, "mouse_enabled", Category::Controls};
+
+    Setting<u8, true> mouse_panning_x_sensitivity{
+                                                  linkage, 50, 1, 100, "mouse_panning_x_sensitivity", Category::Controls};
+    Setting<u8, true> mouse_panning_y_sensitivity{
+                                                  linkage, 50, 1, 100, "mouse_panning_y_sensitivity", Category::Controls};
+    Setting<u8, true> mouse_panning_deadzone_counterweight{
+                                                           linkage, 20, 0, 100, "mouse_panning_deadzone_counterweight", Category::Controls};
+    Setting<u8, true> mouse_panning_decay_strength{
+                                                   linkage, 18, 0, 100, "mouse_panning_decay_strength", Category::Controls};
+    Setting<u8, true> mouse_panning_min_decay{
+                                              linkage, 6, 0, 100, "mouse_panning_min_decay", Category::Controls};
+
+    Setting<bool> emulate_analog_keyboard{linkage, false, "emulate_analog_keyboard",
+                                          Category::Controls};
+    Setting<bool> keyboard_enabled{linkage, false, "keyboard_enabled", Category::Controls};
+
+    Setting<bool> debug_pad_enabled{linkage, false, "debug_pad_enabled", Category::Controls};
+    ButtonsRaw debug_pad_buttons;
+    AnalogsRaw debug_pad_analogs;
+
+    TouchscreenInput touchscreen;
+
+    Setting<std::string> touch_device{linkage, "min_x:100,min_y:50,max_x:1800,max_y:850",
+                                      "touch_device", Category::Controls};
+    Setting<u32> touch_from_button_map_index{linkage, 0, "touch_from_button_map",
+                                             Category::Controls};
+    std::vector<TouchFromButtonMap> touch_from_button_maps;
+
+    Setting<bool> enable_ring_controller{linkage, true, "enable_ring_controller",
+                                         Category::Controls};
+    RingconRaw ringcon_analogs;
+
+    Setting<bool> enable_ir_sensor{linkage, false, "enable_ir_sensor", Category::Controls};
+    Setting<std::string> ir_sensor_device{linkage, "auto", "ir_sensor_device", Category::Controls};
+
+    Setting<bool> random_amiibo_id{linkage, false, "random_amiibo_id", Category::Controls};
+
+    // Data Storage
+    Setting<bool> use_virtual_sd{linkage, true, "use_virtual_sd", Category::DataStorage};
+    Setting<bool> gamecard_inserted{linkage, false, "gamecard_inserted", Category::DataStorage};
+    Setting<bool> gamecard_current_game{linkage, false, "gamecard_current_game",
+                                        Category::DataStorage};
+    Setting<std::string> gamecard_path{linkage, std::string(), "gamecard_path",
+                                       Category::DataStorage};
+    Setting<bool> ext_content_from_game_dirs{linkage, true, "ext_content_from_game_dirs",
+                                             Category::DataStorage};
+    std::vector<std::string> external_content_dirs;
+
+    // Debugging
+    bool record_frame_times;
+    Setting<bool> use_gdbstub{linkage, false, "use_gdbstub", Category::Debugging};
+    Setting<u16> gdbstub_port{linkage, 6543, "gdbstub_port", Category::Debugging};
+    SwitchableSetting<std::string> program_args{linkage,
+                                                std::string(),
+                                                "program_args",
+                                                Category::Debugging,
+                                                Specialization::Default,
+                                                true,    // save_ - persist in config file
+                                                false};  // runtime_modifiable_ - startup-only
+    Setting<bool> dump_exefs{linkage, false, "dump_exefs", Category::Debugging};
+    Setting<bool> dump_nso{linkage, false, "dump_nso", Category::Debugging};
+    Setting<bool> dump_guest_shaders{
+                               linkage, false, "dump_guest_shaders", Category::DebuggingGraphics, Specialization::Default,
+                               false};
+    Setting<bool> dump_macros{
+                              linkage, false, "dump_macros", Category::DebuggingGraphics, Specialization::Default, false};
+    Setting<bool> enable_fs_access_log{linkage, false, "enable_fs_access_log", Category::Debugging};
+    Setting<bool> reporting_services{
+                                     linkage, false, "reporting_services", Category::Debugging, Specialization::Default, false};
+    Setting<bool> quest_flag{linkage, false, "quest_flag", Category::Debugging};
+    Setting<bool> use_dev_keys{linkage, false, "use_dev_keys", Category::Debugging};
+    Setting<bool> disable_macro_jit{linkage, false, "disable_macro_jit",
+                                    Category::DebuggingGraphics};
+    Setting<bool> disable_macro_hle{linkage, false, "disable_macro_hle",
+                                    Category::DebuggingGraphics};
+    Setting<bool> extended_logging{
+                                   linkage, false, "extended_logging", Category::Debugging, Specialization::Default, false};
+    Setting<bool> use_debug_asserts{linkage, false, "use_debug_asserts", Category::Debugging};
+    Setting<bool> use_auto_stub{
+                                linkage, false, "use_auto_stub", Category::Debugging};
+    Setting<bool> enable_all_controllers{linkage, false, "enable_all_controllers",
+                                         Category::Debugging};
+    Setting<bool> perform_vulkan_check{linkage, true, "perform_vulkan_check", Category::Debugging};
+    Setting<bool> disable_web_applet{linkage, true, "disable_web_applet", Category::Debugging};
+
+    // GPU Logging
+    Setting<GpuLogLevel> gpu_log_level{linkage, GpuLogLevel::Off, "gpu_log_level",
+                                       Category::Debugging};
+    Setting<bool> gpu_log_vulkan_calls{linkage, true, "gpu_log_vulkan_calls", Category::Debugging};
+    Setting<bool> gpu_log_shader_dumps{linkage, false, "gpu_log_shader_dumps", Category::Debugging};
+    Setting<bool> gpu_log_memory_tracking{linkage, true, "gpu_log_memory_tracking",
+                                           Category::Debugging};
+    Setting<bool> gpu_log_driver_debug{linkage, true, "gpu_log_driver_debug", Category::Debugging};
+    Setting<s32> gpu_log_ring_buffer_size{linkage, 512, "gpu_log_ring_buffer_size",
+                                           Category::Debugging};
+
+    SwitchableSetting<u16, true> debug_knobs{linkage,
+                                           0,
+                                           0,
+                                           65535,
+                                           "debug_knobs",
+                                           Category::Debugging,
+                                           Specialization::Countable,
+                                           true,
+                                           true};
+
+    // Miscellaneous
+    Setting<std::string> log_filter{linkage, "*:Info", "log_filter", Category::Miscellaneous};
+    Setting<bool> log_flush_line{linkage, false, "flush_line", Category::Miscellaneous, Specialization::Default, true, true};
+    Setting<bool> censor_username{linkage, true, "censor_username", Category::Miscellaneous};
+    Setting<bool> first_launch{linkage, true, "first_launch", Category::Miscellaneous};
+    // The values the recommended settings (common/recommended_settings.h) replaced.
+    Setting<std::string> recommended_settings_backup{
+        linkage, {}, "recommended_settings_backup", Category::Miscellaneous};
+
+    // Network
+    Setting<std::string> network_interface{linkage, std::string(), "network_interface",
+                                           Category::Network};
+    SwitchableSetting<bool> airplane_mode{linkage, true, "airplane_mode", Category::Network};
+    Setting<bool> lan_play{linkage, false, "lan_play", Category::Network};
+    Setting<bool> nextendo_enabled{linkage, false, "nextendo_enabled", Category::Network};
+    // Replaces the current user's nickname and icon with the Nextendo account's.
+    Setting<bool> nextendo_sync_profile{linkage, false, "nextendo_sync_profile", Category::Network};
+    Setting<std::string> nextendo_server_ip{linkage, "51.178.29.194", "nextendo_server_ip",
+                                           Category::Network};
+    Setting<std::string> nextendo_nat_ip{linkage, "164.132.111.120", "nextendo_nat_ip",
+                                        Category::Network};
+    Setting<std::string> nextendo_client_id{linkage, "nxc_eHeSgpYwMkFV", "nextendo_client_id",
+                                           Category::Network};
+    // Profiles missing from the NAND whose Nextendo sign-ins the user chose to keep, comma-separated.
+    Setting<std::string> nextendo_kept_accounts{linkage, std::string(), "nextendo_kept_accounts",
+                                                Category::Network};
+    // Host redirect to a server the user runs (core/internal_network/local_redirect.h). Off: the
+    // online_redirect_* values are ignored.
+    Setting<bool> online_service_redirect{linkage, false, "online_service_redirect",
+                                          Category::Network};
+    Setting<std::string> online_redirect_hosts{linkage, std::string(), "online_redirect_hosts",
+                                               Category::Network};
+    Setting<std::string> online_redirect_server{linkage, std::string(), "online_redirect_server",
+                                                Category::Network};
+    Setting<std::string> online_redirect_ca{linkage, std::string(), "online_redirect_ca",
+                                            Category::Network};
+    Setting<bool> online_redirect_loopback_only{linkage, false, "online_redirect_loopback_only",
+                                                Category::Network};
+
+    // WebService
+    Setting<std::string> web_api_url{linkage, "api.ynet-fun.xyz", "web_api_url",
+                                     Category::WebService};
+    Setting<std::string> eden_username{linkage, "Eden", "eden_username",
+                                       Category::WebService};
+    Setting<std::string> eden_token{linkage, "",
+                                    "eden_token", Category::WebService};
+
+    // Add-Ons
+    std::map<u64, std::vector<std::string>> disabled_addons;
+
+    // Per-game overrides
+    bool use_squashed_iterated_blend;
+    /// A title that reads GPU-written memory on the CPU needs reactive flushing whatever the
+    /// setting says. Set per boot by the game overrides; the settings dialog never touches it.
+    bool force_reactive_flushing{};
+    /// A title that breaks when buffers miss the GPU engines' inner writes keeps those
+    /// invalidations whatever skip_cpu_inner_invalidation says. Set per boot by the game overrides.
+    bool keep_cpu_inner_invalidation{};
+
+};
+
+extern Values values;
+
+struct NvidiaDlssRuntimeSettings {
+    NvidiaDlssQuality quality;
+    NvidiaDlssPreset preset;
+};
+
+void RefreshNvidiaDlssRuntimeSettings();
+NvidiaDlssRuntimeSettings GetNvidiaDlssRuntimeSettings();
+
+/// The NVIDIA DLSS quality whose render scale Ocarina of Time's built-in patch applies when the
+/// game starts: Balanced, Performance or Ultra Performance with NVIDIA DLSS on, docked.
+std::optional<NvidiaDlssQuality> OcarinaDlssRenderScale();
+/// The quality whose render-scale patch the running game's main module got (none: unpatched).
+void SetAppliedOcarinaRenderScale(std::optional<NvidiaDlssQuality> quality);
+std::optional<NvidiaDlssQuality> AppliedOcarinaRenderScale();
+
+constexpr u32 MIN_FRAME_GEN_MULTIPLIER = 2;
+constexpr u32 MAX_FRAME_GEN_MULTIPLIER = 4;
+
+[[nodiscard]] u32 FrameGenMultiplier();
+
+[[nodiscard]] size_t FrameGenGenerations();
+
+[[nodiscard]] size_t FrameGenMaxGenerations();
+
+bool GetDebugKnobAt(u8 i);
+
+void UpdateGPUAccuracy();
+bool IsGPULevelHigh();
+
+bool IsDMALevelDefault();
+bool IsDMALevelSafe();
+
+bool IsGPUFenceBehaviorDefault();
+bool IsGPUFenceBehaviorBalanced();
+bool IsGPUFenceBehaviorAccurate();
+
+bool IsFastmemEnabled();
+void SetNceEnabled(bool is_64bit);
+bool IsNceEnabled();
+
+void SetCurrentProgramID(u64 program_id);
+u64 GetCurrentProgramID();
+
+// Whether the program being loaded is a Switch 2 one (set by the core before the GPU starts).
+void SetCurrentProgramIsSwitch2(bool is_switch2);
+bool CurrentProgramIsSwitch2();
+
+/// Whether GPU-written memory is flushed back when the CPU reads it: the setting, or a title
+/// that requires it.
+bool ReactiveFlushing();
+bool SkipCpuInnerInvalidation();
+
+// The ASTC recompression in effect: astc_recompression, unless the renderer picked another one
+// for the running program (the configuration is left as is). The core clears it on load.
+AstcRecompression GetAstcRecompression();
+void SetAstcRecompressionOverride(std::optional<AstcRecompression> recompression);
+
+bool IsOpenGL();
+
+bool IsDockedMode();
+
+float Volume();
+
+// speed limit ops
+u16 SpeedLimit();
+void SetSpeedMode(const SpeedMode &mode);
+void ToggleStandardMode();
+void ToggleTurboMode();
+void ToggleSlowMode();
+
+std::string GetTimeZoneString(TimeZone time_zone);
+
+void LogSettings();
+
+void TranslateResolutionInfo(ResolutionSetup setup, ResolutionScalingInfo& info);
+void UpdateRescalingInfo();
+
+// Restore the global state of all applicable settings in the Values struct
+void RestoreGlobalState(bool is_powered_on);
+
+bool IsConfiguringGlobal();
+void SetConfiguringGlobal(bool is_global);
+
+} // namespace Settings

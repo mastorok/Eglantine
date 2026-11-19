@@ -1,0 +1,684 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <limits>
+#include <mutex>
+#include <string_view>
+#include <vector>
+
+#include <fmt/format.h>
+
+#ifdef __ANDROID__
+#include <android/api-level.h>
+#endif
+
+#include "common/display_hdr.h"
+#include "common/logging.h"
+#include "common/settings.h"
+#include "common/settings_enums.h"
+#include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/renderer_vulkan/vk_swapchain.h"
+#include "video_core/vulkan_common/vk_enum_string_helper.h"
+#include "video_core/vulkan_common/vulkan_device.h"
+#include "video_core/vulkan_common/vulkan_wrapper.h"
+#include "vulkan/vulkan_core.h"
+#ifdef EGLANTINE_STREAMLINE
+#include "video_core/vulkan_common/streamline.h"
+#include "video_core/vulkan_common/streamline_frame_gen.h"
+#endif
+
+namespace Vulkan {
+
+namespace {
+
+/// Streamline's DLSS Frame Generation presents and paces the frames in this format. Turning it
+/// on or off changes the present mode, which recreates the swapchain as NVIDIA asks.
+bool FrameGenPresents([[maybe_unused]] VkFormat format) {
+#ifdef EGLANTINE_STREAMLINE
+    return Streamline::FrameGenActive() && Streamline::FrameGenSupportsSwapchain(format);
+#else
+    return false;
+#endif
+}
+
+/// DLSS-G is loaded, so Streamline makes the swapchains, whether or not it generates frames.
+bool FrameGenLoaded() {
+#ifdef EGLANTINE_STREAMLINE
+    return Streamline::FrameGenSession();
+#else
+    return false;
+#endif
+}
+
+#ifdef EGLANTINE_STREAMLINE
+/// Streamline asks for a flushed pipeline and no Vulkan calls while a feature unloads.
+void UnloadFrameGen(Scheduler& scheduler, const Device& device, std::string_view reason) {
+    const auto paused = scheduler.PauseWorker();
+    std::scoped_lock lock{scheduler.submit_mutex};
+    const VkResult result = device.GetLogical().WaitIdle();
+    if (result == VK_ERROR_DEVICE_LOST) {
+        device.ReportLoss();
+    }
+    vk::Check(result);
+    Streamline::DisableFrameGen(reason);
+}
+#endif
+
+VkSurfaceFormatKHR ChooseSwapSurfaceFormat(vk::Span<VkSurfaceFormatKHR> formats,
+                                         VkFormat requested_format,
+                                         VkColorSpaceKHR requested_color_space) {
+    if (requested_format == VK_FORMAT_R16G16B16A16_SFLOAT ||
+        requested_format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 ||
+        requested_color_space != VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
+        // A swapchain may only use a pair the surface lists
+        // (VUID-VkSwapchainCreateInfoKHR-imageFormat-01273).
+        const bool listed = std::ranges::any_of(formats, [&](const VkSurfaceFormatKHR& format) {
+            return format.format == requested_format &&
+                   format.colorSpace == requested_color_space;
+        });
+        if (listed) {
+            return {
+                .format = requested_format,
+                .colorSpace = requested_color_space,
+            };
+        }
+        LOG_ERROR(Render_Vulkan, "The surface has no {} {} format, presenting SDR",
+                  string_VkFormat(requested_format), string_VkColorSpaceKHR(requested_color_space));
+    }
+    if (formats.size() == 1 && formats[0].format == VK_FORMAT_UNDEFINED) {
+        VkSurfaceFormatKHR format;
+        format.format = VK_FORMAT_B8G8R8A8_UNORM;
+        format.colorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+        return format;
+    }
+    const auto& found = std::find_if(formats.begin(), formats.end(), [](const auto& format) {
+        return format.format == VK_FORMAT_B8G8R8A8_UNORM &&
+               format.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+    });
+    if (found != formats.end()) {
+        return *found;
+    }
+    const auto sdr = std::find_if(formats.begin(), formats.end(), [](const auto& format) {
+        return format.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+    });
+    return sdr != formats.end() ? *sdr : formats[0];
+}
+
+static VkPresentModeKHR ChooseSwapPresentMode(bool has_imm, bool has_mailbox,
+                                              bool has_fifo_relaxed, VkFormat format) {
+    // DLSS Frame Generation on Vulkan doesn't support VSync.
+    if (FrameGenPresents(format) && (has_imm || has_mailbox)) {
+        return has_imm ? VK_PRESENT_MODE_IMMEDIATE_KHR : VK_PRESENT_MODE_MAILBOX_KHR;
+    }
+    // Mailbox doesn't lock the application like FIFO (vsync)
+    // FIFO present mode locks the framerate to the monitor's refresh rate
+    Settings::VSyncMode setting = [has_imm, has_mailbox]() {
+        // Choose Mailbox or Immediate if unlocked and those modes are supported
+        const auto mode = Settings::values.vsync_mode.GetValue();
+        if (Settings::values.frame_gen.GetValue()) {
+            return mode == Settings::VSyncMode::FifoRelaxed ? mode : Settings::VSyncMode::Fifo;
+        }
+        if (Settings::values.use_speed_limit.GetValue() &&
+            Settings::values.current_speed_mode.GetValue() != Settings::SpeedMode::Turbo) {
+            return mode;
+        }
+        switch (mode) {
+        case Settings::VSyncMode::Fifo:
+        case Settings::VSyncMode::FifoRelaxed:
+            if (has_mailbox) {
+                return Settings::VSyncMode::Mailbox;
+            } else if (has_imm) {
+                return Settings::VSyncMode::Immediate;
+            }
+            [[fallthrough]];
+        default:
+            return mode;
+        }
+    }();
+    if (setting == Settings::VSyncMode::Immediate && !has_imm) {
+        setting = Settings::VSyncMode::Mailbox;
+    }
+    if ((setting == Settings::VSyncMode::Mailbox && !has_mailbox) ||
+        (setting == Settings::VSyncMode::FifoRelaxed && !has_fifo_relaxed)) {
+        setting = Settings::VSyncMode::Fifo;
+    }
+
+    switch (setting) {
+    case Settings::VSyncMode::Immediate:
+        return VK_PRESENT_MODE_IMMEDIATE_KHR;
+    case Settings::VSyncMode::Mailbox:
+        return VK_PRESENT_MODE_MAILBOX_KHR;
+    case Settings::VSyncMode::Fifo:
+        return VK_PRESENT_MODE_FIFO_KHR;
+    case Settings::VSyncMode::FifoRelaxed:
+        return VK_PRESENT_MODE_FIFO_RELAXED_KHR;
+    default:
+        return VK_PRESENT_MODE_FIFO_KHR;
+    }
+}
+
+VkExtent2D ChooseSwapExtent(const VkSurfaceCapabilitiesKHR& capabilities, u32 width, u32 height) {
+    constexpr auto undefined_size{(std::numeric_limits<u32>::max)()};
+    if (capabilities.currentExtent.width != undefined_size) {
+        return capabilities.currentExtent;
+    }
+    VkExtent2D extent;
+    extent.width = (std::max)(capabilities.minImageExtent.width,
+                            (std::min)(capabilities.maxImageExtent.width, width));
+    extent.height = (std::max)(capabilities.minImageExtent.height,
+                             (std::min)(capabilities.maxImageExtent.height, height));
+    return extent;
+}
+
+VkCompositeAlphaFlagBitsKHR ChooseAlphaFlags(const VkSurfaceCapabilitiesKHR& capabilities) {
+    if (capabilities.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR) {
+        return VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    } else if (capabilities.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR) {
+        return VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR;
+    } else {
+        LOG_ERROR(Render_Vulkan, "Unknown composite alpha flags value {:#x}",
+                  capabilities.supportedCompositeAlpha);
+        return VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    }
+}
+
+} // Anonymous namespace
+
+std::optional<VkSurfaceFormatKHR> ChooseHdrSurfaceFormat(
+    std::span<const VkSurfaceFormatKHR> formats, Settings::HdrSwapchain preferred) {
+    constexpr VkSurfaceFormatKHR hdr10{VK_FORMAT_A2B10G10R10_UNORM_PACK32,
+                                       VK_COLOR_SPACE_HDR10_ST2084_EXT};
+    constexpr VkSurfaceFormatKHR scrgb{VK_FORMAT_R16G16B16A16_SFLOAT,
+                                       VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT};
+    const auto listed = [&](const VkSurfaceFormatKHR& wanted) {
+        return std::ranges::any_of(formats, [&](const VkSurfaceFormatKHR& format) {
+            return format.format == wanted.format && format.colorSpace == wanted.colorSpace;
+        });
+    };
+    const auto& first = preferred == Settings::HdrSwapchain::Scrgb ? scrgb : hdr10;
+    const auto& second = preferred == Settings::HdrSwapchain::Scrgb ? hdr10 : scrgb;
+    if (listed(first)) {
+        return first;
+    }
+    if (listed(second)) {
+        return second;
+    }
+    return std::nullopt;
+}
+
+Swapchain::Swapchain(
+    VkSurfaceKHR_T* surface_,
+    const Device& device_,
+    Scheduler& scheduler_,
+    u32 width_,
+    u32 height_,
+    VkSurfaceFormatKHR requested)
+    : surface(surface_)
+    , device{device_}
+    , scheduler{scheduler_}
+{
+    if (!Create(surface, width_, height_, requested.format, requested.colorSpace)) {
+        LOG_ERROR(Render_Vulkan, "Initial swapchain creation failed: surface has zero extent");
+        throw vk::Exception(VK_ERROR_INITIALIZATION_FAILED);
+    }
+}
+
+Swapchain::~Swapchain() {
+    Common::DisplayHdrMonitor::Instance().SetPresentingHdr(false);
+}
+
+bool Swapchain::Create(
+    VkSurfaceKHR_T* surface_,
+    u32 width_,
+    u32 height_,
+    VkFormat requested_format_,
+    VkColorSpaceKHR requested_color_space_)
+{
+    is_outdated = false;
+    // Keep recreation pending until creation succeeds, including zero-extent surfaces.
+    is_suboptimal = true;
+    width = width_;
+    height = height_;
+    surface = surface_;
+    requested_format = requested_format_;
+    requested_color_space = requested_color_space_;
+
+    const auto physical_device = device.GetPhysical();
+    const auto capabilities{physical_device.GetSurfaceCapabilitiesKHR(VkSurfaceKHR(surface))};
+    if (capabilities.maxImageExtent.width == 0 || capabilities.maxImageExtent.height == 0) {
+        return false;
+    }
+
+    // Submitted work may still wait on the old acquire/present semaphores; destroying them under
+    // it loses the device on MoltenVK (window moved to a display with a different scale).
+    if (swapchain) {
+        std::scoped_lock lock{scheduler.submit_mutex};
+        const VkResult result = device.GetLogical().WaitIdle();
+        if (result == VK_ERROR_DEVICE_LOST) {
+            device.ReportLoss();
+        }
+        vk::Check(result);
+    }
+    {
+        // The present wait thread may be waiting on the old swapchain (WaitForPresent).
+        const auto use_lock = LockForUse();
+        Destroy();
+        CreateSwapchain(capabilities);
+    }
+    CreateSemaphores();
+    is_suboptimal = false;
+
+    resource_ticks.clear();
+    resource_ticks.resize(image_count);
+    return true;
+}
+
+std::unique_lock<std::mutex> Swapchain::LockForUse() {
+    // WaitForPresent takes the lock again right after each of its waits: it lets this thread in
+    // first, so a present or an acquire waits for one of those waits to end at most.
+    use_requests.fetch_add(1, std::memory_order_acq_rel);
+    std::unique_lock lock{use_mutex};
+    use_requests.fetch_sub(1, std::memory_order_acq_rel);
+    use_cv.notify_one();
+    return lock;
+}
+
+bool Swapchain::AcquireNextImage(bool may_flush, u32 game_frame_presents) {
+    const VkResult result = [this] {
+        const auto use_lock = LockForUse();
+        return device.GetLogical().AcquireNextImageKHR(
+            *swapchain, (std::numeric_limits<u64>::max)(), *present_semaphores[frame_index],
+            VK_NULL_HANDLE, &image_index);
+    }();
+    switch (result) {
+    case VK_SUCCESS:
+        break;
+    case VK_SUBOPTIMAL_KHR:
+        is_suboptimal = true;
+        break;
+    case VK_ERROR_OUT_OF_DATE_KHR:
+        is_outdated = true;
+        break;
+    case VK_ERROR_SURFACE_LOST_KHR:
+        vk::Check(result);
+        break;
+    default:
+        LOG_ERROR(Render_Vulkan, "vkAcquireNextImageKHR returned {}", string_VkResult(result));
+        break;
+    }
+    if (result == VK_ERROR_OUT_OF_DATE_KHR) {
+        // No image was acquired, so image_index is stale: the caller recreates and tries again.
+        return true;
+    }
+
+    const auto wait_with_frame_pacing = [this, may_flush, game_frame_presents] {
+    switch (Settings::values.frame_pacing_mode.GetValue()) {
+    case Settings::FramePacingMode::Target_Auto:
+        scheduler.Wait(resource_ticks[image_index], 0.0, may_flush);
+        break;
+    case Settings::FramePacingMode::Target_30:
+        scheduler.Wait(resource_ticks[image_index], 30.0, may_flush, game_frame_presents);
+        break;
+    case Settings::FramePacingMode::Target_60:
+        scheduler.Wait(resource_ticks[image_index], 60.0, may_flush, game_frame_presents);
+        break;
+    case Settings::FramePacingMode::Target_90:
+        scheduler.Wait(resource_ticks[image_index], 90.0, may_flush, game_frame_presents);
+        break;
+    case Settings::FramePacingMode::Target_120:
+        scheduler.Wait(resource_ticks[image_index], 120.0, may_flush, game_frame_presents);
+        break;
+    }
+    };
+
+#ifdef __ANDROID__
+    if (android_get_device_api_level() >= 30) {
+        scheduler.Wait(resource_ticks[image_index], 0.0, may_flush);
+    } else {
+        wait_with_frame_pacing();
+    }
+#else
+    wait_with_frame_pacing();
+#endif
+
+    resource_ticks[image_index] = scheduler.CurrentTick();
+
+    // A suboptimal acquire still acquired an image and signals its semaphore: present it, and let
+    // NeedsRecreation() recreate at the next frame.
+    return false;
+}
+
+bool Swapchain::Present(VkSemaphore render_semaphore, u64 present_id) {
+    const auto present_queue{device.GetPresentQueue()};
+    const VkPresentIdKHR present_id_info{
+        .sType = VK_STRUCTURE_TYPE_PRESENT_ID_KHR,
+        .pNext = nullptr,
+        .swapchainCount = 1,
+        .pPresentIds = &present_id,
+    };
+    const VkPresentId2KHR present_id2_info{
+        .sType = VK_STRUCTURE_TYPE_PRESENT_ID_2_KHR,
+        .pNext = nullptr,
+        .swapchainCount = 1,
+        .pPresentIds = &present_id,
+    };
+    const void* id_info = nullptr;
+    if (present_ids && present_id != 0) {
+        id_info = present_ids2 ? static_cast<const void*>(&present_id2_info)
+                               : static_cast<const void*>(&present_id_info);
+    }
+    const VkPresentInfoKHR present_info{
+        .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+        .pNext = id_info,
+        .waitSemaphoreCount = render_semaphore ? 1U : 0U,
+        .pWaitSemaphores = &render_semaphore,
+        .swapchainCount = 1,
+        .pSwapchains = swapchain.address(),
+        .pImageIndices = &image_index,
+        .pResults = nullptr,
+    };
+    const auto use_lock = LockForUse();
+    std::scoped_lock lock{scheduler.submit_mutex};
+    bool accepted = false;
+    switch (const VkResult result = present_queue.Present(present_info)) {
+    case VK_SUCCESS:
+        accepted = true;
+        break;
+    case VK_SUBOPTIMAL_KHR:
+        LOG_DEBUG(Render_Vulkan, "Suboptimal swapchain");
+        accepted = true;
+        break;
+    case VK_ERROR_OUT_OF_DATE_KHR:
+        is_outdated = true;
+        break;
+    case VK_ERROR_SURFACE_LOST_KHR:
+        vk::Check(result);
+        break;
+    default:
+        LOG_CRITICAL(Render_Vulkan, "Failed to present with error {}", string_VkResult(result));
+        break;
+    }
+    ++frame_index;
+    if (frame_index >= image_count) {
+        frame_index = 0;
+    }
+    return accepted;
+}
+
+VkResult Swapchain::WaitForPresent(u64 wanted_generation, u64 present_id, u64 timeout_ns) {
+    std::unique_lock lock{use_mutex};
+    use_cv.wait(lock, [this] { return use_requests.load(std::memory_order_acquire) == 0; });
+    if (!swapchain || generation.load(std::memory_order_relaxed) != wanted_generation) {
+        return VK_ERROR_OUT_OF_DATE_KHR;
+    }
+    if (!present_ids || present_wait_stalled) {
+        return VK_ERROR_EXTENSION_NOT_PRESENT;
+    }
+    const auto start = std::chrono::steady_clock::now();
+    const VkResult result =
+        present_ids2 ? device.GetLogical().WaitForPresent2KHR(*swapchain, present_id, timeout_ns)
+                     : device.GetLogical().WaitForPresentKHR(*swapchain, present_id, timeout_ns);
+    // Presents and acquires wait for this lock, so a driver that ignores the timeout would stall
+    // them at every present: one such wait ends the present waits.
+    constexpr std::chrono::milliseconds Overrun{250};
+    if (std::chrono::steady_clock::now() - start > std::chrono::nanoseconds{timeout_ns} + Overrun) {
+        LOG_ERROR(Render_Vulkan,
+                  "A present wait of {} ns took over {} ms: the driver ignores the timeout, "
+                  "present waits are off",
+                  timeout_ns, Overrun.count());
+        present_wait_stalled = true;
+    }
+    return result;
+}
+
+void Swapchain::CreateSwapchain(const VkSurfaceCapabilitiesKHR& capabilities) {
+    const auto physical_device{device.GetPhysical()};
+    const auto formats{physical_device.GetSurfaceFormatsKHR(VkSurfaceKHR(surface))};
+    const auto present_modes = physical_device.GetSurfacePresentModesKHR(VkSurfaceKHR(surface));
+
+    // Keep the SDR choice available even while the active swapchain is HDR.
+    sdr_image_format = ChooseSwapSurfaceFormat(formats, VK_FORMAT_B8G8R8A8_UNORM,
+                                              VK_COLOR_SPACE_SRGB_NONLINEAR_KHR).format;
+
+    has_mailbox = std::find(present_modes.begin(), present_modes.end(), VK_PRESENT_MODE_MAILBOX_KHR)
+                  != present_modes.end();
+    has_imm = std::find(present_modes.begin(), present_modes.end(),
+                        VK_PRESENT_MODE_IMMEDIATE_KHR) != present_modes.end();
+    has_fifo_relaxed = std::find(present_modes.begin(), present_modes.end(),
+                                 VK_PRESENT_MODE_FIFO_RELAXED_KHR) != present_modes.end();
+
+    const VkCompositeAlphaFlagBitsKHR alpha_flags{ChooseAlphaFlags(capabilities)};
+    surface_format = ChooseSwapSurfaceFormat(formats, requested_format, requested_color_space);
+    Common::DisplayHdrMonitor::Instance().SetPresentingHdr(surface_format.colorSpace !=
+                                                           VK_COLOR_SPACE_SRGB_NONLINEAR_KHR);
+#ifdef EGLANTINE_STREAMLINE
+    // The old swapchain is gone, so DLSS-G unloads before the new one is made.
+    if (Streamline::FrameGenSession() &&
+        !Streamline::FrameGenSupportsSwapchain(surface_format.format)) {
+        UnloadFrameGen(scheduler, device,
+                       "scRGB HDR output; set the HDR format to HDR10 to use it");
+    }
+#endif
+    present_mode =
+        ChooseSwapPresentMode(has_imm, has_mailbox, has_fifo_relaxed, surface_format.format);
+    // Present ids only when asked for (RequestPresentIds), and not with DLSS-G loaded: Streamline
+    // makes the swapchain and paces its presents itself.
+    const bool with_ids = present_ids_requested && !FrameGenLoaded() &&
+                          !FrameGenPresents(surface_format.format);
+    present_ids2 = with_ids && !present_ids2_failed && SurfaceSupportsPresentWait2();
+    present_ids = present_ids2 || (with_ids && device.IsKhrPresentWaitEnabled());
+    present_ids_refused = present_ids_requested && !present_ids;
+
+    u32 requested_image_count{capabilities.minImageCount + 1};
+    // Ensure Triple buffering if possible.
+    if (capabilities.maxImageCount > 0) {
+        if (requested_image_count > capabilities.maxImageCount) {
+            requested_image_count = capabilities.maxImageCount;
+        } else {
+            requested_image_count =
+                (std::max)(requested_image_count, (std::min)(3U, capabilities.maxImageCount));
+        }
+    } else {
+        requested_image_count = (std::max)(requested_image_count, 3U);
+    }
+    VkSwapchainCreateInfoKHR swapchain_ci{
+        .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
+        .pNext = nullptr,
+        .flags = 0,
+        .surface = VkSurfaceKHR(surface),
+        .minImageCount = requested_image_count,
+        .imageFormat = surface_format.format,
+        .imageColorSpace = surface_format.colorSpace,
+        .imageExtent = {},
+        .imageArrayLayers = 1,
+        .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .queueFamilyIndexCount = 0,
+        .pQueueFamilyIndices = nullptr,
+#ifdef __ANDROID__
+        // On Android, do not allow surface rotation to deviate from the frontend.
+        .preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR,
+#else
+        .preTransform = capabilities.currentTransform,
+#endif
+        .compositeAlpha = alpha_flags,
+        .presentMode = present_mode,
+        .clipped = VK_FALSE,
+        .oldSwapchain = VkSwapchainKHR{},
+    };
+    const u32 graphics_family{device.GetGraphicsFamily()};
+    const u32 present_family{device.GetPresentFamily()};
+    const std::array<u32, 2> queue_indices{graphics_family, present_family};
+    if (graphics_family != present_family) {
+        swapchain_ci.imageSharingMode = VK_SHARING_MODE_CONCURRENT;
+        swapchain_ci.queueFamilyIndexCount = static_cast<u32>(queue_indices.size());
+        swapchain_ci.pQueueFamilyIndices = queue_indices.data();
+    }
+    // According to Vulkan spec, when using VK_SWAPCHAIN_CREATE_MUTABLE_FORMAT_BIT_KHR,
+    // the base format (imageFormat) MUST be included in pViewFormats
+    const std::array view_formats{
+        swapchain_ci.imageFormat,  // Base format MUST be first
+        VK_FORMAT_B8G8R8A8_UNORM,
+        VK_FORMAT_B8G8R8A8_SRGB,
+#ifdef __ANDROID__
+        VK_FORMAT_R8G8B8A8_UNORM,  // Android may use RGBA
+        VK_FORMAT_R8G8B8A8_SRGB,
+#endif
+    };
+    VkImageFormatListCreateInfo format_list{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO_KHR,
+        .pNext = nullptr,
+        .viewFormatCount = static_cast<u32>(view_formats.size()),
+        .pViewFormats = view_formats.data(),
+    };
+    if (device.IsKhrSwapchainMutableFormatEnabled() &&
+        surface_format.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
+        format_list.pNext = std::exchange(swapchain_ci.pNext, &format_list);
+        swapchain_ci.flags |= VK_SWAPCHAIN_CREATE_MUTABLE_FORMAT_BIT_KHR;
+    }
+    if (present_ids2) {
+        swapchain_ci.flags |=
+            VK_SWAPCHAIN_CREATE_PRESENT_ID_2_BIT_KHR | VK_SWAPCHAIN_CREATE_PRESENT_WAIT_2_BIT_KHR;
+    }
+    const auto create = [this, &swapchain_ci] {
+        try {
+            swapchain = device.GetLogical().CreateSwapchainKHR(swapchain_ci);
+        } catch (const vk::Exception& exception) {
+            const VkResult result = exception.GetResult();
+            if (!present_ids2 || result == VK_ERROR_SURFACE_LOST_KHR ||
+                result == VK_ERROR_NATIVE_WINDOW_IN_USE_KHR) {
+                throw;
+            }
+            // Keep presenting on a driver that refuses the second versions' swapchain: this
+            // surface gets the first versions, or no ids.
+            LOG_WARNING(Render_Vulkan,
+                        "No swapchain with VK_KHR_present_id2/VK_KHR_present_wait2 ({}), creating "
+                        "it without them",
+                        exception.what());
+            present_ids2_failed = true;
+            present_ids2 = false;
+            present_ids = device.IsKhrPresentWaitEnabled();
+            present_ids_refused = !present_ids;
+            swapchain_ci.flags &= ~static_cast<VkSwapchainCreateFlagsKHR>(
+                VK_SWAPCHAIN_CREATE_PRESENT_ID_2_BIT_KHR |
+                VK_SWAPCHAIN_CREATE_PRESENT_WAIT_2_BIT_KHR);
+            swapchain = device.GetLogical().CreateSwapchainKHR(swapchain_ci);
+        }
+    };
+    // Request the size again to reduce the possibility of a TOCTOU race condition.
+    const auto updated_capabilities = physical_device.GetSurfaceCapabilitiesKHR(VkSurfaceKHR(surface));
+    swapchain_ci.imageExtent = ChooseSwapExtent(updated_capabilities, width, height);
+    // Don't add code within this and the swapchain creation.
+    try {
+        create();
+    } catch ([[maybe_unused]] const vk::Exception& exception) {
+        // A lost surface or a window still in use is transient: the present loop retries those.
+        const VkResult result = exception.GetResult();
+        if (!FrameGenLoaded() || result == VK_ERROR_SURFACE_LOST_KHR ||
+            result == VK_ERROR_NATIVE_WINDOW_IN_USE_KHR) {
+            throw;
+        }
+#ifdef EGLANTINE_STREAMLINE
+        // Keep the game running without frame generation: DLSS-G unloaded, the hooks reach the
+        // driver's swapchain.
+        UnloadFrameGen(scheduler, device,
+                       fmt::format("Streamline's swapchain failed ({})", exception.what()));
+#endif
+        present_mode =
+            ChooseSwapPresentMode(has_imm, has_mailbox, has_fifo_relaxed, surface_format.format);
+        swapchain_ci.presentMode = present_mode;
+        create();
+    }
+
+    extent = swapchain_ci.imageExtent;
+
+    images = swapchain.GetImages();
+    image_count = static_cast<u32>(images.size());
+#ifdef __ANDROID__
+    // Android is already ordered the same as Switch.
+    image_view_format = VK_FORMAT_R8G8B8A8_UNORM;
+#else
+    image_view_format = VK_FORMAT_B8G8R8A8_UNORM;
+#endif
+    if (surface_format.colorSpace != VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
+        image_view_format = surface_format.format;
+    }
+}
+
+void Swapchain::CreateSemaphores() {
+    present_semaphores.resize(image_count);
+    std::ranges::generate(present_semaphores,
+                          [this] { return device.GetLogical().CreateSemaphore(); });
+    render_semaphores.resize(image_count);
+    std::ranges::generate(render_semaphores,
+                          [this] { return device.GetLogical().CreateSemaphore(); });
+}
+
+void Swapchain::Destroy() {
+    generation.fetch_add(1, std::memory_order_acq_rel);
+    frame_index = 0;
+    present_semaphores.clear();
+    render_semaphores.clear();
+    swapchain.reset();
+}
+
+void Swapchain::SetHdrMetadata(u16 peak_luminance, u16 reference_white) const {
+    if (!device.IsExtHdrMetadataEnabled() ||
+        surface_format.colorSpace != VK_COLOR_SPACE_HDR10_ST2084_EXT) {
+        return;
+    }
+    // The game tone maps to the peak it was told about, so that is the brightest the stream
+    // gets. Mastering primaries are BT.2020 with a D65 white (the colour space's own); the frame
+    // average is not known.
+    const VkHdrMetadataEXT metadata{
+        .sType = VK_STRUCTURE_TYPE_HDR_METADATA_EXT,
+        .pNext = nullptr,
+        .displayPrimaryRed = {0.708f, 0.292f},
+        .displayPrimaryGreen = {0.170f, 0.797f},
+        .displayPrimaryBlue = {0.131f, 0.046f},
+        .whitePoint = {0.3127f, 0.3290f},
+        .maxLuminance = static_cast<float>(peak_luminance),
+        .minLuminance = 0.0f,
+        .maxContentLightLevel = static_cast<float>(peak_luminance),
+        .maxFrameAverageLightLevel = 0.0f,
+    };
+    device.GetLogical().SetHdrMetadataEXT(*swapchain, metadata);
+    LOG_INFO(Render_Vulkan, "HDR10 metadata: peak {} nits (reference white {} nits)",
+             peak_luminance, reference_white);
+}
+
+bool Swapchain::SurfaceSupportsPresentWait2() const {
+    if (!device.IsKhrPresentWait2Enabled()) {
+        return false;
+    }
+    VkSurfaceCapabilitiesPresentWait2KHR wait_capabilities{
+        .sType = VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_PRESENT_WAIT_2_KHR,
+        .pNext = nullptr,
+        .presentWait2Supported = VK_FALSE,
+    };
+    VkSurfaceCapabilitiesPresentId2KHR id_capabilities{
+        .sType = VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_PRESENT_ID_2_KHR,
+        .pNext = &wait_capabilities,
+        .presentId2Supported = VK_FALSE,
+    };
+    VkSurfaceCapabilities2KHR capabilities{
+        .sType = VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_2_KHR,
+        .pNext = &id_capabilities,
+        .surfaceCapabilities = {},
+    };
+    return device.GetPhysical().GetSurfaceCapabilities2KHR(VkSurfaceKHR(surface), capabilities) &&
+           id_capabilities.presentId2Supported && wait_capabilities.presentWait2Supported;
+}
+
+bool Swapchain::NeedsPresentModeUpdate() const {
+    const auto requested_mode =
+        ChooseSwapPresentMode(has_imm, has_mailbox, has_fifo_relaxed, surface_format.format);
+    return present_mode != requested_mode;
+}
+
+} // namespace Vulkan

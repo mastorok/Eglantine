@@ -1,0 +1,308 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <!-- Custom button styles -->
+    <style name="InGameMenuOption" parent="Widget.Material3.Button.TextButton">
+        <item name="android:layout_width">match_parent</item>
+        <item name="android:layout_height">48dp</item>
+        <item name="android:textColor">@android:color/black</item>
+        <item name="android:textSize">16sp</item>
+        <item name="android:fontFamily">sans-serif-condensed</item>
+        <item name="android:gravity">center_vertical|left</item>
+        <item name="android:paddingLeft">32dp</item>
+        <item name="android:paddingRight">32dp</item>
+    </style>
+
+    <style name="LichiiSlider" parent="Widget.Material3.Slider">
+        <item name="tickVisible">false</item>
+        <item name="labelBehavior">gone</item>
+    </style>
+
+    <!-- Blue theme dialog -->
+    <style name="LichiiMaterialDialog.Blue" parent="ThemeOverlay.Material3.MaterialAlertDialog">
+        <item name="colorPrimary">@color/lichii_primaryContainer_blue</item>
+        <item name="colorSurface">@color/lichii_primaryContainer_blue</item>
+        <item name="colorSecondary">@color/lichii_primary_blue</item>
+        <item name="android:textColorLink">@color/lichii_primary_blue</item>
+        <item name="buttonBarPositiveButtonStyle">@style/LichiiButton.Blue</item>
+        <item name="buttonBarNegativeButtonStyle">@style/LichiiButton.Blue</item>
+        <item name="buttonBarNeutralButtonStyle">@style/LichiiButton.Blue</item>
+    </style>
+
+    <style name="LichiiButton.Blue" parent="Widget.Material3.Button.TextButton.Dialog">
+        <item name="android:textColor">@color/lichii_primary_blue</item>
+        <item name="rippleColor">@color/lichii_inversePrimary_blue</item>
+    </style>
+
+    <!-- Cyan theme dialog -->
+    <style name="LichiiMaterialDialog.Cyan" parent="ThemeOverlay.Material3.MaterialAlertDialog">
+        <item name="colorPrimary">@color/lichii_primaryContainer_cyan</item>
+        <item name="colorSurface">@color/lichii_primaryContainer_cyan</item>
+        <item name="colorSecondary">@color/lichii_primary_cyan</item>
+        <item name="android:textColorLink">@color/lichii_primary_cyan</item>
+        <item name="buttonBarPositiveButtonStyle">@style/LichiiButton.Cyan</item>
+        <item name="buttonBarNegativeButtonStyle">@style/LichiiButton.Cyan</item>
+        <item name="buttonBarNeutralButtonStyle">@style/LichiiButton.Cyan</item>
+    </style>
+
+    <style name="LichiiButton.Cyan" parent="Widget.Material3.Button.TextButton.Dialog">
+        <item name="android:textColor">@color/lichii_primary_cyan</item>
+        <item name="rippleColor">@color/lichii_inversePrimary_cyan</item>
+    </style>
+
+    <!-- Red theme dialog -->
+    <style name="LichiiMaterialDialog.Red" parent="ThemeOverlay.Material3.MaterialAlertDialog">
+        <item name="colorPrimary">@color/lichii_primaryContainer_red</item>
+        <item name="colorSurface">@color/lichii_primaryContainer_red</item>
+        <item name="colorSecondary">@color/lichii_primary_red</item>
+        <item name="android:textColorLink">@color/lichii_primary_red</item>
+        <item name="buttonBarPositiveButtonStyle">@style/LichiiButton.Red</item>
+        <item name="buttonBarNegativeButtonStyle">@style/LichiiButton.Red</item>
+        <item name="buttonBarNeutralButtonStyle">@style/LichiiButton.Red</item>
+    </style>
+
+    <style name="LichiiButton.Red" parent="Widget.Material3.Button.TextButton.Dialog">
+        <item name="android:textColor">@color/lichii_primary_red</item>
+        <item name="rippleColor">@color/lichii_inversePrimary_red</item>
+    </style>
+
+    <!-- Green theme dialog -->
+    <style name="LichiiMaterialDialog.Green" parent="ThemeOverlay.Material3.MaterialAlertDialog">
+        <item name="colorPrimary">@color/lichii_primaryContainer_green</item>
+        <item name="colorSurface">@color/lichii_primaryContainer_green</item>
+        <item name="colorSecondary">@color/lichii_primary_green</item>
+        <item name="android:textColorLink">@color/lichii_primary_green</item>
+        <item name="buttonBarPositiveButtonStyle">@style/LichiiButton.Green</item>
+        <item name="buttonBarNegativeButtonStyle">@style/LichiiButton.Green</item>
+        <item name="buttonBarNeutralButtonStyle">@style/LichiiButton.Green</item>
+    </style>
+
+    <style name="LichiiButton.Green" parent="Widget.Material3.Button.TextButton.Dialog">
+        <item name="android:textColor">@color/lichii_primary_green</item>
+        <item name="rippleColor">@color/lichii_inversePrimary_green</item>
+    </style>
+
+    <!-- Yellow theme dialog -->
+    <style name="LichiiMaterialDialog.Yellow" parent="ThemeOverlay.Material3.MaterialAlertDialog">
+        <item name="colorPrimary">@color/lichii_primaryContainer_yellow</item>
+        <item name="colorSurface">@color/lichii_primaryContainer_yellow</item>
+        <item name="colorSecondary">@color/lichii_primary_yellow</item>
+        <item name="android:textColorLink">@color/lichii_primary_yellow</item>
+        <item name="buttonBarPositiveButtonStyle">@style/LichiiButton.Yellow</item>
+        <item name="buttonBarNegativeButtonStyle">@style/LichiiButton.Yellow</item>
+        <item name="buttonBarNeutralButtonStyle">@style/LichiiButton.Yellow</item>
+    </style>
+
+    <style name="LichiiButton.Yellow" parent="Widget.Material3.Button.TextButton.Dialog">
+        <item name="android:textColor">@color/lichii_primary_yellow</item>
+        <item name="rippleColor">@color/lichii_inversePrimary_yellow</item>
+    </style>
+
+    <!-- Orange theme dialog -->
+    <style name="LichiiMaterialDialog.Orange" parent="ThemeOverlay.Material3.MaterialAlertDialog">
+        <item name="colorPrimary">@color/lichii_primaryContainer_orange</item>
+        <item name="colorSurface">@color/lichii_primaryContainer_orange</item>
+        <item name="colorSecondary">@color/lichii_primary_orange</item>
+        <item name="android:textColorLink">@color/lichii_primary_orange</item>
+        <item name="buttonBarPositiveButtonStyle">@style/LichiiButton.Orange</item>
+        <item name="buttonBarNegativeButtonStyle">@style/LichiiButton.Orange</item>
+        <item name="buttonBarNeutralButtonStyle">@style/LichiiButton.Orange</item>
+    </style>
+
+    <style name="LichiiButton.Orange" parent="Widget.Material3.Button.TextButton.Dialog">
+        <item name="android:textColor">@color/lichii_primary_orange</item>
+        <item name="rippleColor">@color/lichii_inversePrimary_orange</item>
+    </style>
+
+    <!-- Violet theme dialog -->
+    <style name="LichiiMaterialDialog.Violet" parent="ThemeOverlay.Material3.MaterialAlertDialog">
+        <item name="colorPrimary">@color/lichii_primaryContainer_violet</item>
+        <item name="colorSurface">@color/lichii_primaryContainer_violet</item>
+        <item name="colorSecondary">@color/lichii_primary_violet</item>
+        <item name="android:textColorLink">@color/lichii_primary_violet</item>
+        <item name="buttonBarPositiveButtonStyle">@style/LichiiButton.Violet</item>
+        <item name="buttonBarNegativeButtonStyle">@style/LichiiButton.Violet</item>
+        <item name="buttonBarNeutralButtonStyle">@style/LichiiButton.Violet</item>
+    </style>
+
+    <style name="LichiiButton.Violet" parent="Widget.Material3.Button.TextButton.Dialog">
+        <item name="android:textColor">@color/lichii_primary_violet</item>
+        <item name="rippleColor">@color/lichii_inversePrimary_violet</item>
+    </style>
+
+    <!-- Gray theme dialog -->
+    <style name="LichiiMaterialDialog.Gray" parent="ThemeOverlay.Material3.MaterialAlertDialog">
+        <item name="colorPrimary">@color/lichii_primaryContainer_gray</item>
+        <item name="colorSurface">@color/lichii_primaryContainer_gray</item>
+        <item name="colorSecondary">@color/lichii_primary_gray</item>
+        <item name="android:textColorLink">@color/lichii_primary_gray</item>
+        <item name="buttonBarPositiveButtonStyle">@style/LichiiButton.Gray</item>
+        <item name="buttonBarNegativeButtonStyle">@style/LichiiButton.Gray</item>
+        <item name="buttonBarNeutralButtonStyle">@style/LichiiButton.Gray</item>
+    </style>
+
+    <style name="LichiiButton.Gray" parent="Widget.Material3.Button.TextButton.Dialog">
+        <item name="android:textColor">@color/lichii_primary_gray</item>
+        <item name="rippleColor">@color/lichii_inversePrimary_gray</item>
+    </style>
+
+    <!-- pink theme dialog -->
+    <style name="LichiiMaterialDialog.PINK" parent="ThemeOverlay.Material3.MaterialAlertDialog">
+        <item name="colorPrimary">@color/lichii_primaryContainer_pink</item>
+        <item name="colorSurface">@color/lichii_primaryContainer_pink</item>
+        <item name="colorSecondary">@color/lichii_primary_pink</item>
+        <item name="android:textColorLink">@color/lichii_primary_pink</item>
+        <item name="buttonBarPositiveButtonStyle">@style/LichiiButton.Pink</item>
+        <item name="buttonBarNegativeButtonStyle">@style/LichiiButton.Pink</item>
+        <item name="buttonBarNeutralButtonStyle">@style/LichiiButton.Pink</item>
+    </style>
+
+    <style name="LichiiButton.Pink" parent="Widget.Material3.Button.TextButton.Dialog">
+        <item name="android:textColor">@color/lichii_primary_pink</item>
+        <item name="rippleColor">@color/lichii_inversePrimary_pink</item>
+    </style>
+
+    <!-- Eden theme styles -->
+    <style name="EdenSlider" parent="Widget.Material3.Slider">
+        <item name="tickVisible">false</item>
+        <item name="labelBehavior">gone</item>
+        <item name="trackColorActive">?attr/colorPrimary</item>
+        <item name="trackColorInactive">?attr/colorOutline</item>
+        <item name="thumbColor">?attr/colorSecondary</item>
+        <item name="haloColor">?attr/colorSecondary</item>
+    </style>
+
+    <style name="EdenMaterialDialog" parent="ThemeOverlay.Material3.MaterialAlertDialog">
+        <item name="colorPrimary">@color/eden_primary</item>
+        <item name="colorSurface">@color/eden_card_background</item>
+        <item name="colorSurfaceContainerHigh">@color/eden_card_background</item>
+        <item name="colorOnSurface">@color/eden_on_surface</item>
+        <item name="colorOnSurfaceVariant">@color/eden_on_surface</item>
+        <item name="colorSecondary">@color/eden_secondary</item>
+        <item name="android:textColorPrimary">@color/eden_on_surface</item>
+        <item name="android:textColorSecondary">@color/eden_on_surface</item>
+        <item name="android:colorBackground">@color/eden_card_background</item>
+        <item name="buttonBarPositiveButtonStyle">@style/EdenButton.Dialog</item>
+        <item name="buttonBarNegativeButtonStyle">@style/EdenButton.Dialog</item>
+        <item name="buttonBarNeutralButtonStyle">@style/EdenButton.Dialog</item>
+    </style>
+
+    <style name="EdenButton.Dialog" parent="Widget.Material3.Button.TextButton.Dialog">
+        <item name="android:textColor">@color/eden_primary</item>
+        <item name="rippleColor">@color/eden_glow_pink</item>
+    </style>
+
+    <style name="Widget.Eden.TransparentTopAppBarLayout" parent="">
+        <item name="android:background">@android:color/transparent</item>
+        <item name="android:elevation">0dp</item>
+        <item name="android:stateListAnimator">@null</item>
+        <item name="elevation">0dp</item>
+        <item name="liftOnScroll">false</item>
+        <item name="statusBarForeground">@android:color/transparent</item>
+    </style>
+
+    <style name="Widget.Eden.TransparentTopToolbar" parent="">
+        <item name="android:background">@android:color/transparent</item>
+        <item name="android:elevation">0dp</item>
+        <item name="backgroundTint">@android:color/transparent</item>
+    </style>
+
+    <style name="EdenPopupMenu" parent="Widget.Material3.PopupMenu">
+        <item name="android:popupBackground">@drawable/popup_menu_background</item>
+    </style>
+    <style name="LichiiPopupMenu" parent="Widget.Material3.PopupMenu">
+        <item name="android:popupBackground">@drawable/popup_menu_background</item>
+    </style>
+
+    <style name="EdenButton.Primary" parent="Widget.Material3.Button">
+        <item name="android:textColor">@color/eden_on_primary</item>
+        <item name="android:textAllCaps">false</item>
+        <item name="android:textStyle">bold</item>
+        <item name="android:letterSpacing">0.05</item>
+        <item name="backgroundTint">@color/eden_primary</item>
+    </style>
+
+    <style name="EdenButton.Secondary" parent="Widget.Material3.Button.OutlinedButton">
+        <item name="strokeColor">@color/eden_secondary</item>
+        <item name="strokeWidth">2dp</item>
+        <item name="android:textColor">@color/eden_secondary</item>
+        <item name="android:textAllCaps">false</item>
+        <item name="cornerRadius">12dp</item>
+        <item name="android:textStyle">bold</item>
+        <item name="android:letterSpacing">0.05</item>
+    </style>
+
+    <style name="EdenCard" parent="">
+        <item name="android:background">@drawable/theme_card_background</item>
+        <item name="android:elevation">0dp</item>
+        <item name="android:focusable">true</item>
+        <item name="android:clickable">true</item>
+    </style>
+    <style name="EdenGameCard" parent="Widget.Material3.CardView.Elevated">
+        <item name="cardElevation">0dp</item>
+        <item name="cardBackgroundColor">?attr/colorSurface</item>
+        <item name="strokeWidth">0dp</item>
+        <item name="android:focusable">true</item>
+        <item name="android:clickable">true</item>
+        <item name="android:stateListAnimator">@null</item>
+    </style>
+
+    <style name="EdenCardElevated" parent="">
+        <item name="android:background">@drawable/eden_card_elevated_selector</item>
+        <item name="android:elevation">0dp</item>
+        <item name="android:padding">16dp</item>
+    </style>
+    <!-- Synthwave Text Styles -->
+    <style name="SynthwaveText.Title" parent="TextAppearance.Material3.DisplayLarge">
+        <item name="android:textColor">@color/eden_on_background</item>
+        <item name="android:textStyle">bold</item>
+        <item name="android:letterSpacing">0.1</item>
+        <item name="android:fontFamily">monospace</item>
+        <item name="android:shadowColor">@color/eden_glow_pink</item>
+        <item name="android:shadowDx">0</item>
+        <item name="android:shadowDy">0</item>
+        <item name="android:shadowRadius">8</item>
+    </style>
+    <style name="SynthwaveText.Header" parent="TextAppearance.Material3.DisplaySmall">
+        <item name="android:textColor">@color/eden_primary</item>
+        <item name="android:textStyle">bold</item>
+        <item name="android:letterSpacing">0.05</item>
+        <item name="android:fontFamily">monospace</item>
+        <item name="android:shadowColor">@color/eden_glow_pink</item>
+        <item name="android:shadowDx">0</item>
+        <item name="android:shadowDy">0</item>
+        <item name="android:shadowRadius">6</item>
+    </style>
+    <style name="SynthwaveText.Body" parent="TextAppearance.Material3.BodyLarge">
+        <item name="android:textColor">@color/eden_on_background</item>
+        <item name="android:fontFamily">monospace</item>
+        <item name="android:letterSpacing">0.02</item>
+    </style>
+    <style name="SynthwaveText.Secondary" parent="TextAppearance.Material3.BodyMedium">
+        <item name="android:textColor">@color/eden_secondary</item>
+        <item name="android:fontFamily">monospace</item>
+        <item name="android:shadowColor">@color/eden_glow_cyan</item>
+        <item name="android:shadowDx">0</item>
+        <item name="android:shadowDy">0</item>
+        <item name="android:shadowRadius">4</item>
+    </style>
+    <style name="SynthwaveText.Accent" parent="TextAppearance.Material3.LabelLarge">
+        <item name="android:textColor">@color/eden_accent_orange</item>
+        <item name="android:textStyle">bold</item>
+        <item name="android:fontFamily">monospace</item>
+        <item name="android:letterSpacing">0.1</item>
+        <item name="android:shadowColor">@color/eden_glow_orange</item>
+        <item name="android:shadowDx">0</item>
+        <item name="android:shadowDy">0</item>
+        <item name="android:shadowRadius">4</item>
+    </style>
+    <!-- Shape appearance for carousel images -->
+    <style name="ShapeAppearance.Eden.CarouselImage" parent="">
+        <item name="cornerFamily">rounded</item>
+        <item name="cornerSizeTopLeft">8dp</item>
+        <item name="cornerSizeTopRight">8dp</item>
+        <item name="cornerSizeBottomLeft">0dp</item>
+        <item name="cornerSizeBottomRight">0dp</item>
+    </style>
+
+</resources>

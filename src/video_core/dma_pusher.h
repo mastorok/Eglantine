@@ -1,0 +1,395 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#pragma once
+
+#include <array>
+#include <atomic>
+#include <condition_variable>
+#include <cstdlib>
+#include <optional>
+#include <span>
+#include <vector>
+#include <boost/container/small_vector.hpp>
+#include <deque>
+#include <queue>
+
+#include "common/bit_field.h"
+#include "common/common_types.h"
+#include "common/scratch_buffer.h"
+#include "video_core/engines/engine_interface.h"
+#include "video_core/engines/puller.h"
+
+namespace Core {
+class System;
+}
+
+namespace Tegra {
+
+namespace Control {
+struct ChannelState;
+}
+
+class GPU;
+class MemoryManager;
+
+enum class SubmissionMode : u32 {
+    IncreasingOld = 0,
+    Increasing = 1,
+    NonIncreasingOld = 2,
+    NonIncreasing = 3,
+    Inline = 4,
+    IncreaseOnce = 5
+};
+
+// Note that, traditionally, methods are treated as 4-byte addressable locations, and hence
+// their numbers are written down multiplied by 4 in Docs. Here we are not multiply by 4.
+// So the values you see in docs might be multiplied by 4.
+// Register documentation:
+// https://github.com/NVIDIA/open-gpu-doc/blob/ab27fc22db5de0d02a4cabe08e555663b62db4d4/classes/host/cla26f.h
+//
+// Register Description (approx):
+// https://github.com/NVIDIA/open-gpu-doc/blob/ab27fc22db5de0d02a4cabe08e555663b62db4d4/manuals/volta/gv100/dev_pbdma.ref.txt
+enum class BufferMethods : u32 {
+    BindObject = 0x0,
+    Illegal = 0x1,
+    Nop = 0x2,
+    SemaphoreAddressHigh = 0x4,
+    SemaphoreAddressLow = 0x5,
+    SemaphoreSequencePayload = 0x6,
+    SemaphoreOperation = 0x7,
+    NonStallInterrupt = 0x8,
+    WrcacheFlush = 0x9,
+    MemOpA = 0xA,
+    MemOpB = 0xB,
+    MemOpC = 0xC,
+    MemOpD = 0xD,
+    RefCnt = 0x14,
+    SemaphoreAcquire = 0x1A,
+    SemaphoreRelease = 0x1B,
+    SyncpointPayload = 0x1C,
+    SyncpointOperation = 0x1D,
+    WaitForIdle = 0x1E,
+    CRCCheck = 0x1F,
+    Yield = 0x20,
+    NonPullerMethods = 0x40,
+};
+
+struct CommandListHeader {
+    union {
+        u64 raw;
+        BitField<0, 40, GPUVAddr> addr;
+        BitField<40, 1, u64> allow_flush;
+        BitField<41, 1, u64> is_push_buffer;
+        BitField<42, 21, u64> size;
+        BitField<63, 1, u64> sync;
+    };
+};
+static_assert(sizeof(CommandListHeader) == sizeof(u64), "CommandListHeader is incorrect size");
+
+union CommandHeader {
+    u32 argument;
+    BitField<0, 13, u32> method;
+    BitField<0, 24, u32> method_count_;
+    BitField<13, 3, u32> subchannel;
+    BitField<16, 13, u32> arg_count;
+    BitField<16, 13, u32> method_count;
+    BitField<29, 3, SubmissionMode> mode;
+};
+static_assert(std::is_standard_layout_v<CommandHeader>, "CommandHeader is not standard layout");
+static_assert(sizeof(CommandHeader) == sizeof(u32), "CommandHeader has incorrect size!");
+
+inline CommandHeader BuildCommandHeader(BufferMethods method, u32 arg_count, SubmissionMode mode) {
+    CommandHeader result{};
+    result.method.Assign(static_cast<u32>(method));
+    result.arg_count.Assign(arg_count);
+    result.mode.Assign(mode);
+    return result;
+}
+
+/// Keeps the blocks of the command lists' submit-time copies for reuse. The guest's submit
+/// thread allocated ~1000 a second, of up to hundreds of KiB, and the GPU thread freed them:
+/// in Ocarina of Time each free took the heap ~30 us of the GPU thread, and each allocation the
+/// submit thread almost as long.
+namespace CommandWordsPool {
+[[nodiscard]] void* Allocate(std::size_t bytes);
+void Deallocate(void* pointer, std::size_t bytes) noexcept;
+/// Frees the blocks kept for reuse (when a channel goes away).
+void Trim() noexcept;
+/// Bytes kept for reuse.
+[[nodiscard]] std::size_t PooledBytes() noexcept;
+} // namespace CommandWordsPool
+
+template <typename T>
+struct CommandWordsAllocator {
+    using value_type = T;
+
+    CommandWordsAllocator() noexcept = default;
+    template <typename U>
+    CommandWordsAllocator(const CommandWordsAllocator<U>&) noexcept {}
+
+    [[nodiscard]] T* allocate(std::size_t count) {
+        return static_cast<T*>(CommandWordsPool::Allocate(count * sizeof(T)));
+    }
+    void deallocate(T* pointer, std::size_t count) noexcept {
+        CommandWordsPool::Deallocate(pointer, count * sizeof(T));
+    }
+    template <typename U>
+    bool operator==(const CommandWordsAllocator<U>&) const noexcept {
+        return true;
+    }
+};
+
+struct CommandList final {
+    CommandList() = default;
+    explicit CommandList(std::size_t size) : command_lists(size) {}
+    explicit CommandList(boost::container::small_vector<CommandHeader, 512>&& prefetch_command_list_)
+        : prefetch_command_list{std::move(prefetch_command_list_)} {}
+
+    boost::container::small_vector<CommandListHeader, 512> command_lists;
+    boost::container::small_vector<CommandHeader, 512> prefetch_command_list;
+    /// EDEN_NX2_PB_CHECK: hash of each entry's words when it was submitted.
+    std::vector<u64> submit_hashes;
+    /// The entries' words when they were submitted (NX2), each entry's at submitted_offsets[i]:
+    /// executed instead of the memory, which the game may already be refilling for a later frame.
+    std::vector<CommandHeader, CommandWordsAllocator<CommandHeader>> submitted_words;
+    std::vector<u32> submitted_offsets;
+    /// Entries (ascending) not copied when submitted, because a GPU map still queued covers them:
+    /// DmaPusher::Push copies them after the map, and until then they read memory.
+    std::vector<u32> deferred_entries;
+    /// DmaPusher::suspensions when the words were copied. A list copied during a suspension, or
+    /// that waited behind one, reads memory instead: games write the commands it runs before they
+    /// release the acquire.
+    u64 snapshot_suspensions = 0;
+    /// The snapshot copier's job that copies the words again (DmaPusher::QueueSnapshotCopy), 0
+    /// for none: the GPU thread waits for it before it parses or copies the list itself.
+    u64 copy_job = 0;
+};
+
+/// FNV-1a over pushbuffer words (EDEN_NX2_PB_CHECK).
+inline u64 HashPushbufferWords(std::span<const u32> words) {
+    u64 hash = 0xcbf29ce484222325ULL;
+    for (const u32 word : words) {
+        hash = (hash ^ word) * 0x100000001b3ULL;
+    }
+    return hash;
+}
+
+/// @brief The DmaPusher class implements DMA submission to FIFOs, providing an area of memory that the
+/// emulated app fills with commands and tells PFIFO to process. The pushbuffers are then assembled
+/// into a "command stream" consisting of 32-bit words that make up "commands".
+/// See https://envytools.readthedocs.io/en/latest/hw/fifo/dma-pusher.html#fifo-dma-pusher for
+/// details on this implementation.
+class DmaPusher final {
+public:
+    /// Counts suspensions on a semaphore acquire and the resumes after them, so it is odd while
+    /// the channel is suspended (see CommandList::snapshot_suspensions).
+    std::atomic<u64> suspensions{0};
+
+    explicit DmaPusher(Core::System& system_, MemoryManager& memory_manager_, Control::ChannelState& channel_state_);
+    ~DmaPusher();
+
+    void Push(CommandList&& entries) {
+        // Copied during a suspension, or behind one: copy again now, unless still suspended.
+        const u64 now = suspensions.load(std::memory_order_acquire);
+        if (!entries.submitted_offsets.empty() && (now & 1) == 0) {
+            if (ResnapshotEnabled() && entries.snapshot_suspensions != now) {
+                RefreshSnapshot(entries, now);
+            } else if (!entries.deferred_entries.empty()) {
+                // Behind a GPU map when submitted: the map has run by now (GPU::MapInOrder).
+                RefreshDeferredEntries(entries);
+            }
+        }
+        dma_pushbuffer.push_back(std::move(entries));
+    }
+
+    void DispatchCalls();
+
+    /// Switch 2: true while the channel is suspended, on a semaphore acquire or on the GPU's copy
+    /// of a command list it reads next.
+    [[nodiscard]] bool HasPendingAcquire() const {
+        return puller.HasPendingAcquire() || pending_list_tick.has_value();
+    }
+    [[nodiscard]] bool CanResumeAcquire();
+    /// Suspended on the GPU's copy of a command list.
+    [[nodiscard]] bool WaitsForListCopy() const {
+        return pending_list_tick.has_value();
+    }
+
+    void BindSubchannel(Engines::EngineInterface* engine, u32 subchannel_id, Engines::EngineTypes engine_type) {
+        subchannels[subchannel_id] = engine;
+        subchannel_type[subchannel_id] = engine_type;
+    }
+
+    void BindRasterizer(VideoCore::RasterizerInterface* rasterizer);
+
+private:
+    friend struct DmaPusherTestAccess;
+
+    static bool IsMemoryWriter(const Engines::EngineInterface& engine, Engines::EngineTypes type,
+                               u32 method);
+
+    static constexpr u32 non_puller_methods = 0x40;
+    static constexpr u32 max_subchannels = 8;
+    bool Step();
+    /// Returns how many words were processed: fewer than given when a semaphore acquire
+    /// suspended the channel.
+    size_t ProcessCommands(std::span<const CommandHeader> commands, size_t word_offset = 0);
+    size_t command_resume_offset{}; ///< Words of the current entry done before a suspension
+
+    void SetState(const CommandHeader& command_header);
+
+    void CallMethod(u32 argument);
+    void CallMultiMethod(const u32* base_start, u32 num_methods);
+    [[nodiscard]] bool WantsSegment() const;
+    void ReportUnboundSubchannel();
+    void WatchArgument(u32 method, u32 argument) const;
+
+public:
+    /// Logs the GPFIFO entry being processed (and the one before it), read through the GPU MMU
+    /// and straight from guest memory, to find pushbuffer desyncs. Debug aid for Switch 2.
+    void DumpCurrentEntry(const char* reason);
+    void CheckSubmitHash(const CommandListHeader& header, u64 submit_hash);
+    void RecordParsedEntry(const CommandListHeader& header, std::span<const CommandHeader> commands);
+    /// Whether the entry lies on device pages the GPU has written (NX2).
+    bool IsGpuWrittenCommands(GPUVAddr address, size_t size);
+    /// A method sent to the split's back as it is: keeps the copy and inline-to-memory engines'
+    /// registers, as their CallMethod and ConsumeSink store them.
+    void ShadowEngineMethod(Engines::EngineTypes type, u32 method, u32 argument);
+    /// What the back writes running that method, with the registers ShadowEngineMethod kept:
+    /// copies and their semaphores, inline-to-memory uploads (GpuSplit::NoteWrite), and what a
+    /// copy's semaphore writes (GpuSplit::NoteSemaphoreWrite).
+    void NoteEngineWrites(Engines::EngineTypes type, u32 method);
+    /// Copies the list's words from memory again, as of suspension count `now`, from entry
+    /// `first_entry` on (the entries before it ran already). Waits for the list's copier job first.
+    void RefreshSnapshot(CommandList& list, u64 now, size_t first_entry = 0);
+    /// RefreshSnapshot on the snapshot copier's thread. False when its queue is full (the caller
+    /// copies).
+    bool QueueSnapshotCopy(CommandList& list, u64 now);
+    /// Waits until the snapshot copier copied everything queued (before work that may change the
+    /// GPU's mappings, and before a channel goes away).
+    static void WaitForSnapshotCopies();
+    /// Copies the list's deferred entries (CommandList::deferred_entries) from memory.
+    void RefreshDeferredEntries(CommandList& list);
+
+    /// EDEN_NX2_RESNAPSHOT=0 turns snapshot refreshes off.
+    static bool ResnapshotEnabled() {
+        static const bool enabled = [] {
+            const char* value = std::getenv("EDEN_NX2_RESNAPSHOT");
+            return value == nullptr || value[0] != '0';
+        }();
+        return enabled;
+    }
+    /// Reads a command list on pages the GPU wrote into command_headers, from the copies the
+    /// buffer cache made after the work that wrote them or from guest memory for pages flushed
+    /// since. False when not all are current (or the list isn't GPU-written): the caller drains,
+    /// flushes and reads guest memory. With `pending`, a copy the GPU has not finished sets
+    /// `*pending` and pending_list_tick instead of waiting (the result is false then).
+    bool ReadGpuWrittenCommands(GPUVAddr address, u32 count, bool* pending = nullptr);
+    /// Takes a complete compute macro call's GPU-written parameters as slot placeholders when
+    /// a tagged dry run proves the front can leave their values to the host GPU.
+    bool TakeGpuWrittenListWords(const CommandListHeader& header);
+    /// Brings command list words the GPU wrote (still only in host buffers) to guest memory.
+    bool FlushGpuWrittenCommands(GPUVAddr address, size_t size);
+    /// A safe read of a command list on the split's front: the GPU-written list tracking follows
+    /// the buffer cache, so what the texture and query caches hold of the list (images, reports)
+    /// is written out on the back after the work sent before it, as a safe read flushes it. The
+    /// caches are asked once the work before the last host-level wait has run (WaitForSync). Only
+    /// a list that is read from memory (`live`) or that an image wrote is flushed. After an image
+    /// write every cache is flushed, the buffer cache too, and it returns true: the list is read
+    /// from guest memory, not from its submit-time copy or a buffer cache list copy.
+    bool FlushCachedCommands(GPUVAddr address, size_t size, bool live);
+
+private:
+
+public:
+    Common::ScratchBuffer<CommandHeader> command_headers; ///< Buffer for list of commands fetched at once
+
+    std::deque<CommandList> dma_pushbuffer; ///< Queue of command lists to be processed
+    std::size_t dma_pushbuffer_subindex{};  ///< Index within a command list within the pushbuffer
+
+    struct DmaState {
+        u32 method;            ///< Current method
+        u32 subchannel;        ///< Current subchannel
+        u32 method_count;      ///< Current method count
+        u32 length_pending;    ///< Large NI command length pending
+        GPUVAddr dma_get;      ///< Currently read segment
+        u64 dma_word_offset;   ///< Current word offset from address
+        bool non_incrementing; ///< Current command's NI flag
+        bool is_last_call;
+    };
+
+    Core::System& system;
+    MemoryManager& memory_manager;
+    Control::ChannelState& channel_state;
+
+    DmaState dma_state{};
+
+    // Switch 2: methods whose data continues in a later GPFIFO entry, set aside while other
+    // command buffers run (NVN interleaves several, so more than one can be pending).
+    struct ParkedMethod {
+        u32 method;
+        u32 subchannel;
+        u32 method_count;
+        bool non_incrementing;
+        bool increment_once;
+        GPUVAddr resume_address; ///< Where the entry that continues the method starts
+    };
+    void ResolveSplitMethod(GPUVAddr entry_address);
+    static constexpr size_t MaxParkedMethods = 16;
+
+    // Read per channel, not at static initialization, which runs before the frontend loads
+    // nx2_switches.txt.
+    // EDEN_NX2_SEM_WATCH=<gpu address>: log every method whose argument is the low word of an
+    // address in the 16 bytes there (finds the engine and method that release a semaphore).
+    const u32 semaphore_watch = [] {
+        const char* value = std::getenv("EDEN_NX2_SEM_WATCH");
+        return value ? static_cast<u32>(std::strtoull(value, nullptr, 16)) : 0U;
+    }();
+    // EDEN_NX2_PB_CHECK also keeps the last parsed entries, for DumpCurrentEntry.
+    const bool record_parsed_entries = std::getenv("EDEN_NX2_PB_CHECK") != nullptr;
+
+    // Debug aid: hashes of the words of the last entries as they were parsed.
+    struct ParsedEntry {
+        GPUVAddr address;
+        u32 size;
+        u64 hash;
+    };
+    std::array<ParsedEntry, 64> parsed_entries{};
+    size_t parsed_entry_count{};
+    std::vector<ParkedMethod> parked_methods;
+    GPUVAddr split_method_end{}; ///< End of the last entry that ended inside a method
+
+    std::array<Engines::EngineInterface*, max_subchannels> subchannels{};
+    std::array<Engines::EngineTypes, max_subchannels> subchannel_type;
+    /// The registers of the channel's copy engine (MaxwellDMA::RegisterCount) and its
+    /// inline-to-memory engine (KeplerMemory::Regs::NUM_REGS), as the methods sent left them
+    /// (ShadowEngineMethod): where the back's copies and uploads write.
+    static constexpr size_t DmaRegisterCount = 0x800;
+    static constexpr size_t InlineToMemoryRegisterCount = 0x7f;
+    std::array<u32, DmaRegisterCount> dma_registers{};
+    std::array<u32, InlineToMemoryRegisterCount> inline_to_memory_registers{};
+
+    Engines::Puller puller;
+    std::mutex sync_mutex;
+    std::condition_variable sync_cv;
+
+    VideoCore::RasterizerInterface* rasterizer = nullptr;
+    /// Host GPU tick of the command list copy this channel waits for (ReadGpuWrittenCommands).
+    std::optional<u64> pending_list_tick;
+    /// The entry parsed next was suspended on pending_list_tick, which is done now.
+    bool resumed_list_read{};
+    /// When the channel suspended on pending_list_tick (EDEN_NX2_LIST_MACRO_TRACE), else 0.
+    u64 list_trace_wait_start{};
+
+    // Not bitfields: the fence thread sets synced, and a bitfield write would rewrite the byte it
+    // shares with dma_increment_once and signal_sync (#479).
+    const bool ib_enable = true; ///< IB mode enabled
+    bool dma_increment_once = false;
+    bool signal_sync = false;
+    std::atomic<bool> synced{false};
+};
+
+} // namespace Tegra
