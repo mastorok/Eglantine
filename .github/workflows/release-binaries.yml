@@ -13,22 +13,7 @@ on:
         default: false
   push:
     branches:
-      - nx2-experimental
-    # A binary only changes when build inputs change; docs-only pushes skip the build.
-    paths:
-      - "src/**"
-      # Test-only changes cannot change a binary: the build configures with BUILD_TESTING=OFF and
-      # LICHII_TESTS=OFF below, so a push that only touches src/tests has nothing to rebuild.
-      - "!src/tests/**"
-      - "CMakeLists.txt"
-      - "CMakeModules/**"
-      - "externals/**"
-      - "dist/**"
-      - "tools/**"
-      - ".patch/**"
-      - "cpmfile.json"
-      - "*.profdata"
-      - ".github/workflows/release-binaries.yml"
+      - claude/lichii-b1
 
 permissions:
   contents: read
@@ -59,7 +44,7 @@ jobs:
           exit 1
 
       - name: Prepare release tag
-        if: github.event_name == 'push' || inputs.publish_release
+        if: false
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -90,30 +75,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: linux-x86_64
-            runner: ubuntu-24.04
           # The Linux -pgo builds are the same programs compiled by clang against the repo's
           # eglantine.profdata. Eden's profile (Eden-CI/PGO) comes from Switch 1 games: with it Mario
           # Kart World ran at about half the speed of the normal build, with eglantine.profdata at
           # about the same speed. Both Windows builds are clang-cl with ThinLTO; windows-x86_64-pgo
           # adds lichii-windows.profdata, an MSVC-ABI profile trained on Ocarina of Time (see
           # docs/CI.md). MSVC still builds for development.
-          - platform: linux-x86_64-pgo
-            runner: ubuntu-24.04
-            pgo: true
           - platform: windows-x86_64
             runner: windows-2022
           - platform: windows-x86_64-pgo
             runner: windows-2022
             pgo: true
             profile: lichii-windows.profdata
-          - platform: linux-aarch64
-            runner: ubuntu-24.04-arm
-          - platform: linux-aarch64-pgo
-            runner: ubuntu-24.04-arm
-            pgo: true
-          - platform: macos-arm64
-            runner: macos-15
 
     steps:
       - name: Check out source
@@ -316,7 +289,7 @@ jobs:
             -DLICHII_USE_BUNDLED_SDL3=ON
             -DVulkanHeaders_FORCE_BUNDLED=ON
             -DVulkanUtilityLibraries_FORCE_BUNDLED=ON
-            -DENABLE_UPDATE_CHECKER=ON
+            -DENABLE_UPDATE_CHECKER=OFF
             -DLICHII_BUILD_TAG=build-${{ github.run_number }}
             -DLICHII_BUILD_PLATFORM=${{ matrix.platform }}
             -DUSE_DISCORD_PRESENCE=OFF
@@ -364,7 +337,7 @@ jobs:
             -DLICHII_USE_BUNDLED_QT=OFF \
             -DENABLE_QT_TRANSLATION=ON \
             -DLICHII_USE_BUNDLED_SDL3=ON \
-            -DENABLE_UPDATE_CHECKER=ON \
+            -DENABLE_UPDATE_CHECKER=OFF \
             -DLICHII_BUILD_TAG=build-${{ github.run_number }} \
             -DLICHII_BUILD_PLATFORM=${{ matrix.platform }} \
             -DUSE_DISCORD_PRESENCE=OFF \
@@ -397,7 +370,7 @@ jobs:
             "-DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" \
             -DVulkanHeaders_FORCE_BUNDLED=ON \
             -DVulkanUtilityLibraries_FORCE_BUNDLED=ON \
-            -DENABLE_UPDATE_CHECKER=ON \
+            -DENABLE_UPDATE_CHECKER=OFF \
             -DLICHII_BUILD_TAG=build-${{ github.run_number }} \
             -DLICHII_BUILD_PLATFORM=${{ matrix.platform }} \
             -DUSE_DISCORD_PRESENCE=OFF \
@@ -415,7 +388,6 @@ jobs:
         run: |
           if command -v ccache > /dev/null; then ccache --zero-stats; else sccache --zero-stats; fi
           targets="lichii lichii-cmd"
-          if [[ "${{ matrix.platform }}" == windows* ]]; then targets="$targets lichii-updater"; fi
           cmake --build build/release --target $targets --parallel
           if command -v ccache > /dev/null; then ccache --show-stats; else sccache --show-stats; fi
 
@@ -677,7 +649,7 @@ jobs:
   release:
     name: Publish release
     needs: build
-    if: github.event_name == 'push' || inputs.publish_release
+    if: false
     runs-on: ubuntu-24.04
     permissions:
       contents: write
