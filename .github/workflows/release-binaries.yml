@@ -777,3 +777,55 @@ jobs:
             echo "Release is tagged '$published_tag' and titled '$published_title', expected tag $expected and a title naming build ${GITHUB_RUN_NUMBER}"
             exit 1
           fi
+
+  # Publishes the two Windows zips of the newest build under one fixed tag, lichii-latest, replacing
+  # the previous ones. The launcher (Litchii_Custom) reads this release to update itself, so there is
+  # no build-N tag per run. Skipped for Nsight Aftermath test builds and when a manual run unticks
+  # "Publish the binaries as a GitHub release".
+  publish-latest:
+    name: Publish latest Windows zips
+    needs: build
+    if: ${{ !inputs.nsight_aftermath && (github.event_name == 'push' || inputs.publish_release) }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download Windows binaries
+        uses: actions/download-artifact@v7
+        with:
+          pattern: lichii-windows-*-${{ github.sha }}
+          path: artifacts
+
+      - name: Zip the binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir dist
+          for artifact in artifacts/*/; do
+            name=$(basename "$artifact")
+            # lichii-windows-x86_64-<sha> becomes lichii-windows-x86_64.zip
+            (cd "$artifact" && zip -qr "${GITHUB_WORKSPACE}/dist/${name%-${GITHUB_SHA}}.zip" .)
+          done
+          ls -la dist
+          test -s dist/lichii-windows-x86_64.zip
+          test -s dist/lichii-windows-x86_64-pgo.zip
+
+      - name: Replace the lichii-latest release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cat > notes.md <<NOTES
+          Newest automatic build of \`${GITHUB_REF_NAME}\`: build ${GITHUB_RUN_NUMBER}, commit ${GITHUB_SHA}.
+
+          This release is replaced by every build, so the link never changes. Extract a zip and run \`lichii.exe\`.
+          The PGO zip is the same program compiled with a profile trained on Ocarina of Time.
+          NOTES
+          gh release delete lichii-latest --repo "${GITHUB_REPOSITORY}" --yes --cleanup-tag || true
+          gh release create lichii-latest dist/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --target "${GITHUB_SHA}" \
+            --prerelease \
+            --title "Lichii, newest build (build ${GITHUB_RUN_NUMBER}, ${GITHUB_SHA::7})" \
+            --notes-file notes.md

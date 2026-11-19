@@ -26,5 +26,8 @@ it merged without a conflict, although Lichii had edited the same workflow file.
 
 ## Build
 
-A push to `claude/lichii` runs `release-binaries` (windows-x86_64 and windows-x86_64-pgo). It publishes
-nothing: the zips are artifacts of the run.
+A push to `claude/lichii` runs `release-binaries` (windows-x86_64 and windows-x86_64-pgo). The zips are
+artifacts of the run, and the `publish-latest` job also puts them in one GitHub release tagged
+`lichii-latest`, replacing the previous build's files each time (assets `lichii-windows-x86_64.zip` and
+`lichii-windows-x86_64-pgo.zip`, no `build-N` tag per run). The launcher on the owner's PC reads that release
+through the GitHub API, which needs no token because the fork is public.
