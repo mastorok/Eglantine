@@ -5127,7 +5127,12 @@ void TextureCache<P>::ForEachSparseSegment(ImageBase& image, Func&& func) {
     const auto segments = gpu_memory->GetSubmappedRange(image.gpu_addr, image.guest_size_bytes);
     for (const auto& [gpu_addr, size] : segments) {
         std::optional<DAddr> cpu_addr = gpu_memory->GpuToCpuAddress(gpu_addr);
-        ASSERT(cpu_addr);
+        if (!cpu_addr) {
+            // A segment with no guest memory behind it has nothing to upload. Metroid Prime 4 hit
+            // this 46 times in a session (assert cpu_addr), and the release build then read an
+            // empty optional.
+            continue;
+        }
         if constexpr (RETURNS_BOOL) {
             if (func(gpu_addr, *cpu_addr, size)) {
                 break;

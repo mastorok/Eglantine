@@ -387,7 +387,11 @@ jobs:
         shell: bash
         run: |
           if command -v ccache > /dev/null; then ccache --zero-stats; else sccache --zero-stats; fi
+          # The plain Windows zip is the one the Litchii Custom launcher installs, so it skips
+          # lichii-cmd (eden-cli): its ThinLTO link ran alongside lichii's and added about three
+          # minutes. The -pgo zip and the other platforms still build and ship both programs.
           targets="lichii lichii-cmd"
+          if [ '${{ matrix.platform }}' = windows-x86_64 ]; then targets="lichii"; fi
           cmake --build build/release --target $targets --parallel
           if command -v ccache > /dev/null; then ccache --show-stats; else sccache --show-stats; fi
 
@@ -514,7 +518,9 @@ jobs:
         if: startsWith(matrix.platform, 'windows')
         shell: pwsh
         run: |
-          foreach ($exe in 'lichii.exe', 'eden-cli.exe') {
+          $required = @('lichii.exe', 'eden-cli.exe')
+          if ('${{ matrix.platform }}' -eq 'windows-x86_64') { $required = @('lichii.exe') }
+          foreach ($exe in $required) {
             if (-not (Test-Path "build/release/bin/$exe")) {
               throw "build/release/bin/$exe was not produced"
             }
@@ -741,7 +747,7 @@ jobs:
 
           ## Windows
 
-          Windows packages are in-place zip files: extract and run \`lichii.exe\`, or \`eden-cli.exe\` from a terminal.
+          Windows packages are in-place zip files: extract and run \`lichii.exe\`. The PGO zip also holds \`eden-cli.exe\`, to run from a terminal.
 
           $({
             row "amd64 / x86_64" "$(link zip lichii-windows-x86_64.zip)" "$(link "PGO zip" lichii-windows-x86_64-pgo.zip)" "Both built with clang-cl and ThinLTO; the PGO zip adds a profile trained on Ocarina of Time"
