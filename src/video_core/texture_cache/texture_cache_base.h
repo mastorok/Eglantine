@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <thread>
 #include <chrono>
 #include <deque>
 #include <limits>
@@ -281,6 +282,34 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
         size_t last_submitted_offset = 0;
         size_t bytes_per_slice;
         bool initialized = false;
+    };
+
+    /// A big 3D volume that already has contents, read and untiled by a thread of its own into a
+    /// staging buffer taken out of the pool; TickAsyncVolumes records the copy into the image once
+    /// the thread is done. The draws in between use the older contents.
+    struct AsyncVolumeJob {
+        AsyncVolumeJob() = default;
+        AsyncVolumeJob(const AsyncVolumeJob&) = delete;
+        AsyncVolumeJob& operator=(const AsyncVolumeJob&) = delete;
+        ~AsyncVolumeJob() {
+            if (thread.joinable()) {
+                thread.join();
+            }
+        }
+        ImageId image_id;
+        VideoCommon::ImageInfo info;
+        GPUVAddr gpu_addr{};
+        size_t guest_size{};
+        Tegra::MemoryManager* memory{};
+        AsyncBuffer staging;
+        std::unique_ptr<u8[]> source;
+        boost::container::small_vector<BufferImageCopy, 16> copies;
+        std::thread thread;
+        std::atomic<bool> done{false};
+        bool cancelled{false};
+        u64 frame_started{};
+        std::chrono::steady_clock::time_point started;
+        double worker_ms{};
     };
 
     struct BlitImages {
@@ -694,6 +723,13 @@ private:
     void QueueAsyncUnswizzle(Image& image, ImageId image_id);
     void TickAsyncUnswizzle();
 
+    /// Reads and untiles a big volume's new contents on a thread of its own. False: not eligible
+    /// (the caller uploads it as usual).
+    bool StartAsyncVolumeUpload(Image& image, ImageId image_id);
+    [[nodiscard]] bool AsyncVolumeInFlight(ImageId image_id) const;
+    void CancelAsyncVolumeJob(ImageId image_id);
+    void TickAsyncVolumes();
+
     Runtime& runtime;
 
     Tegra::MaxwellDeviceMemoryManager& device_memory;
@@ -963,6 +999,7 @@ private:
 
     std::deque<PendingUnswizzle> unswizzle_queue;
     u8 current_unswizzle_frame;
+    std::vector<std::unique_ptr<AsyncVolumeJob>> async_volume_jobs;
 
     // Join caching
     boost::container::small_vector<ImageId, 4> join_overlap_ids;

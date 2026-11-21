@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <new>
 #include <numeric>
 #include <cstdlib>
 #include <limits>
@@ -103,6 +104,21 @@ constexpr u64 VolumeThrottleMinBytes = u64{64} << 20;
                                 .count()) +
            1;
 }
+
+/// EDEN_NX2_TC_ASYNC_VOLUMES=0 turns off the background uploads of big volumes (below).
+[[nodiscard]] inline bool AsyncVolumesEnabled() {
+    static const bool value = [] {
+        const char* const v = std::getenv("EDEN_NX2_TC_ASYNC_VOLUMES");
+        return v == nullptr || v[0] != '0';
+    }();
+    return value;
+}
+
+/// Big volumes being read and untiled at once at most (each one uses a thread and up to three
+/// texture workers).
+constexpr size_t AsyncVolumeMaxJobs = 2;
+inline u64 g_volume_async_started{};
+inline u64 g_volume_async_applied{};
 
 /// Uploads of big volumes put off since the last log line, and the frame's spending on them.
 inline u64 g_volume_uploads_deferred{};
@@ -1644,10 +1660,12 @@ void TextureCache<P>::TickFrame() {
                  "for buffer-written pages; {} MiB of pages marked stale",
                  tc_stale_skips, tc_stale_skip_bytes >> 20, tc_stale_gpu_written,
                  (stale_pages.Count() << StalePages::PAGE_BITS) >> 20);
-        if (g_volume_uploads_deferred != 0) {
-            LOG_INFO(HW_GPU, "Texture cache last 600 frames: {} big volume uploads put off",
-                     g_volume_uploads_deferred);
-            g_volume_uploads_deferred = 0;
+        if (g_volume_uploads_deferred != 0 || g_volume_async_started != 0) {
+            LOG_INFO(HW_GPU,
+                     "Texture cache last 600 frames: big volumes: {} uploads put off, {} read on a "
+                     "thread, {} applied",
+                     g_volume_uploads_deferred, g_volume_async_started, g_volume_async_applied);
+            g_volume_uploads_deferred = g_volume_async_started = g_volume_async_applied = 0;
         }
         tc_stale_skips = tc_stale_skip_bytes = tc_stale_gpu_written = 0;
         images_uploaded = uploaded_bytes = largest_upload = layer_uploads = 0;
@@ -1697,6 +1715,7 @@ void TextureCache<P>::TickFrame() {
     sentenced_image_view.Tick();
     TickAsyncDecode();
     TickAsyncUnswizzle();
+    TickAsyncVolumes();
     if (frame_tick % 600 == 0 && !uploaded_ranges.empty()) {
         for (const auto& [address, size] : uploaded_ranges) {
             device_memory.HintCold(address, size);
@@ -3417,12 +3436,28 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
         // Only upload modified images
         return;
     }
+    // Sparse images (what the volumes of Metroid Prime 4 are) are in: they upload like any other.
     const bool big_volume =
         image.info.type == ImageType::e3D && image.guest_size_bytes >= VolumeThrottleMinBytes &&
-        False(image.flags & (ImageFlagBits::GpuModified | ImageFlagBits::Sparse |
-                             ImageFlagBits::SparseLayers | ImageFlagBits::SparseTiles |
-                             ImageFlagBits::Unbacked | ImageFlagBits::AsynchronousDecode));
-    if (big_volume && VolumeThrottleMs() != 0) {
+        False(image.flags & (ImageFlagBits::GpuModified | ImageFlagBits::SparseLayers |
+                             ImageFlagBits::SparseTiles | ImageFlagBits::Unbacked |
+                             ImageFlagBits::AsynchronousDecode));
+    // Its contents are on the GPU already and not tied to this frame's draws: the new ones can
+    // come from a thread of its own (the draws use the older ones until then).
+    const bool async_volume =
+        big_volume && image.volume_upload_us != 0 && AsyncVolumesEnabled() &&
+        image.dirty_layers.empty() &&
+        False(image.flags & (ImageFlagBits::Converted | ImageFlagBits::AcceleratedUpload |
+                             ImageFlagBits::TrimmedLevels)) &&
+        image.info.num_samples <= 1 && image.info.type != ImageType::Linear;
+    if (async_volume && (AsyncVolumeInFlight(image_id) ||
+                         async_volume_jobs.size() >= AsyncVolumeMaxJobs ||
+                         SteadyMicroseconds() - image.volume_upload_us <
+                             VolumeThrottleMs() * 1000)) {
+        // CpuModified stays set: the next frame that finds a free job slot starts it.
+        return;
+    }
+    if (big_volume && !async_volume && VolumeThrottleMs() != 0) {
         if (g_volume_budget_frame != frame_tick) {
             g_volume_budget_frame = frame_tick;
             g_volume_budget_spent_ms = 0.0;
@@ -3517,6 +3552,11 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
     }
     if (True(image.flags & ImageFlagBits::AsynchronousDecode)) {
         QueueAsyncDecode(image, image_id);
+        return;
+    }
+
+    if (async_volume && StartAsyncVolumeUpload(image, image_id)) {
+        image.volume_upload_us = SteadyMicroseconds();
         return;
     }
 
@@ -4291,6 +4331,124 @@ void TextureCache<P>::TickAsyncDecode() {
         i = async_decodes.erase(i);
     }
     if (has_uploads) {
+        runtime.InsertUploadMemoryBarrier();
+    }
+}
+
+template <class P>
+bool TextureCache<P>::AsyncVolumeInFlight(ImageId image_id) const {
+    for (const auto& job : async_volume_jobs) {
+        if (job->image_id == image_id && !job->cancelled) {
+            return true;
+        }
+    }
+    return false;
+}
+
+template <class P>
+void TextureCache<P>::CancelAsyncVolumeJob(ImageId image_id) {
+    for (const auto& job : async_volume_jobs) {
+        if (job->image_id == image_id) {
+            job->cancelled = true;
+        }
+    }
+}
+
+template <class P>
+bool TextureCache<P>::StartAsyncVolumeUpload(Image& image, ImageId image_id) {
+    const size_t guest_size = image.guest_size_bytes;
+    const size_t map_size = MapSizeBytes(image);
+    if (guest_size == 0 || map_size == 0 || async_volume_jobs.size() >= AsyncVolumeMaxJobs) {
+        return false;
+    }
+    auto job = std::make_unique<AsyncVolumeJob>();
+    job->image_id = image_id;
+    job->info = image.info;
+    job->gpu_addr = image.gpu_addr;
+    job->guest_size = guest_size;
+    job->memory = gpu_memory;
+    job->source.reset(new (std::nothrow) u8[guest_size]);
+    if (!job->source) {
+        return false;
+    }
+    // Taken out of the pool for the thread to write in: a buffer the pool hands out again once
+    // the GPU is past its tick could be overwritten under it.
+    job->staging = runtime.UploadStagingBuffer(map_size, true);
+    job->frame_started = frame_tick;
+    job->started = std::chrono::steady_clock::now();
+    AsyncVolumeJob* const raw = job.get();
+    raw->thread = std::thread([raw] {
+        raw->memory->ReadBlockUnsafe(raw->gpu_addr, raw->source.get(), raw->guest_size);
+        raw->copies = UnswizzleImage(*raw->memory, raw->gpu_addr, raw->info,
+                                     std::span<const u8>(raw->source.get(), raw->guest_size),
+                                     raw->staging.mapped_span, nullptr);
+        raw->source.reset();
+        raw->worker_ms = std::chrono::duration<double, std::milli>(
+                             std::chrono::steady_clock::now() - raw->started)
+                             .count();
+        raw->done.store(true, std::memory_order_release);
+    });
+    async_volume_jobs.push_back(std::move(job));
+    ++g_volume_async_started;
+    ++images_uploaded;
+    uploaded_bytes += guest_size;
+    largest_upload = (std::max<u64>)(largest_upload, guest_size);
+    return true;
+}
+
+template <class P>
+void TextureCache<P>::TickAsyncVolumes() {
+    if (async_volume_jobs.empty()) {
+        return;
+    }
+    size_t applied = 0;
+    for (auto it = async_volume_jobs.begin(); it != async_volume_jobs.end();) {
+        AsyncVolumeJob& job = **it;
+        if (!job.done.load(std::memory_order_acquire)) {
+            ++it;
+            continue;
+        }
+        if (!job.cancelled) {
+            if (applied >= 2) {
+                ++it; // a copy or two a frame: the rest next frame
+                continue;
+            }
+            if (job.thread.joinable()) {
+                job.thread.join();
+            }
+            Image& image = slot_images[job.image_id];
+            if (True(image.flags & ImageFlagBits::GpuModified)) {
+                // The GPU wrote to it since: these bytes are older than its contents.
+                if (job.thread.joinable()) {
+                    job.thread.join();
+                }
+                runtime.FreeDeferredStagingBuffer(job.staging);
+                it = async_volume_jobs.erase(it);
+                continue;
+            }
+            if (UploadTiming() && frame_tick - job.frame_started >= 1) {
+                static u32 logged{};
+                if (logged++ < 200) {
+                    LOG_INFO(HW_GPU,
+                             "TCASYNC volume gpu={:#x} fmt={} {}x{}x{} guest={}KiB thread={:.1f} ms "
+                             "frames_late={} frame={}",
+                             image.gpu_addr, static_cast<u32>(image.info.format),
+                             image.info.size.width, image.info.size.height, image.info.size.depth,
+                             image.guest_size_bytes / 1024, job.worker_ms,
+                             frame_tick - job.frame_started, frame_tick);
+                }
+            }
+            image.UploadMemory(job.staging, job.copies);
+            ++applied;
+            ++g_volume_async_applied;
+        }
+        if (job.thread.joinable()) {
+            job.thread.join();
+        }
+        runtime.FreeDeferredStagingBuffer(job.staging);
+        it = async_volume_jobs.erase(it);
+    }
+    if (applied != 0) {
         runtime.InsertUploadMemoryBarrier();
     }
 }
@@ -5476,6 +5634,9 @@ template <class P>
 void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
     const StutterTrace::SiteScope site{StutterTrace::Site::ImageDelete};
     ImageBase& image = slot_images[image_id];
+    if (!async_volume_jobs.empty()) {
+        CancelAsyncVolumeJob(image_id);
+    }
     ++images_deleted;
     ++churn.deleted;
     {
