@@ -12,9 +12,11 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <optional>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 #include "common/container/unordered_map.h"
 #include "common/container/unordered_set.h"
 #include <utility>
@@ -462,20 +464,74 @@ u64 AllocatedUsage(VkDeviceSize driver_usage, const VmaBudget& vma_budget) {
 PFN_vkAllocateMemory g_vma_allocate_memory{};
 PFN_vkFreeMemory g_vma_free_memory{};
 
+// The size and memory type of each block while the stutter trace is on, to say what a slow
+// allocation or free was (a 256 MiB staging buffer, a 223 MiB volume...).
+struct BlockRecord {
+    VkDeviceSize size;
+    u32 type_index;
+};
+std::mutex g_block_mutex;
+std::unordered_map<VkDeviceMemory, BlockRecord> g_blocks;
+
 VKAPI_ATTR VkResult VKAPI_CALL TimedAllocateMemory(VkDevice device,
                                                    const VkMemoryAllocateInfo* allocate_info,
                                                    const VkAllocationCallbacks* allocator,
                                                    VkDeviceMemory* memory) {
     using namespace VideoCommon::StutterTrace;
-    const SiteScope site{Site::MemoryAllocate};
-    return g_vma_allocate_memory(device, allocate_info, allocator, memory);
+    if (!Enabled()) {
+        return g_vma_allocate_memory(device, allocate_info, allocator, memory);
+    }
+    const auto begin = std::chrono::steady_clock::now();
+    VkResult result;
+    {
+        const SiteScope site{Site::MemoryAllocate};
+        result = g_vma_allocate_memory(device, allocate_info, allocator, memory);
+    }
+    if (result == VK_SUCCESS) {
+        {
+            std::scoped_lock lock{g_block_mutex};
+            g_blocks[*memory] = {allocate_info->allocationSize, allocate_info->memoryTypeIndex};
+        }
+        static std::atomic<u32> logged{};
+        const double ms = std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - begin)
+                              .count();
+        if (ms >= 8.0 && logged++ < 300) {
+            LOG_WARNING(Render_Vulkan, "Slow vkAllocateMemory: {} MiB (type {}) took {:.1f} ms",
+                        allocate_info->allocationSize >> 20, allocate_info->memoryTypeIndex, ms);
+        }
+    }
+    return result;
 }
 
 VKAPI_ATTR void VKAPI_CALL TimedFreeMemory(VkDevice device, VkDeviceMemory memory,
                                            const VkAllocationCallbacks* allocator) {
     using namespace VideoCommon::StutterTrace;
-    const SiteScope site{Site::MemoryFree};
-    g_vma_free_memory(device, memory, allocator);
+    if (!Enabled()) {
+        g_vma_free_memory(device, memory, allocator);
+        return;
+    }
+    BlockRecord record{};
+    {
+        std::scoped_lock lock{g_block_mutex};
+        if (const auto it = g_blocks.find(memory); it != g_blocks.end()) {
+            record = it->second;
+            g_blocks.erase(it);
+        }
+    }
+    const auto begin = std::chrono::steady_clock::now();
+    {
+        const SiteScope site{Site::MemoryFree};
+        g_vma_free_memory(device, memory, allocator);
+    }
+    static std::atomic<u32> logged{};
+    const double ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin)
+            .count();
+    if (ms >= 8.0 && logged++ < 300) {
+        LOG_WARNING(Render_Vulkan, "Slow vkFreeMemory: {} MiB (type {}) took {:.1f} ms",
+                    record.size >> 20, record.type_index, ms);
+    }
 }
 
 } // Anonymous namespace

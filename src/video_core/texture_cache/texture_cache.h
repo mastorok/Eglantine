@@ -65,6 +65,12 @@ namespace VideoCommon {
     return enabled;
 }
 
+/// The upload's phases are timed for EDEN_NX2_TC_TRACE, and for the stutter trace, which logs the
+/// slow ones (TCSLOW) without the per-image output of the former.
+[[nodiscard]] inline bool UploadTiming() {
+    return TextureCacheTrace() || StutterTrace::Enabled();
+}
+
 using Tegra::Texture::TICEntry;
 using Tegra::Texture::TSCEntry;
 using VideoCore::Surface::GetFormatType;
@@ -3465,32 +3471,41 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
     largest_upload = (std::max<u64>)(largest_upload, image.guest_size_bytes);
     using TraceClock = std::chrono::steady_clock;
     const bool tc_trace = TextureCacheTrace();
-    const auto trace_begin = tc_trace ? TraceClock::now() : TraceClock::time_point{};
-    const u64 trace_faults = tc_trace ? Common::GetProcessPageFaults() : 0;
+    const bool timed = UploadTiming();
+    const auto trace_begin = timed ? TraceClock::now() : TraceClock::time_point{};
+    const u64 trace_faults = timed ? Common::GetProcessPageFaults() : 0;
     auto trace_staged = trace_begin;
     upload_trace = {};
     const bool chunked = UploadInChunks(image);
     if (!chunked) {
         auto staging = runtime.UploadStagingBuffer(MapSizeBytes(image));
-        if (tc_trace) {
+        if (timed) {
             trace_staged = TraceClock::now();
         }
         UploadImageContents(image, staging);
         runtime.InsertUploadMemoryBarrier();
     }
-    if (tc_trace) {
+    if (timed) {
         using Ms = std::chrono::duration<double, std::milli>;
-        LOG_WARNING(HW_GPU,
-                    "TCTRACE upload gpu={:#x} fmt={} {}x{}x{} lv={} ly={} guest={}KiB host={}KiB "
-                    "ms={:.2f} staging={:.2f} prefault={:.2f} read={:.2f} untile={:.2f} faults={} "
-                    "chunked={} frame={}",
-                    image.gpu_addr, static_cast<u32>(image.info.format), image.info.size.width,
-                    image.info.size.height, image.info.size.depth, image.info.resources.levels,
-                    image.info.resources.layers, image.guest_size_bytes / 1024,
-                    MapSizeBytes(image) / 1024, Ms(TraceClock::now() - trace_begin).count(),
-                    Ms(trace_staged - trace_begin).count(), upload_trace.prefault_ms,
-                    upload_trace.read_ms, upload_trace.untile_ms,
-                    Common::GetProcessPageFaults() - trace_faults, chunked, frame_tick);
+        const double upload_ms = Ms(TraceClock::now() - trace_begin).count();
+        // Slow uploads are logged even without EDEN_NX2_TC_TRACE: which phase of the upload takes
+        // the time (the staging buffer, touching guest memory, reading it, untiling it, and the
+        // process's page faults meanwhile, which a fresh staging buffer makes by the thousand).
+        static u32 slow_uploads_logged{};
+        if (tc_trace || (upload_ms >= 15.0 && slow_uploads_logged++ < 400)) {
+            LOG_WARNING(HW_GPU,
+                        "{} upload gpu={:#x} fmt={} {}x{}x{} lv={} ly={} guest={}KiB host={}KiB "
+                        "ms={:.2f} staging={:.2f} prefault={:.2f} read={:.2f} untile={:.2f} "
+                        "faults={} chunked={} frame={}",
+                        tc_trace ? "TCTRACE" : "TCSLOW", image.gpu_addr,
+                        static_cast<u32>(image.info.format), image.info.size.width,
+                        image.info.size.height, image.info.size.depth, image.info.resources.levels,
+                        image.info.resources.layers, image.guest_size_bytes / 1024,
+                        MapSizeBytes(image) / 1024, upload_ms,
+                        Ms(trace_staged - trace_begin).count(), upload_trace.prefault_ms,
+                        upload_trace.read_ms, upload_trace.untile_ms,
+                        Common::GetProcessPageFaults() - trace_faults, chunked, frame_tick);
+        }
     }
     // The host GPU has its own copy now and the guest rarely reads this memory again: TickFrame
     // marks it cold, so the OS pages it out before anything else when it needs RAM (title 1
@@ -3818,7 +3833,7 @@ void TextureCache<P>::UploadImageContents(Image& image, StagingBuffer& staging) 
     }
 
     using TraceClock = std::chrono::steady_clock;
-    const bool tc_trace = TextureCacheTrace();
+    const bool tc_trace = UploadTiming();
     const auto prefault_begin = tc_trace ? TraceClock::now() : TraceClock::time_point{};
     PrefaultGuestMemory(*gpu_memory, gpu_addr, image.guest_size_bytes);
     const auto read_begin = tc_trace ? TraceClock::now() : TraceClock::time_point{};
@@ -3829,6 +3844,10 @@ void TextureCache<P>::UploadImageContents(Image& image, StagingBuffer& staging) 
     if (True(image.flags & ImageFlagBits::AcceleratedUpload)) {
         gpu_memory->ReadBlock(gpu_addr, mapped_span.data(), mapped_span.size_bytes(),
                               VideoCommon::CacheType::NoTextureCache);
+        if (tc_trace) {
+            upload_trace.read_ms =
+                std::chrono::duration<double, std::milli>(TraceClock::now() - read_begin).count();
+        }
         const auto uploads = FullUploadSwizzles(image.info);
         runtime.AccelerateImageUpload(image, staging, uploads, 0, 0);
         return;

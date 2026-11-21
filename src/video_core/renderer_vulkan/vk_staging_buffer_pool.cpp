@@ -387,12 +387,17 @@ void StagingBufferPool::ReleaseLevel(StagingBuffersCache& cache, size_t log2) {
     // swept every 64 frames, so after a pause each upload over 8 MiB (past the stream buffer's
     // regions) got a new dedicated allocation, written to for the first time (16 MiB on an
     // RTX 4080, idle system: 0.4 ms to create, 1.2 ms more for the first write).
-    constexpr size_t KeepMaxLog2 = 25;
-    constexpr size_t KeepPerLevel = 2;
+    // The big ones too, up to 512 MiB (two up to 256 MiB, one of 512 MiB: 1 GiB at most): Metroid
+    // Prime 4 uploads six volumes of 220 to 440 MiB at every zone change, each into a buffer made
+    // for it (~20 ms to allocate, ~60 ms of page faults for the first write) and freed about a
+    // second later (five vkFreeMemory of ~30 ms each: the stutter that follows the zone load). The
+    // memory-pressure path (ReleaseMemory) still frees them.
+    constexpr size_t KeepMaxLog2 = 29;
     if (&cache == &upload_cache && log2 <= KeepMaxLog2) {
+        const size_t keep_per_level = log2 <= 28 ? 2 : 1;
         size_t idle = 0;
-        std::erase_if(entries, [this, &idle](const StagingBuffer& entry) {
-            return scheduler.IsFree(entry.tick) && ++idle > KeepPerLevel;
+        std::erase_if(entries, [this, &idle, keep_per_level](const StagingBuffer& entry) {
+            return scheduler.IsFree(entry.tick) && ++idle > keep_per_level;
         });
         staging.delete_index = 0;
         if (staging.iterate_index > entries.size()) {

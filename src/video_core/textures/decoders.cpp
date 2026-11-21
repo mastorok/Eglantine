@@ -3,10 +3,13 @@
 
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cmath>
 #include <cstring>
+#include <latch>
 #include <span>
 
 #include "common/alignment.h"
@@ -15,6 +18,7 @@
 #include "common/div_ceil.h"
 #include "video_core/gpu.h"
 #include "video_core/textures/decoders.h"
+#include "video_core/textures/workers.h"
 
 namespace Tegra::Texture {
 namespace {
@@ -57,7 +61,11 @@ std::array<u32, GOB_SIZE_Y * 4> GobUnitOffsets(bool native_tiling) {
 
 template <bool TO_LINEAR, u32 BYTES_PER_PIXEL>
 void SwizzleImpl(std::span<u8> output, std::span<const u8> input, u32 width, u32 height, u32 depth,
-                 u32 block_height, u32 block_depth, u32 stride, bool native_tiling) {
+                 u32 block_height, u32 block_depth, u32 stride, bool native_tiling,
+                 u32 slice_begin = 0, u32 slice_end = ~0U) {
+    // Only the slices [slice_begin, slice_end) are done (all by default): slices are independent,
+    // so a big volume can be split across threads. Their offsets are those of the whole image.
+    slice_end = (std::min)(slice_end, depth);
     // The origin of the transformation can be configured here, leave it as zero as the current API
     // doesn't expose it.
     static constexpr u32 origin_x = 0;
@@ -82,7 +90,7 @@ void SwizzleImpl(std::span<u8> output, std::span<const u8> input, u32 width, u32
         // their offsets in a GOB come from a table instead of being computed one by one.
         const auto unit_offsets = GobUnitOffsets(native_tiling);
         const u32 gobs_wide = Common::DivCeil(width, 4U);
-        for (u32 slice = 0; slice < depth; ++slice) {
+        for (u32 slice = slice_begin; slice < slice_end; ++slice) {
             const u32 offset_z = (slice >> block_depth) * slice_size +
                                  ((slice & block_depth_mask) << (GOB_SIZE_SHIFT + block_height));
             for (u32 line = 0; line < height; ++line) {
@@ -108,7 +116,7 @@ void SwizzleImpl(std::span<u8> output, std::span<const u8> input, u32 width, u32
         return;
     }
 
-    for (u32 slice = 0; slice < depth; ++slice) {
+    for (u32 slice = slice_begin; slice < slice_end; ++slice) {
         const u32 z = slice + origin_z;
         const u32 offset_z = (z >> block_depth) * slice_size +
                              ((z & block_depth_mask) << (GOB_SIZE_SHIFT + block_height));
@@ -229,12 +237,14 @@ void SwizzleSubrectImpl(std::span<u8> output, std::span<const u8> input, u32 wid
 
 template <bool TO_LINEAR>
 void Swizzle(std::span<u8> output, std::span<const u8> input, u32 bytes_per_pixel, u32 width,
-             u32 height, u32 depth, u32 block_height, u32 block_depth, u32 stride_alignment, bool native_tiling) {
+             u32 height, u32 depth, u32 block_height, u32 block_depth, u32 stride_alignment,
+             bool native_tiling, u32 slice_begin = 0, u32 slice_end = ~0U) {
     switch (bytes_per_pixel) {
 #define BPP_CASE(x)                                                                                \
     case x:                                                                                        \
         return SwizzleImpl<TO_LINEAR, x>(output, input, width, height, depth, block_height,        \
-                                         block_depth, stride_alignment, native_tiling);
+                                         block_depth, stride_alignment, native_tiling,             \
+                                         slice_begin, slice_end);
         BPP_CASE(1)
         BPP_CASE(2)
         BPP_CASE(3)
@@ -250,15 +260,63 @@ void Swizzle(std::span<u8> output, std::span<const u8> input, u32 bytes_per_pixe
     }
 }
 
+// A volume at least this big (and this deep) is unswizzled by several threads. Metroid Prime 4
+// makes six 896x960x544 block-compressed volumes (220 to 440 MiB each) at every zone change, and
+// one thread took ~125 ms for each.
+constexpr size_t ParallelSliceMinBytes = 8 * 1024 * 1024;
+constexpr u32 ParallelSliceMinDepth = 8;
+constexpr u32 MaxSliceHelpers = 3;
+
+// Splits the slices among the texture workers. The caller does its share too, and all of the work
+// when no worker is free, so nothing waits on a busy pool.
+void UnswizzleSlicesInParallel(std::span<u8> output, std::span<const u8> input,
+                               u32 bytes_per_pixel, u32 width, u32 height, u32 depth,
+                               u32 block_height, u32 block_depth, u32 stride,
+                               bool native_tiling) {
+    // Whole depth blocks together: their slices share GOBs, which keeps each thread's reads local.
+    const u32 batch = (std::max)(1U << (std::min)(block_depth, 5U), 4U);
+    std::atomic<u32> cursor{0};
+    const auto work = [&] {
+        for (;;) {
+            const u32 first = cursor.fetch_add(batch, std::memory_order_relaxed);
+            if (first >= depth) {
+                return;
+            }
+            Swizzle<false>(output, input, bytes_per_pixel, width, height, depth, block_height,
+                           block_depth, stride, native_tiling, first,
+                           (std::min)(first + batch, depth));
+        }
+    };
+    std::latch helpers{static_cast<std::ptrdiff_t>(MaxSliceHelpers)};
+    u32 queued = 0;
+    auto& workers = GetThreadWorkers();
+    while (queued < MaxSliceHelpers && workers.TryQueueWork([&] {
+        work();
+        helpers.count_down();
+    })) {
+        ++queued;
+    }
+    helpers.count_down(static_cast<std::ptrdiff_t>(MaxSliceHelpers - queued));
+    work();
+    helpers.wait();
+}
+
 } // Anonymous namespace
 
 void UnswizzleTexture(std::span<u8> output, std::span<const u8> input, u32 bytes_per_pixel,
                       u32 width, u32 height, u32 depth, u32 block_height, u32 block_depth,
                       u32 stride_alignment, bool native_tiling) {
     const u32 stride = Common::AlignUpLog2(width, stride_alignment) * bytes_per_pixel;
+    const size_t linear_bytes =
+        size_t{width} * bytes_per_pixel * size_t{height} * size_t{depth};
     const u32 new_bpp = (std::min)(4U, static_cast<u32>(std::countr_zero(width * bytes_per_pixel)));
     width = (width * bytes_per_pixel) >> new_bpp;
     bytes_per_pixel = 1U << new_bpp;
+    if (depth >= ParallelSliceMinDepth && linear_bytes >= ParallelSliceMinBytes) {
+        UnswizzleSlicesInParallel(output, input, bytes_per_pixel, width, height, depth,
+                                  block_height, block_depth, stride, native_tiling);
+        return;
+    }
     Swizzle<false>(output, input, bytes_per_pixel, width, height, depth, block_height, block_depth,
                    stride, native_tiling);
 }
