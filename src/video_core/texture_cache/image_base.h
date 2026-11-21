@@ -141,6 +141,9 @@ struct ImageBase {
     /// after it are bytes it holds older copies of, unless it rendered over them itself (which the
     /// cache can't tell from a render elsewhere in it).
     u64 load_tick = 0;
+    /// Microseconds (steady clock) when a big 3D volume last took its contents from guest memory,
+    /// or 0 while it never has: RefreshContents spaces such uploads out.
+    u64 volume_upload_us = 0;
     /// frame_tick + 1 of the first frame a render pass other than a clear wrote it, or 0.
     u64 first_written_frame = 0;
     /// Levels whose every layer a shader last wrote through a storage view. Any other GPU write

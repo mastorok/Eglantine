@@ -71,6 +71,44 @@ namespace VideoCommon {
     return TextureCacheTrace() || StutterTrace::Enabled();
 }
 
+/// Big 3D volumes (Metroid Prime 4 streams six of 220-440 MiB into the same addresses at each zone
+/// change, and keeps rewriting them while it loads) were read, untiled and copied whole every time
+/// the game touched them: 20 or more uploads of 50-140 ms in a few seconds, each in the frame that
+/// draws with the volume. A volume that already has its contents on the GPU is uploaded again at
+/// most every EDEN_NX2_TC_VOLUME_MS (default 400, 0 = every time like before), and at most one
+/// per frame (once a frame has spent EDEN_NX2_TC_VOLUME_BUDGET_MS, default 40, on them); until
+/// then the draws use the older contents, and the pages stay marked as modified so the next
+/// frame after the delay uploads the newest.
+constexpr u64 VolumeThrottleMinBytes = u64{64} << 20;
+
+[[nodiscard]] inline u64 VolumeThrottleMs() {
+    static const u64 value = [] {
+        const char* const v = std::getenv("EDEN_NX2_TC_VOLUME_MS");
+        return v != nullptr ? std::strtoull(v, nullptr, 10) : u64{400};
+    }();
+    return value;
+}
+
+[[nodiscard]] inline double VolumeBudgetMs() {
+    static const double value = [] {
+        const char* const v = std::getenv("EDEN_NX2_TC_VOLUME_BUDGET_MS");
+        return v != nullptr ? std::strtod(v, nullptr) : 40.0;
+    }();
+    return value;
+}
+
+[[nodiscard]] inline u64 SteadyMicroseconds() {
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count()) +
+           1;
+}
+
+/// Uploads of big volumes put off since the last log line, and the frame's spending on them.
+inline u64 g_volume_uploads_deferred{};
+inline u64 g_volume_budget_frame{~u64{}};
+inline double g_volume_budget_spent_ms{};
+
 using Tegra::Texture::TICEntry;
 using Tegra::Texture::TSCEntry;
 using VideoCore::Surface::GetFormatType;
@@ -1606,6 +1644,11 @@ void TextureCache<P>::TickFrame() {
                  "for buffer-written pages; {} MiB of pages marked stale",
                  tc_stale_skips, tc_stale_skip_bytes >> 20, tc_stale_gpu_written,
                  (stale_pages.Count() << StalePages::PAGE_BITS) >> 20);
+        if (g_volume_uploads_deferred != 0) {
+            LOG_INFO(HW_GPU, "Texture cache last 600 frames: {} big volume uploads put off",
+                     g_volume_uploads_deferred);
+            g_volume_uploads_deferred = 0;
+        }
         tc_stale_skips = tc_stale_skip_bytes = tc_stale_gpu_written = 0;
         images_uploaded = uploaded_bytes = largest_upload = layer_uploads = 0;
         astc_opaque_images = astc_alpha_images = 0;
@@ -3374,6 +3417,30 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
         // Only upload modified images
         return;
     }
+    const bool big_volume =
+        image.info.type == ImageType::e3D && image.guest_size_bytes >= VolumeThrottleMinBytes &&
+        False(image.flags & (ImageFlagBits::GpuModified | ImageFlagBits::Sparse |
+                             ImageFlagBits::SparseLayers | ImageFlagBits::SparseTiles |
+                             ImageFlagBits::Unbacked | ImageFlagBits::AsynchronousDecode));
+    if (big_volume && VolumeThrottleMs() != 0) {
+        if (g_volume_budget_frame != frame_tick) {
+            g_volume_budget_frame = frame_tick;
+            g_volume_budget_spent_ms = 0.0;
+        }
+        const bool uploaded_before = image.volume_upload_us != 0;
+        // The first upload of a new image can't wait (nothing to show before it); the budget
+        // lets the first volume of a frame through and puts off the rest.
+        if (uploaded_before &&
+            (SteadyMicroseconds() - image.volume_upload_us < VolumeThrottleMs() * 1000 ||
+             g_volume_budget_spent_ms >= VolumeBudgetMs())) {
+            ++g_volume_uploads_deferred;
+            runtime.TransitionImageLayout(image);
+            return;
+        }
+    }
+    const auto volume_begin = big_volume ? std::chrono::steady_clock::now()
+                                         : std::chrono::steady_clock::time_point{};
+
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::TextureUpload};
 
     image.flags &= ~ImageFlagBits::CpuModified;
@@ -3507,11 +3574,19 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
                         Common::GetProcessPageFaults() - trace_faults, chunked, frame_tick);
         }
     }
+    if (big_volume) {
+        g_volume_budget_spent_ms +=
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                      volume_begin)
+                .count();
+        image.volume_upload_us = SteadyMicroseconds();
+    }
     // The host GPU has its own copy now and the guest rarely reads this memory again: TickFrame
     // marks it cold, so the OS pages it out before anything else when it needs RAM (title 1
-    // streams several GB of textures through it).
+    // streams several GB of textures through it). Not the big volumes: the game writes them again
+    // and we read them whole again within seconds, each time faulting every page back in.
     constexpr u64 ColdHintMinBytes = 64_KiB;
-    if (image.guest_size_bytes >= ColdHintMinBytes &&
+    if (image.guest_size_bytes >= ColdHintMinBytes && !big_volume &&
         False(image.flags & ImageFlagBits::GpuModified)) {
         if (True(image.flags & ImageFlagBits::Sparse)) {
             // Non-contiguous: each mapped piece (title 1 maps its own memory into these).
