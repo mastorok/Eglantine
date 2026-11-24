@@ -1,0 +1,43 @@
+name: publish-test
+on:
+  push:
+    branches:
+      - claude/ci-publish-test
+permissions:
+  contents: write
+jobs:
+  try:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Try creating tags and releases at several commits
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          repo="$GITHUB_REPOSITORY"
+          try_ref() {
+            name="$1"; sha="$2"
+            if out=$(gh api --method POST "repos/$repo/git/refs" -f "ref=refs/tags/$name" -f "sha=$sha" 2>&1); then
+              echo "REF OK   $name -> $sha"
+              gh api --method DELETE "repos/$repo/git/refs/tags/$name" > /dev/null 2>&1 || true
+            else
+              echo "REF FAIL $name -> $sha : $out" | head -3
+            fi
+          }
+          try_release() {
+            name="$1"; target="$2"
+            if out=$(gh release create "$name" --repo "$repo" --target "$target" --prerelease --title "test $name" --notes "ci test, deleted right away" 2>&1); then
+              echo "REL OK   $name target=$target"
+              gh release delete "$name" --repo "$repo" --yes --cleanup-tag > /dev/null 2>&1 || true
+            else
+              echo "REL FAIL $name target=$target : $out" | head -3
+            fi
+          }
+          echo "tokens perms:"; gh api "repos/$repo" --jq '.permissions' || true
+          for sha in b38ffd974 71245554b 9dd2cd192 500ef33f2 19dfa543e; do
+            full=$(gh api "repos/$repo/commits/$sha" --jq .sha 2>&1) || { echo "no commit $sha: $full"; continue; }
+            try_ref "ci-ref-$sha" "$full"
+            try_release "ci-rel-$sha" "$full"
+          done
+          try_release "ci-rel-nx2" "nx2"
+          try_release "ci-rel-branch" "claude/lichii"
