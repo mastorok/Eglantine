@@ -345,6 +345,13 @@ private:
     /// (native_async_draws = Bounded). Only touched on the GPU thread; reset in TickFrame.
     s64 native_wait_budget_us{8000};
     s64 native_wait_used_us{}; ///< Budget spent since the last 10 s log line.
+    /// Frames that skipped a draw or dispatch for an unbuilt pipeline, in the current 10 s window.
+    u64 skipped_frame_last{~0ULL};
+    u32 frames_window{};
+    u32 skipped_frames_window{};
+    u32 skipped_draws_window{};
+    std::chrono::steady_clock::time_point skip_window_begin{};
+    void NoteSkippedDraw() noexcept;
     std::deque<std::pair<u64, std::unique_ptr<GraphicsPipeline>>> evicted_pipelines; ///< (tick, pipeline)
     std::unordered_set<u64> used_and_evicted; ///< Key hashes of pipelines used this session, evicted since
     std::unordered_set<u64> evicted_hashes;   ///< Key hashes of evicted pipelines not created again

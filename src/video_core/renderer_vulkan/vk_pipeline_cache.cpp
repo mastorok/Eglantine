@@ -2571,6 +2571,22 @@ void PipelineCache::TickFrame() {
     ++frame_count;
     native_wait_budget_us =
         static_cast<s64>(Settings::values.native_pipeline_wait_ms.GetValue()) * 1000;
+    ++frames_window;
+    if (const auto now = std::chrono::steady_clock::now();
+        skip_window_begin == std::chrono::steady_clock::time_point{}) {
+        skip_window_begin = now;
+    } else if (now - skip_window_begin >= std::chrono::seconds{10}) {
+        if (skipped_draws_window != 0) {
+            LOG_INFO(Render_Vulkan,
+                     "Async shaders in the last 10 s: {} of {} frames skipped a draw or dispatch "
+                     "for an unbuilt pipeline ({} skipped)",
+                     skipped_frames_window, frames_window, skipped_draws_window);
+        }
+        frames_window = 0;
+        skipped_frames_window = 0;
+        skipped_draws_window = 0;
+        skip_window_begin = now;
+    }
     while (!evicted_pipelines.empty() && scheduler.IsFree(evicted_pipelines.front().first)) {
         evicted_pipelines.pop_front();
     }
@@ -2717,6 +2733,14 @@ void PipelineCache::LogBoundedWaits() {
     window = std::chrono::steady_clock::now();
 }
 
+void PipelineCache::NoteSkippedDraw() noexcept {
+    ++skipped_draws_window;
+    if (skipped_frame_last != frame_count) {
+        skipped_frame_last = frame_count;
+        ++skipped_frames_window;
+    }
+}
+
 bool PipelineCache::SkipPendingMeshDraw() const {
     return use_asynchronous_shaders && Settings::values.skip_unbuilt_mesh_draws.GetValue() &&
            maxwell3d->GetNativeMacroEngine().native_turing && maxwell3d->regs.IsMeshEnabled();
@@ -2736,10 +2760,47 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) noexc
     const bool native = maxwell3d->GetNativeMacroEngine().native_turing;
     const NativePendingMode mode = native ? NativeMode() : NativePendingMode::Wait;
     const auto& regs = maxwell3d->regs;
+    if (native && pipeline->IsEmulatedMesh() && mode != NativePendingMode::Wait) {
+        // The driver builds an emulated mesh pipeline (compute programs, no VK_EXT_mesh_shader)
+        // in seconds to tens of seconds (Ocarina of Time on a GTX 1060: 12-52 s, the whole game
+        // frozen while its draws wait). Wait for it within the frame's budget and for at most
+        // MeshWaitCapUs in all, then skip its draws until it is built.
+        static const s64 cap_us = [] {
+            const char* value = std::getenv("EDEN_NX2_MESH_WAIT_MS");
+            const s64 ms = value != nullptr ? std::strtoll(value, nullptr, 10) : 250;
+            return (std::max<s64>)(ms, 0) * 1000;
+        }();
+        const s64 allowed =
+            mode == NativePendingMode::Bounded
+                ? (std::min)(native_wait_budget_us, cap_us - pipeline->PendingWaitUs())
+                : 0;
+        if (allowed > 0) {
+            s64 left = allowed;
+            const bool built = WaitWithinBudget(left, native_wait_used_us, [&](auto timeout) {
+                return pipeline->WaitBuilt(timeout);
+            });
+            native_wait_budget_us -= allowed - left;
+            pipeline->AddPendingWaitUs(allowed - left);
+            LogBoundedWaits();
+            if (built) {
+                return pipeline;
+            }
+        }
+        if (pipeline->PendingWaitUs() >= cap_us && pipeline->FirstWaitLog()) {
+            LOG_INFO(Render_Vulkan,
+                     "Emulated mesh pipeline {:016x} still building after {} ms of waiting: its "
+                     "draws are skipped until it is built",
+                     pipeline->Key().Hash(), pipeline->PendingWaitUs() / 1000);
+        }
+        NoteSkippedDraw();
+        LogSkippedPipelineLookup(true);
+        return nullptr;
+    }
     // A native draw counts as depth-tested only when every render target it writes color into
     // was first written in an earlier frame, which the title redraws every frame: Mario Kart World
     // bakes terrain once with depth-tested draws (b7980efd7), and a bound depth buffer alone
-    // doesn't test (Eglantine #874). Mesh draws wait unless the mesh skip setting is on.
+    // doesn't test (Eglantine #874). Mesh draws wait unless the mesh skip setting is on (emulated
+    // ones: see above).
     const auto writes_color = [&regs](u32 rt_index) {
         return rt_index < Maxwell::NumRenderTargets &&
                regs.rt[rt_index].format != Tegra::RenderTargetFormat::NONE &&
@@ -2797,6 +2858,7 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) noexc
     }
     const bool skip_mesh = SkipPendingMeshDraw();
     if (discard || skip_mesh) {
+        NoteSkippedDraw();
         LogSkippedPipelineLookup(skip_mesh);
         return nullptr;
     }
@@ -2831,6 +2893,7 @@ bool PipelineCache::SkipUnbuiltDispatch(ComputePipeline& pipeline, bool outputs_
     case NativeDrawAction::Skip:
         break;
     }
+    NoteSkippedDraw();
     static std::atomic<u64> skipped{};
     if ((skipped.fetch_add(1, std::memory_order_relaxed) & 255) == 0) {
         LOG_INFO(Render_Vulkan, "Async shaders: {} compute dispatches skipped for unbuilt pipelines",

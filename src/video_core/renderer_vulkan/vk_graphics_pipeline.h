@@ -215,6 +215,19 @@ public:
         return mesh_emulation.has_value();
     }
 
+    /// Microseconds draws have spent waiting for this pipeline's build (PipelineCache::BuiltPipeline
+    /// caps it for emulated mesh pipelines). Touched by the draw thread only.
+    [[nodiscard]] s64 PendingWaitUs() const noexcept {
+        return pending_wait_us;
+    }
+    void AddPendingWaitUs(s64 us) noexcept {
+        pending_wait_us += us;
+    }
+    /// True the first time it is asked, to log a pipeline's waits once.
+    [[nodiscard]] bool FirstWaitLog() noexcept {
+        return !std::exchange(wait_logged, true);
+    }
+
     /// Output bytes the emulation needs for one mesh workgroup.
     [[nodiscard]] u64 MeshEmulationBlockBytes() const noexcept {
         return mesh_emulation ? u64{mesh_emulation->block_words} * 4 : 0;
@@ -600,6 +613,8 @@ private:
     DescriptorAllocator distribution_allocator;
     std::array<MeshEmulationBuffer, 4> mesh_task_buffers{};
     u32 mesh_capacity{};
+    s64 pending_wait_us{}; ///< PendingWaitUs
+    bool wait_logged{};
 
     std::optional<PipelineBuild> build;
 };
