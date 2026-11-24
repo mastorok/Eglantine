@@ -688,4 +688,75 @@ TEST_CASE("Ampere Ocarina byte constant loads, ULEA carries to UP3 and two-sourc
     REQUIRE(static_cast<bool>(convert));
     CHECK(field(FindMaxwell(convert, 0x5cb, 52), 41, 2) == 3);
 }
+// Words from Hyrule Warriors: Age of Imprisonment's gloom decal pixel shader (fed969f5c41bb131).
+TEST_CASE("Ampere convergence-state markers lower to nothing", "[video_core][ampere]") {
+    const std::array<Instruction, 4> code{{
+        {{0x1a0f7f55, 0x00000000, 0x00000000, 0x000fe200}},
+        {{0x1a0f7f56, 0x00000000, 0x00100000, 0x000fe400}},
+        {{0x1a0f7f56, 0x00000000, 0x00000000, 0x000fe400}},
+        EXIT,
+    }};
+    const std::array<Instruction, 1> exit_only{{EXIT}};
+    const auto lowered = LowerToMaxwell(code);
+    const auto reference = LowerToMaxwell(exit_only);
+    REQUIRE(static_cast<bool>(lowered));
+    REQUIRE(static_cast<bool>(reference));
+    CHECK(lowered.instructions.size() == reference.instructions.size());
+}
+
+TEST_CASE("Ampere FSWZADD.NDV keeps its swizzle", "[video_core][ampere]") {
+    // FSWZADD.NDV R12, R12, R73, swizzle 0xcc
+    const std::array<Instruction, 2> code{{
+        {{0x0c0c7822, 0x000000cc, 0x00002049, 0x001fc600}},
+        EXIT,
+    }};
+    const auto lowered = LowerToMaxwell(code);
+    REQUIRE(static_cast<bool>(lowered));
+    const u64 swizzled = FindMaxwell(lowered, 0x50f8, 48);
+    REQUIRE(swizzled != 0);
+    CHECK(((swizzled >> 20) & 0xff) == 0x49);
+    CHECK(((swizzled >> 28) & 0xff) == 0xcc);
+}
+
+TEST_CASE("Ampere TEX.NDV becomes Maxwell TEX.NDV", "[video_core][ampere]") {
+    // TEX.NDV R12, R74, R12, binding 2, 3D, R
+    const std::array<Instruction, 2> code{{
+        {{0x4a0c7b60, 0x5080120c, 0x001e21ff, 0x00014200}},
+        EXIT,
+    }};
+    const auto lowered = LowerToMaxwell(code);
+    REQUIRE(static_cast<bool>(lowered));
+    const u64 tex = FindMaxwell(lowered, 0x30, 58);
+    REQUIRE(tex != 0);
+    CHECK(((tex >> 28) & 7) == 4); // 3D
+    CHECK(((tex >> 35) & 1) == 1); // NDV
+}
+
+TEST_CASE("Ampere MOV with a one-lane quad mask writes only that lane", "[video_core][ampere]") {
+    // MOV R16, R12 with quad-lane mask 2
+    const std::array<Instruction, 2> code{{
+        {{0x00107202, 0x0000000c, 0x00000200, 0x000fc800}},
+        EXIT,
+    }};
+    const auto lowered = LowerToMaxwell(code);
+    REQUIRE(static_cast<bool>(lowered));
+    CHECK(CountMaxwell(lowered, 0xf0c8, 48) == 1); // S2R SR_LANEID
+    const u64 lane = FindMaxwell(lowered, 0x010, 52);
+    CHECK(static_cast<u32>(lane >> 20) == 1);
+    const u64 compare = FindMaxwell(lowered, 0x5b6, 52);
+    REQUIRE(compare != 0);
+    CHECK(((compare >> 3) & 7) == 6);  // P6
+    CHECK(((compare >> 49) & 7) == 2); // EQ
+    const u64 move = FindMaxwell(lowered, 0x5c98, 48);
+    REQUIRE(move != 0);
+    CHECK(((move >> 16) & 15) == 6); // @P6
+    CHECK((move & 0xff) == 16);
+    CHECK(((move >> 20) & 0xff) == 12);
+
+    const std::array<Instruction, 2> two_lanes{{
+        {{0x00107202, 0x0000000c, 0x00000300, 0x000fc800}},
+        EXIT,
+    }};
+    REQUIRE(!static_cast<bool>(LowerToMaxwell(two_lanes)));
+}
 } // namespace

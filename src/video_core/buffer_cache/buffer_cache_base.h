@@ -425,6 +425,10 @@ public:
     template <typename Ranges>
     void ClaimCpuWrites(const Ranges& ranges);
 
+    /// Whether WriteMemory uploads a write on a page holding GPU-written data into its buffer
+    /// (Switch 2 titles, a buffer registered there) instead of downloading the page first.
+    [[nodiscard]] bool InlinesPageWrite(DAddr device_addr, u64 size);
+
     /// Return true when there are uncommitted buffers to be downloaded
     [[nodiscard]] bool HasUncommittedFlushes() const noexcept;
 
@@ -458,6 +462,13 @@ public:
             nx2_list_copy_requests.clear();
         }
     }
+    [[nodiscard]] bool Nx2HasListCopyRequests() const {
+        return !nx2_list_copy_requests.empty();
+    }
+    /// Pages a dispatch's NoteWorkRecorded records early downloads of.
+    [[nodiscard]] bool HasEarlyDownloads() const {
+        return !early_pages.empty();
+    }
     /// True when it recorded copies, which the GPU completes at `tick` (the caller submits).
     bool Nx2CopyListPages(u64 tick);
     enum class Nx2ListRead { Unknown, Copied, Synced, NeedsSync, Pending };
@@ -480,6 +491,19 @@ public:
 
     /// Return true when a CPU region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(DAddr addr, size_t size);
+
+    /// Whether DownloadMemory(device_addr, size) would download nothing: no deferred CPU read
+    /// ranges, and no GPU-modified range on the pages it visits.
+    [[nodiscard]] bool DownloadsNothing(DAddr device_addr, u64 size) {
+        if constexpr (USE_MEMORY_MAPS) {
+            if (download_cpu_read_ranges) {
+                return false;
+            }
+        }
+        const DAddr begin = Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE);
+        const DAddr end = Common::AlignUp(device_addr + size, Core::DEVICE_PAGESIZE);
+        return !IsRegionGpuModified(begin, end - begin);
+    }
 
     /// Whether every byte the bound compute storage and texture buffers would mark GPU-written
     /// for this dispatch already holds GPU writes. Call before the bindings are made (and mark).
@@ -844,7 +868,7 @@ private:
     [[nodiscard]] Binding StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index, bool is_written,
                                                bool native_pointer = false,
                                                bool table_pointer = false,
-                                               bool compute = false) const;
+                                               bool compute = false, bool sized = false) const;
 
     void TraceTablePointer(bool compute, size_t stage, size_t ssbo_index, u32 cbuf_index,
                            u32 cbuf_offset, u32 indirect_offset, GPUVAddr holder,
@@ -902,6 +926,33 @@ private:
         u64 deletions{};
     };
     std::array<GeometrySync, NUM_VERTEX_BUFFERS + 1> geometry_syncs{};
+    /// The buffer a binding slot last touched in the LRU, and in which frame (TouchBufferOnce).
+    struct TouchMemo {
+        u64 frame{~u64{0}};
+        BufferId buffer_id{};
+        u64 deletions{}; ///< buffer_deletions then: the id may be another buffer's since
+    };
+    std::array<TouchMemo, NUM_VERTEX_BUFFERS> vertex_touches{};
+    std::array<std::array<TouchMemo, NUM_GRAPHICS_UNIFORM_BUFFERS>, NUM_STAGES> uniform_touches{};
+    void TouchBufferOnce(TouchMemo& memo, Buffer& buffer, BufferId buffer_id) noexcept;
+    /// FindBuffer's recent results by caching page.
+    struct FindMemo {
+        u64 page{~u64{0}};
+        u64 deletions{}; ///< buffer_deletions then
+        DAddr begin{};
+        DAddr end{};
+        BufferId buffer_id{};
+        bool sparse_compatible{};
+    };
+    std::array<FindMemo, 256> find_memos{};
+    /// Storage ranges VirtualRangeCache found in one segment (ResolveMultiRangeStorage).
+    struct SingleRangeMemo {
+        const Tegra::MemoryManager* memory{};
+        u64 map_serial{};
+        GPUVAddr gpu_addr{};
+        u32 size{};
+    };
+    std::array<SingleRangeMemo, 64> single_ranges{};
     /// Counts DeleteBuffer calls: a buffer id older than this count may have been freed or reused.
     u64 buffer_deletions = 0;
     /// EDEN_NX2_BUFFER_TRACE: buffers created (with the buffers they joined) and collected, logged

@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <algorithm>
+
 #include "common/common_types.h"
 
 namespace Vulkan {
@@ -18,13 +20,24 @@ constexpr bool IsTooLargeToBack(u64 texels, u64 bytes) {
     return texels > MaxBackedImageTexels && bytes > MaxBackedImageBytes;
 }
 
-/// Whether an image no memory is left for gets an unbacked sparse image (reads return zero,
-/// writes are dropped) instead of failing. Only one too large to back, or one whose caller cannot
-/// do without an image: the texture cache can (TryCreateImage), and leaves the image out until
-/// the collector has freed memory. An unbacked render target is drawn into, which AMD's drivers
-/// do not survive, and the texture cache would take it for an image over unwritten sparse memory.
-constexpr bool UsesUnbackedFallback(u64 texels, u64 bytes, bool may_fail) {
-    return IsTooLargeToBack(texels, bytes) || !may_fail;
+constexpr u64 Bc6hMipTailBytes(u32 width, u32 height, u32 levels, u32 layers, u32 first_level) {
+    u64 bytes = 0;
+    for (u32 level = first_level; level < levels; ++level) {
+        const u32 blocks_x = ((std::max)(width >> level, 1U) + 3) / 4;
+        const u32 blocks_y = ((std::max)(height >> level, 1U) + 3) / 4;
+        bytes += u64{blocks_x} * blocks_y * 16 * layers;
+    }
+    return bytes;
+}
+
+constexpr u32 CompactBc6hFirstMip(u32 width, u32 height, u32 levels, u32 layers) {
+    constexpr u64 limit = u64{128} << 20;
+    u32 first_level = 1;
+    while (first_level + 1 < levels &&
+           Bc6hMipTailBytes(width, height, levels, layers, first_level) > limit) {
+        ++first_level;
+    }
+    return first_level;
 }
 
 } // namespace Vulkan

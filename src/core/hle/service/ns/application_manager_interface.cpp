@@ -13,6 +13,7 @@
 
 #include "core/file_sys/content_archive.h"
 #include "core/hle/service/ns/content_management_interface.h"
+#include "core/hle/service/ns/game_list_applications.h"
 #include "core/hle/service/ns/read_only_application_control_data_interface.h"
 #include "core/file_sys/patch_manager.h"
 #include "frontend_common/firmware_manager.h"
@@ -20,6 +21,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <set>
 #include <vector>
 
 namespace Service::NS {
@@ -585,25 +587,36 @@ Result IApplicationManagerInterface::ListApplicationRecord(
     const auto installed_games = cache.ListEntriesFilterOrigin(
         std::nullopt, FileSys::TitleType::Application, FileSys::ContentRecordType::Program);
 
-    std::vector<ApplicationRecord> records;
-    records.reserve(installed_games.size());
-
+    std::set<u64> application_ids;
     for (const auto& [slot, game] : installed_games) {
-         if (game.title_id == 0 || game.title_id < 0x0100000000001FFFull) {
-             continue;
-         }
-         if ((game.title_id & 0xFFF) != 0) {
-             continue; // skip sub-programs (e.g., 001)
-         }
+        application_ids.insert(game.title_id);
+    }
+    // Games the game list shows without installing them, Switch 2 games among them.
+    for (const u64 application_id : ListGameListApplications(system)) {
+        application_ids.insert(application_id);
+    }
 
-         ApplicationRecord record{};
-         record.application_id = game.title_id;
-         record.last_event = ApplicationEvent::Installed;
-         record.attributes = 0;
-         record.last_updated = Core::LaunchTimestampCache::GetLaunchTimestamp(game.title_id);
+    std::vector<ApplicationRecord> records;
+    records.reserve(application_ids.size());
 
-         records.push_back(record);
-     }
+    for (const u64 application_id : application_ids) {
+        if (application_id < 0x0100000000001FFFull) {
+            continue;
+        }
+        // Sub-programs (base + 1, ...) belong to their base application. Switch 2 Editions
+        // such as 04004D300C5AE001 have no base of their own and are listed.
+        if ((application_id & 0xFFF) != 0 && application_ids.contains(application_id & ~0xFFFULL)) {
+            continue;
+        }
+
+        ApplicationRecord record{};
+        record.application_id = application_id;
+        record.last_event = ApplicationEvent::Installed;
+        record.attributes = 0;
+        record.last_updated = Core::LaunchTimestampCache::GetLaunchTimestamp(application_id);
+
+        records.push_back(record);
+    }
 
      std::sort(records.begin(), records.end(), [](const ApplicationRecord& lhs, const ApplicationRecord& rhs) {
          if (lhs.last_updated == rhs.last_updated) {

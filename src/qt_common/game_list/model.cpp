@@ -48,9 +48,9 @@ GameListModel::~GameListModel() {
     StopWorker();
 }
 
-void GameListModel::SetScanEnabled(bool enabled) {
+void GameListModel::SetScanEnabled(bool enabled, bool stop_worker) {
     scan_enabled = enabled;
-    if (!enabled) {
+    if (!enabled && stop_worker) {
         StopWorker();
     }
 }

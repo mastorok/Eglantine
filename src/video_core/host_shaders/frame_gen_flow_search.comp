@@ -1,0 +1,142 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#version 460 core
+
+// One level of coarse-to-fine block matching for frame generation. Finds, per pixel of this
+// pyramid level, the offset d where PreviousLuma(p + d) best matches CurrentLuma(p), in this
+// level's pixels. The coarsest level searches every offset within the radius; finer levels search
+// around the doubled offsets of the coarser level's pixel and its neighbours, and around zero.
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(binding = 0) uniform sampler2D CurrentLuma;
+layout(binding = 1) uniform sampler2D PreviousLuma;
+layout(binding = 2) uniform sampler2D CoarseMotion;
+layout(binding = 3, rg16f) uniform writeonly image2D OutMotion;
+
+layout(push_constant) uniform PushConstants {
+    ivec2 size;
+    int radius;
+    int has_coarse;
+    int subpixel;
+};
+
+// In the full search, ties go to the smaller motion; this keeps flat areas and static overlays
+// still.
+const float MOTION_COST = 0.002;
+// In the refinement, prefer the motion the coarser level predicted for this pixel, so flat areas
+// (sky) follow their surroundings instead of matching noise.
+const float PREDICTOR_COST = 0.01;
+// Per-tap difference cap, so a few mismatched taps (a static HUD edge in the block) cannot
+// outweigh the rest of the block.
+const float TAP_LIMIT = 0.1;
+
+// 5x5 blocks: 3x3 ones match the wrong offset on pixel art and other fine, repeating detail. Each
+// block is compared without its mean, so fades and menus darkening the scene don't make the search
+// pick arbitrary offsets.
+float current_block[25];
+float current_mean;
+
+float Cost(ivec2 p, ivec2 d, ivec2 last) {
+    float previous_block[25];
+    float previous_mean = 0.0;
+    int i = 0;
+    for (int y = -2; y <= 2; ++y) {
+        for (int x = -2; x <= 2; ++x) {
+            const ivec2 coord = clamp(p + d + ivec2(x, y), ivec2(0), last);
+            previous_block[i] = texelFetch(PreviousLuma, coord, 0).r;
+            previous_mean += previous_block[i++];
+        }
+    }
+    previous_mean /= 25.0;
+    float sum = 0.0;
+    for (i = 0; i < 25; ++i) {
+        sum += min(abs((current_block[i] - current_mean) - (previous_block[i] - previous_mean)),
+                   TAP_LIMIT);
+    }
+    return sum;
+}
+
+void main() {
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(p, size))) {
+        return;
+    }
+    const ivec2 last = size - 1;
+    int i = 0;
+    for (int y = -2; y <= 2; ++y) {
+        for (int x = -2; x <= 2; ++x) {
+            const ivec2 coord = clamp(p + ivec2(x, y), ivec2(0), last);
+            current_block[i++] = texelFetch(CurrentLuma, coord, 0).r;
+        }
+    }
+
+    current_mean = 0.0;
+    for (int j = 0; j < 25; ++j) {
+        current_mean += current_block[j];
+    }
+    current_mean /= 25.0;
+
+    ivec2 best = ivec2(0);
+    float best_cost = Cost(p, best, last);
+    if (has_coarse == 0) {
+        for (int y = -radius; y <= radius; ++y) {
+            for (int x = -radius; x <= radius; ++x) {
+                const ivec2 d = ivec2(x, y);
+                const float cost = Cost(p, d, last) + MOTION_COST * length(vec2(d));
+                if (cost < best_cost) {
+                    best_cost = cost;
+                    best = d;
+                }
+            }
+        }
+    } else {
+        const ivec2 coarse_last = textureSize(CoarseMotion, 0) - 1;
+        const ivec2 coarse = p / 2;
+        const vec2 own_motion = texelFetch(CoarseMotion, clamp(coarse, ivec2(0), coarse_last), 0).rg;
+        const ivec2 own = ivec2(round(own_motion * 2.0));
+        best_cost += PREDICTOR_COST * length(vec2(own));
+        const ivec2 neighbours[6] = ivec2[](ivec2(0, 0), ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1),
+                                            ivec2(0, 1), ivec2(0, 0));
+        for (int n = 0; n < 6; ++n) {
+            ivec2 predictor = ivec2(0);
+            if (n < 5) {
+                const ivec2 at = clamp(coarse + neighbours[n], ivec2(0), coarse_last);
+                predictor = ivec2(round(texelFetch(CoarseMotion, at, 0).rg * 2.0));
+                if (n > 0 && predictor == own) {
+                    continue;
+                }
+            }
+            for (int y = -radius; y <= radius; ++y) {
+                for (int x = -radius; x <= radius; ++x) {
+                    const ivec2 d = predictor + ivec2(x, y);
+                    const float cost = Cost(p, d, last) + PREDICTOR_COST * length(vec2(d - own));
+                    if (cost < best_cost) {
+                        best_cost = cost;
+                        best = d;
+                    }
+                }
+            }
+        }
+    }
+
+    vec2 motion = vec2(best);
+    if (subpixel != 0) {
+        // Parabola through the costs either side of the best offset, per axis.
+        const float left = Cost(p, best - ivec2(1, 0), last);
+        const float right = Cost(p, best + ivec2(1, 0), last);
+        const float up = Cost(p, best - ivec2(0, 1), last);
+        const float down = Cost(p, best + ivec2(0, 1), last);
+        const float centre = Cost(p, best, last);
+        const float dx = left + right - 2.0 * centre;
+        const float dy = up + down - 2.0 * centre;
+        if (dx > 1e-5) {
+            motion.x += clamp(0.5 * (left - right) / dx, -0.5, 0.5);
+        }
+        if (dy > 1e-5) {
+            motion.y += clamp(0.5 * (up - down) / dy, -0.5, 0.5);
+        }
+    }
+    imageStore(OutMotion, p, vec4(motion, 0.0, 0.0));
+}

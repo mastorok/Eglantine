@@ -1418,8 +1418,9 @@ std::pair<s32, Errno> BSD_USA::SocketImpl(Domain domain, Type type, Protocol pro
     auto room_member = Network::GetRoomMember().lock();
     if (room_member && room_member->IsConnected() && !Network::IsDirectLanActive()) {
         // A room carries IPv4 alone.
-        if (domain == Domain::INET6) {
-            LOG_INFO(Service, "Refusing an IPv6 socket in a room");
+        if (domain != Domain::INET) {
+            LOG_INFO(Service, "Refusing non-IPv4 socket domain={} in a room",
+                     static_cast<u32>(domain));
             return {-1, Errno::AFNOSUPPORT};
         }
         socket = std::make_shared<Network::ProxySocket>();

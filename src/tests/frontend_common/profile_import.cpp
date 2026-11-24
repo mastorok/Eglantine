@@ -135,7 +135,9 @@ TEST_CASE("CLI-first configuration is blocked and portable user stays untouched"
     fs::create_directories(fixture.root / "user");
     Common::FS::SetAppDirectory("");
     CHECK(Common::FS::IsPortableMode());
-    CHECK(Common::FS::GetEdenPath(Common::FS::EdenPath::EdenDir) == fixture.root / "user");
+    // macOS may resolve the fixture via /var vs /private/var; use equivalent, not string ==.
+    CHECK(fs::equivalent(Common::FS::GetEdenPath(Common::FS::EdenPath::EdenDir),
+                         fixture.root / "user"));
     CHECK_FALSE(NeedsLegacyProfileImport());
     CHECK_NOTHROW(CheckLegacyProfileBeforeConfig());
     CHECK(fs::is_empty(fixture.root / "user"));

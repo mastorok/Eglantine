@@ -103,6 +103,9 @@ struct RuntimeInfo {
 
     bool convert_depth_mode{};
     bool force_early_z{};
+    /// Fragment stage: the guest depth buffer is 24-bit UNORM but the host stores it as a float,
+    /// so FragDepth is rounded to the 24-bit values the guest would store.
+    bool quantize_frag_depth_d24{};
 
     TessPrimitive tess_primitive{};
     TessSpacing tess_spacing{};

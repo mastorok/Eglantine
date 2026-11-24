@@ -18,6 +18,8 @@ class System;
 
 namespace Loader {
 
+FileSys::VirtualFile ResolveLooseProgram(const FileSys::VirtualDir& directory);
+
 /**
  * This class loads a "deconstructed ROM directory", which are the typical format we see for Switch
  * game dumps. The path should be a "main" NSO, which must be in a directory that contains the other

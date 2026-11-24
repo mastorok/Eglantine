@@ -144,3 +144,26 @@ TEST_CASE("Changing the active native policy preserves recorded work",
     REQUIRE(Advance(counter, true, false) == Action::Dispatch);
     REQUIRE(counter == 32);
 }
+
+TEST_CASE("Native submissions can flush at a pass boundary from half the budget",
+          "[video_core][submission_policy]") {
+    u32 counter{};
+    for (u32 work = 1; work < DefaultNativeBudget / 2; ++work) {
+        REQUIRE(Advance(counter, true, false, DefaultNativeBudget, 4096, true) != Action::Flush);
+    }
+    REQUIRE(Advance(counter, true, false, DefaultNativeBudget, 4096, true) == Action::Flush);
+    REQUIRE(counter == 0);
+}
+
+TEST_CASE("Pass boundaries do not change the legacy or Android schedules",
+          "[video_core][submission_policy]") {
+    for (const bool android : {false, true}) {
+        u32 baseline{};
+        u32 with_boundary{};
+        for (u32 work = 0; work < 4096 + 32; ++work) {
+            REQUIRE(Advance(with_boundary, android, android, DefaultNativeBudget, 4096, true) ==
+                    Advance(baseline, android, android));
+            REQUIRE(with_boundary == baseline);
+        }
+    }
+}

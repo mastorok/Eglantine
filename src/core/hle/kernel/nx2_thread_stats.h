@@ -115,9 +115,10 @@ inline void BeginRun() {
 
 /// The Run() of `thread` on `core` from `start` to `end` returned for `exit` (`svc` when it
 /// is an SVC). The core's JIT totals so far: C++ block lookups, blocks compiled, full code cache
-/// clears.
+/// clears, handled fastmem faults and invalidation requests.
 void EndRun(KThread* thread, size_t core, u64 start, u64 end, Exit exit, u32 svc,
-            u64 block_lookups, u64 blocks_compiled, u64 cache_clears);
+            u64 block_lookups, u64 blocks_compiled, u64 cache_clears, u64 fastmem_faults,
+            u64 fastmem_recompiles);
 
 /// KScheduler::SwitchThread: `from` ran `from_ticks` on its core until `now`.
 void OnSwitch(KThread* from, KThread* to, s64 now, s64 from_ticks);

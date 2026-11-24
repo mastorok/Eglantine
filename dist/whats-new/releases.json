@@ -1,0 +1,108 @@
+[
+  {
+    "build": 366,
+    "date": "2026-11-20",
+    "summary": "A third GPU thread, better Switch 2 Edition support, and game fixes.",
+    "changes": [
+      {
+        "icon": "cpu",
+        "title": "A third GPU thread",
+        "body": "Eligible Switch 2 Vulkan draws use a third recording thread."
+      },
+      {
+        "icon": "clock",
+        "title": "Ocarina of Time above 60 FPS",
+        "body": "FPS Unlock fixes Epona's fence jump, the day/night clock and the Deku Tree webs. The game no longer freezes after closing the R1 menu."
+      },
+      {
+        "icon": "apps",
+        "title": "Switch 2 games in HOME and better Edition support",
+        "body": "Launch games from HOME without installing them. Lichii better detects and launches Switch 2 Editions, applies matching upgrade packs, and keeps update information in NUPs."
+      },
+      {
+        "icon": "download",
+        "title": "Precompile All Shaders",
+        "body": "Turn it on for individual games in their right-click menu. Precompilation can now find compute shaders in asset packs such as Kirby Air Riders' packs."
+      },
+      {
+        "icon": "bug",
+        "title": "Xenoblade DE and Yoshi fixes",
+        "body": "Fixes Xenoblade DE's title-screen textures and docked/handheld crash. Yoshi no longer crashes when Vulkan rejects a texture-buffer view."
+      },
+      {
+        "icon": "globe",
+        "title": "Multiplayer room connections",
+        "body": "The room proxy keeps the right player address and port and drops packets left over from earlier connections."
+      },
+      {
+        "icon": "sparkles",
+        "title": "What's New in Lichii",
+        "body": "See the highlights after an update or reopen them anytime from Help, even offline."
+      }
+    ]
+  },
+  {
+    "build": 341,
+    "date": "2026-11-17",
+    "summary": "Fewer shader stalls, fixes for Cyberpunk 2077 and Ocarina of Time, and Switch 2 Pro Controller support.",
+    "changes": [
+      {
+        "icon": "cpu",
+        "title": "Fewer shader stalls",
+        "body": "Async shaders now use the Bounded setting by default, with an 8 ms wait. If you chose a setting yourself, Lichii keeps it."
+      },
+      {
+        "icon": "layers",
+        "title": "Cyberpunk 2077",
+        "body": "Lichii can now translate the 64 shaders that previously failed in this game."
+      },
+      {
+        "icon": "clock",
+        "title": "Ocarina of Time",
+        "body": "Choose 2×, 4×, or instant text with the new add-ons. Unlocked frame rates are also presented more smoothly."
+      },
+      {
+        "icon": "gamepad",
+        "title": "Switch 2 Pro Controller",
+        "body": "Connect over USB on Windows or Linux, or over Bluetooth in the Windows desktop app."
+      },
+      {
+        "icon": "bug",
+        "title": "Star Fox",
+        "body": "The floor in the Venom mission renders again."
+      }
+    ]
+  },
+  {
+    "build": 316,
+    "date": "2026-11-16",
+    "summary": "Nextendo online play, fixes for Ocarina of Time and Donkey Kong Bananza, and better frame pacing with frame generation.",
+    "changes": [
+      {
+        "icon": "globe",
+        "title": "Online play through Nextendo",
+        "body": "Turn on Nextendo in Configure → Network. Sign in separately for each user profile."
+      },
+      {
+        "icon": "clock",
+        "title": "Frame generation and online races",
+        "body": "Frame pacing now counts game frames rather than generated frames, fixing a cause of online race disconnects."
+      },
+      {
+        "icon": "globe",
+        "title": "IPv6 support",
+        "body": "Games can open IPv6 connections and look up IPv6 addresses. IPv4 behavior is unchanged."
+      },
+      {
+        "icon": "gamepad",
+        "title": "Ocarina of Time",
+        "body": "FPS Unlock works alongside code cheats and warns about conflicts. Castle Town no longer loses the Vulkan device on AMD at 1.5× or 2×."
+      },
+      {
+        "icon": "bug",
+        "title": "Donkey Kong Bananza",
+        "body": "The tutorial panel no longer appears black or flashes, and looping videos no longer stall."
+      }
+    ]
+  }
+]

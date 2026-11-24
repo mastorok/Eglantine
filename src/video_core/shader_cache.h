@@ -132,6 +132,14 @@ protected:
     /// @return Pointer to a valid shader, nullptr on error
     const ShaderInfo* ComputeShader();
 
+    /// EDEN_NX2_RENDER_UNLEND_DISPATCH, on the back: the current compute shader when it is known
+    /// already (nothing translated); nullptr otherwise.
+    [[nodiscard]] const ShaderInfo* KnownComputeShader() const;
+    /// ComputeShader's checks for a shader KnownComputeShader found: false, having done nothing,
+    /// when a game hook acts on it (the lent dispatch runs it); else the trap guards, which throw
+    /// as ComputeShader's do, and the network bypass's bookkeeping.
+    [[nodiscard]] bool KnownComputeShaderChecks(const ShaderInfo* shader);
+
     /// @brief Collect the current graphics environments
     void GetGraphicsEnvironments(GraphicsEnvironments& result,
                                  const std::array<u64, NUM_PROGRAMS>& unique_hashes);

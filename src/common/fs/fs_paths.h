@@ -30,6 +30,7 @@
 #define SHADER_DIR "shader"
 #define STREAMLINE_DIR "streamline"
 #define FIDELITYFX_DIR "fidelityfx"
+#define FLYHIGH_DIR "flyhigh"
 #define TAS_DIR "tas"
 #define ICONS_DIR "icons"
 

@@ -1,0 +1,34 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#version 460 core
+
+// One level of the frame generation luma pyramid: a 2x2 box filter of the level above (or of the
+// colour frame for the first level).
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(binding = 0) uniform sampler2D Source;
+layout(binding = 1, r16f) uniform writeonly image2D Destination;
+
+layout(push_constant) uniform PushConstants {
+    ivec2 destination_size;
+    int is_color;
+};
+
+float Luma(ivec2 coord, ivec2 last) {
+    const vec4 texel = texelFetch(Source, clamp(coord, ivec2(0), last), 0);
+    return is_color != 0 ? dot(texel.rgb, vec3(0.299, 0.587, 0.114)) : texel.r;
+}
+
+void main() {
+    const ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(coord, destination_size))) {
+        return;
+    }
+    const ivec2 last = textureSize(Source, 0) - 1;
+    const ivec2 source = coord * 2;
+    const float sum = Luma(source, last) + Luma(source + ivec2(1, 0), last) +
+                      Luma(source + ivec2(0, 1), last) + Luma(source + ivec2(1, 1), last);
+    imageStore(Destination, coord, vec4(sum * 0.25));
+}

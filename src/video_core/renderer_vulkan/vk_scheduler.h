@@ -28,6 +28,7 @@
 #include "common/polyfill_thread.h"
 #include "common/settings.h"
 #include "video_core/gpu_split.h"
+#include "video_core/renderer_vulkan/vk_buffer_arena.h"
 #include "video_core/renderer_vulkan/fragment_barrier_state.h"
 #include "video_core/renderer_vulkan/frame_pacer.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
@@ -55,6 +56,22 @@ class Scheduler {
 public:
     explicit Scheduler(const Device& device, StateTracker& state_tracker);
     ~Scheduler();
+
+    /// Every entry point: waits for the draw packet GPURender records, then plays the buffer
+    /// commands this thread queued (BufferArena), so both keep their place before what follows.
+    void JoinRecorders(std::source_location site = std::source_location::current()) const {
+        if (render_recorders) {
+            JoinActiveRecorders(site);
+        }
+    }
+
+    [[nodiscard]] bool RenderRecordersEnabled() const {
+        return render_recorders;
+    }
+
+    [[nodiscard]] bool BufferArenaEnabled() const {
+        return buffer_arena;
+    }
 
     /// Sends the current execution context to the GPU.
     u64 Flush(VkSemaphore signal_semaphore = {}, VkSemaphore wait_semaphore = {},
@@ -86,6 +103,7 @@ public:
 
     /// Keeps the worker from executing chunks while the lock is held. Take it before submit_mutex.
     [[nodiscard]] std::unique_lock<std::mutex> PauseWorker() {
+        JoinRecorders();
         return std::unique_lock{execution_mutex};
     }
 
@@ -140,38 +158,51 @@ public:
         std::source_location location = std::source_location::current());
 
     void DeferFragmentBarrier() {
+        JoinRecorders();
         fragment_barrier.Defer(state.renderpass != VK_NULL_HANDLE);
     }
 
     bool HasFragmentBarrier() const {
+        JoinRecorders();
         return fragment_barrier.Pending();
     }
 
     void NoteRenderPassStores() {
+        JoinRecorders();
         render_pass_has_stores = true;
     }
 
     bool RenderPassHasStores() const {
+        JoinRecorders();
         return render_pass_has_stores;
     }
 
     /// A dispatch was recorded: the next render pass must see what it wrote.
     void NoteComputeWrites() {
+        JoinRecorders();
         compute_writes_pending = true;
     }
 
     /// Returns true when a render pass is currently active in the scheduler state.
     bool IsRenderPassActive() const {
+        JoinRecorders();
         return state.renderpass != VK_NULL_HANDLE;
+    }
+
+    bool IsBetweenRenderPasses() const {
+        JoinRecorders();
+        return state.renderpass == VK_NULL_HANDLE && deferred_clear.framebuffer == nullptr;
     }
 
     /// Changes whenever a render pass begins or ends.
     u64 RenderPassSerial() const {
+        JoinRecorders();
         return render_pass_serial;
     }
 
     /// The graphics pipeline bound in the current command buffer, if the scheduler knows it.
     const GraphicsPipeline* BoundGraphicsPipeline() const {
+        JoinRecorders();
         return state.graphics_pipeline;
     }
 
@@ -215,15 +246,17 @@ public:
         requires std::is_invocable_v<T, vk::CommandBuffer, vk::CommandBuffer>
     void RecordWithUploadBuffer(T&& command,
                                 std::source_location location = std::source_location::current()) {
+        JoinRecorders();
         if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
             VideoCommon::GpuSplit::CheckOwner("Scheduler::Record");
+            BufferArena::CheckRecord("Scheduler::Record", location);
         }
         if (uploads_pending) {
             // Pending uploads precede every other recorded command, including upload-buffer work.
             FlushUploads();
         }
         ++record_serial;
-        if (Common::DkbFrameTrace::Enabled()) {
+        if (Common::DkbFrameTrace::GpuSitesEnabled()) {
             RecordSiteMarker(location);
         }
         if (chunk->Record(command)) {
@@ -233,7 +266,7 @@ public:
         (void)chunk->Record(command);
     }
 
-    /// Send work to a separate thread; `location` labels it in EDEN_DKB_FRAME_TRACE's gpu_site log.
+    /// Send work to a separate thread; `location` labels it in EDEN_DKB_GPU_SITES's gpu_site log.
     template <typename T>
         requires std::is_invocable_v<T, vk::CommandBuffer>
     void Record(T&& c, std::source_location location = std::source_location::current()) {
@@ -247,6 +280,7 @@ public:
     /// Whether anything was recorded since the last Flush or Finish, or waits to be: batched
     /// uploads and a deferred clear reach the command buffer only at the next record or submit.
     [[nodiscard]] bool RecordedSinceSubmit() const noexcept {
+        JoinRecorders();
         return record_serial != submitted_serial || uploads_pending ||
                deferred_clear.framebuffer != nullptr;
     }
@@ -273,6 +307,7 @@ public:
     /// Changes whenever recorded command buffer state may have been reset (InvalidateState, the
     /// end of a render pass), so a binding recorded at the same epoch is still bound.
     [[nodiscard]] u64 RecordingEpoch() const noexcept {
+        JoinRecorders();
         return recording_epoch;
     }
 
@@ -478,7 +513,7 @@ private:
 
     void TraceGpuSubmission();
     void ReportWorkTimes();
-    /// EDEN_DKB_FRAME_TRACE: before each recorded command, a marker that timestamps it in
+    /// EDEN_DKB_GPU_SITES: before each recorded command, a marker that timestamps it in
     /// sampled submissions, so the frame's GPU time can be split by the code that recorded it.
     void RecordSiteMarker(std::source_location location);
     /// Worker thread, run by a marker: writes its timestamp while a sampled submission records.
@@ -509,8 +544,12 @@ private:
 
     void AcquireNewChunk();
 
+    static void JoinActiveRecorders(std::source_location site);
+
     const Device& device;
     StateTracker& state_tracker;
+    const bool render_recorders;
+    const bool buffer_arena;
 
     std::unique_ptr<MasterSemaphore> master_semaphore;
     FragmentBarrierState fragment_barrier;

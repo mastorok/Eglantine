@@ -304,6 +304,13 @@ public:
         flags = &default_flags;
     }
 
+    /// EDEN_NX2_RENDER_UNLEND: GPURender uses its register view's flags while it plays an unlent
+    /// draw. Returns the flags it used.
+    Tegra::Engines::Maxwell3D::DirtyState::Flags* SwapFlags(
+        Tegra::Engines::Maxwell3D::DirtyState::Flags* flags_) noexcept {
+        return std::exchange(flags, flags_);
+    }
+
     void InvalidateState();
 
 private:

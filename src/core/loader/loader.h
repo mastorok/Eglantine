@@ -332,7 +332,7 @@ public:
     }
 
     /**
-     * Get the control data (CNMT) of the application
+     * Get the control data (NACP) of the application
      *
      * @param[out] control Reference to store the application control data into
      *
@@ -341,6 +341,8 @@ public:
     virtual ResultStatus ReadControlData(FileSys::NACP& control) {
         return ResultStatus::ErrorNotImplemented;
     }
+
+    virtual ResultStatus ReadDeveloper(std::string& developer);
 
     /**
      * Get the application's display version ("1.8.0"), from its control data by default

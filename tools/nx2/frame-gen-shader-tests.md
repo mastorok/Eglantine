@@ -1,4 +1,4 @@
-# FSR3 temporal regression checks
+# Lichii Optical Flow Frame Generation regression checks
 
 This port adapts Frizti/Lichii `a605fac744b2e20202165d4b8c100d735cd39987`
 from the pinned `oot-gather-fix` tip `765659af4ccb7201d1145c57f3b45ce84653cea0`.
@@ -34,16 +34,16 @@ The Vulkan integration needs more than those arithmetic changes:
 Install `glslang-tools`, `spirv-tools`, `mesa-vulkan-drivers`,
 `vulkan-validationlayers`, and Python packages `vulkan==1.3.275.1`, `numpy`,
 and `pillow`. Configure the project with `CMAKE_EXPORT_COMPILE_COMMANDS=ON`.
-Generate its two `fsr3_*_comp_spv.h` headers before running the C++ probe.
+Generate its two `frame_gen_*_comp_spv.h` headers before running the C++ probe.
 
 ```sh
-python tools/nx2/test_fsr3_shaders.py --out /tmp/fsr3-tests --build build
+python tools/nx2/test_frame_gen_shaders.py --out /tmp/frame-gen-tests --build build
 ```
 
 The test compiles and dispatches the real production shaders. With `--build`,
 it also compiles the actual C++ copy/layout helpers through a small exported
 probe, using the configured translation unit's includes and defines. The probe
-does not instantiate the emulator's scheduler or the complete `Fsr3FrameGen`
+does not instantiate the emulator's scheduler or the complete `OpticalFlowFrameGen`
 class; descriptor retirement and reset orchestration are reviewed at their
 production call sites, not claimed as end-to-end emulator coverage.
 

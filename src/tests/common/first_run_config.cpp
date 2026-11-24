@@ -91,6 +91,7 @@ public:
 
 void CheckFreshProfile() {
     const auto& values = Settings::values;
+    CHECK(values.cpu_backend.GetValue() == Settings::CpuBackend::Dynarmic);
     CHECK(values.scaling_filter.GetValue() == Settings::ScalingFilter::Fsr3);
     CHECK(values.gpu_accuracy.GetValue() == Settings::GpuAccuracy::Low);
     CHECK(values.nvdec_emulation.GetValue() == Settings::NvdecEmulation::Gpu);
@@ -217,6 +218,18 @@ TEST_CASE("Existing explicit settings survive load save and reopen", "[config]")
         CHECK(Settings::values.gpu_clock.GetValue() == Settings::GpuClock::Normal);
     }
 }
+
+#ifdef HAS_NCE
+TEST_CASE("Existing explicit native CPU backend selection survives config reload", "[config]") {
+    ConfigDirectory directory;
+    directory.Write("qt-config.ini", fmt::format("[Cpu]\ncpu_backend={}\ncpu_backend\\default=false\n",
+                                                u32(Settings::CpuBackend::Nce)));
+    for (int i = 0; i < 2; ++i) {
+        FileConfig config{std::string{"qt-config"}};
+        CHECK(Settings::values.cpu_backend.GetValue() == Settings::CpuBackend::Nce);
+    }
+}
+#endif
 
 TEST_CASE("Existing default markers and missing keys keep their historical values", "[config]") {
     ConfigDirectory directory;
@@ -596,4 +609,38 @@ TEST_CASE("DLSS config round-trips choices and publishes per-game overrides",
     Settings::values.nvidia_dlss_preset.SetGlobal(true);
     Settings::RefreshNvidiaDlssRuntimeSettings();
     CHECK(Settings::GetNvidiaDlssRuntimeSettings().preset == Settings::NvidiaDlssPreset::K);
+}
+
+TEST_CASE("Precompile All Shaders sets only that game's precache to Always", "[config]") {
+    ConfigDirectory directory;
+    {
+        FileConfig global{std::string{"qt-config"}};
+        Settings::values.precache_shaders.SetValue(Settings::PrecacheShaders::Ask);
+        global.SaveValues();
+        FileConfig other{std::string{"0100000000000002"}, Config::ConfigType::PerGameConfig};
+    }
+    Settings::RestoreGlobalState(false);
+    const auto global_file = ReadText(directory.path / "qt-config.ini");
+    const auto other_file = ReadText(directory.path / "custom" / "0100000000000002.ini");
+
+    Config::SaveGameValue("0100000000000001", Settings::values.precache_shaders,
+                          std::to_string(static_cast<u32>(Settings::PrecacheShaders::Always)));
+
+    CHECK(ReadText(directory.path / "qt-config.ini") == global_file);
+    CHECK(ReadText(directory.path / "custom" / "0100000000000002.ini") == other_file);
+    CHECK(Settings::values.precache_shaders.UsingGlobal());
+    CHECK(Settings::values.precache_shaders.GetValue() == Settings::PrecacheShaders::Ask);
+    {
+        FileConfig game{std::string{"0100000000000001"}, Config::ConfigType::PerGameConfig};
+        CHECK_FALSE(Settings::values.precache_shaders.UsingGlobal());
+        CHECK(Settings::values.precache_shaders.GetValue() == Settings::PrecacheShaders::Always);
+        CHECK(Settings::values.precache_shaders.GetValue(true) == Settings::PrecacheShaders::Ask);
+    }
+    Settings::RestoreGlobalState(false);
+    {
+        FileConfig other{std::string{"0100000000000002"}, Config::ConfigType::PerGameConfig};
+        CHECK(Settings::values.precache_shaders.UsingGlobal());
+        CHECK(Settings::values.precache_shaders.GetValue() == Settings::PrecacheShaders::Ask);
+    }
+    Settings::RestoreGlobalState(false);
 }

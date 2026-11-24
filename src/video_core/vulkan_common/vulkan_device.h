@@ -21,6 +21,7 @@
 #include "common/settings.h"
 #include "video_core/fsr4_support.h"
 #include "video_core/vulkan_common/descriptor_limits.h"
+#include "video_core/vulkan_common/device_buffer_pool.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 #include <vulkan/vulkan_beta.h>
@@ -79,6 +80,7 @@ VK_DEFINE_HANDLE(VmaPool)
             primitive_topology_list_restart)                                                       \
     FEATURE(EXT, ProvokingVertex, PROVOKING_VERTEX, provoking_vertex)                              \
     FEATURE(EXT, Robustness2, ROBUSTNESS_2, robustness2)                                           \
+    FEATURE(EXT, TexelBufferAlignment, TEXEL_BUFFER_ALIGNMENT, texel_buffer_alignment)             \
     FEATURE(EXT, ShaderFloat8, SHADER_FLOAT8, shader_float8)                                       \
     FEATURE(EXT, TransformFeedback, TRANSFORM_FEEDBACK, transform_feedback)                        \
     FEATURE(EXT, VertexInputDynamicState, VERTEX_INPUT_DYNAMIC_STATE, vertex_input_dynamic_state)  \
@@ -267,6 +269,10 @@ public:
     /// unhandled exception on whichever thread saw the loss (#1934).
     [[noreturn]] void ReportLoss() const;
 
+    /// Ends the process when submitted GPU work stopped making progress without the driver
+    /// reporting a loss (EDEN_NX2_GPU_WATCHDOG). Makes no Vulkan calls.
+    [[noreturn]] void ReportUnresponsive() const;
+
     /// Logs what VK_EXT_device_fault reports about a device loss.
     void ReportDeviceFault() const;
 
@@ -292,7 +298,11 @@ public:
         SparsePages,
         DeviceBuffers,
     };
-    static constexpr VkDeviceSize SeparatePoolBlockSize = 16ULL << 20;
+    static constexpr VkDeviceSize SeparatePoolBlockSize = DefaultSeparatePoolBlockSize;
+
+    VkDeviceSize GetDeviceBufferPoolBlockSize() const noexcept {
+        return device_buffer_pool_block_size;
+    }
 
     /// The pool of that kind for a memory type, created on first use (null if that failed).
     VmaPool GetSeparatePool(SeparatePool kind, u32 memory_type) const;
@@ -437,6 +447,12 @@ public:
     VkDeviceSize GetMaxStorageBufferRange() const {
         return properties.properties.limits.maxStorageBufferRange;
     }
+
+    u32 GetMaxTexelBufferElements() const {
+        return properties.properties.limits.maxTexelBufferElements;
+    }
+
+    VkDeviceSize GetTexelBufferOffsetAlignment(VkDeviceSize texel_alignment) const;
 
     std::array<u32, 3> GetMaxComputeWorkGroupCount() const {
         const auto& count = properties.properties.limits.maxComputeWorkGroupCount;
@@ -1142,6 +1158,13 @@ FN_MAX_LIMIT_LIST
         return has_broken_cube_compatibility;
     }
 
+    /// Returns true for AMD GCN4 and older (Polaris and earlier, found by device ID or by the
+    /// lack of float16) on AMD's own drivers (CheezyEmu 132cc46c9e). Their driver uses a lot of
+    /// RAM per compile of a large Switch 2 shader, so pipelines build on fewer threads there.
+    bool IsAmdLegacyGcn() const {
+        return is_amd_legacy_gcn;
+    }
+
     /// Returns true if parallel shader compiling has issues with the current driver.
     bool HasBrokenParallelShaderCompiling() const {
         return has_broken_parallel_compiling;
@@ -1453,6 +1476,7 @@ private:
         VkPhysicalDeviceDescriptorIndexingProperties descriptor_indexing{};
         VkPhysicalDeviceDescriptorBufferPropertiesEXT descriptor_buffer{};
         VkPhysicalDeviceSubgroupSizeControlProperties subgroup_size_control{};
+        VkPhysicalDeviceTexelBufferAlignmentProperties texel_buffer_alignment{};
         VkPhysicalDeviceTransformFeedbackPropertiesEXT transform_feedback{};
         VkPhysicalDeviceMaintenance5PropertiesKHR maintenance5{};
         VkPhysicalDevicePipelineBinaryPropertiesKHR pipeline_binary{};
@@ -1497,6 +1521,7 @@ private:
     bool host_float16_supported{};             ///< shaderFloat16 for host-only shaders
     bool has_broken_descriptor_aliasing{};     ///< Miscompiles descriptors aliased on one binding
     bool has_broken_parallel_compiling{};      ///< Has broken parallel shader compiling.
+    bool is_amd_legacy_gcn{};                  ///< AMD GCN4 or older on an AMD driver.
     bool has_renderdoc{};                      ///< Has RenderDoc attached
     bool has_nsight_graphics{};                ///< Has Nsight Graphics attached
     bool has_radeon_gpu_profiler{};            ///< Has Radeon GPU Profiler attached.
@@ -1527,6 +1552,7 @@ private:
     size_t main_heap{};       ///< Largest device-local heap, where images live.
     u64 heap_size_limit{};    ///< EDEN_NX2_VRAM_LIMIT_MIB for device-local heaps, 0 if unset.
     u64 main_heap_size{};     ///< Size of main_heap, with heap_size_limit applied.
+    VkDeviceSize device_buffer_pool_block_size{SeparatePoolBlockSize};
 
     /// Format properties dictionary.
     ::Common::unordered_map<VkFormat, VkFormatProperties> format_properties;

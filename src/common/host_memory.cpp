@@ -10,6 +10,8 @@
 #include <boost/icl/separate_interval_set.hpp>
 #include <windows.h>
 #include <psapi.h>
+#include <shared_mutex>
+#include <span>
 #include <vector>
 #include "common/dynamic_library.h"
 
@@ -23,7 +25,6 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include "common/scope_exit.h"
-#include "common/settings.h"
 
 #if defined(__linux__)
 #include <sys/random.h>
@@ -240,7 +241,9 @@ public:
         ASSERT(placeholders.find({virtual_offset, virtual_offset + length}) == placeholders.end());
         TrackPlaceholder(virtual_offset, host_offset, length);
 
-        MapView(virtual_offset, host_offset, length);
+        if (!MapView(virtual_offset, host_offset, length)) {
+            LOG_CRITICAL(HW_Memory, "Failed to map placeholder, error {}", GetLastError());
+        }
     }
 
     void Unmap(size_t virtual_offset, size_t length) {
@@ -264,15 +267,14 @@ public:
         }
         const size_t virtual_end = virtual_offset + length;
 
-        // Nearly every call protects a range inside one mapped view, which VirtualProtect does
-        // whole without the lock. It refuses a range that reaches a placeholder or a second view
-        // (one Map or Unmap is making or taking apart, or a range across views): those take the
-        // lock below, which gives the whole range the same flags. Map and Unmap hold the lock
-        // across their kernel calls, which slow down when a game maps memory in bulk (zone
-        // changes): write-trap protections, thousands a second, then queued behind them.
+        // Protect within one view without the placeholder lock. Only partial remaps block this
+        // path; a failed call drops the shared lock before looking up views under placeholder_mutex.
         DWORD old_flags{};
-        if (VirtualProtect(virtual_base + virtual_offset, length, new_flags, &old_flags)) {
-            return;
+        {
+            std::shared_lock lock{protect_mutex};
+            if (VirtualProtect(virtual_base + virtual_offset, length, new_flags, &old_flags)) {
+                return;
+            }
         }
 
         std::scoped_lock lock{placeholder_mutex};
@@ -308,11 +310,6 @@ public:
             const size_t run_end = (std::min)(it->upper(), virtual_end);
             runs.push_back({begin, run_end - begin, host_pointer_it->second + begin - it->lower()});
         }
-    }
-
-    void EnableDirectMappedAddress() {
-        // TODO
-        UNREACHABLE();
     }
 
     const size_t backing_size; ///< Size of the backing memory in bytes
@@ -379,26 +376,40 @@ private:
         const bool split_left = unmap_begin > placeholder_begin;
         const bool split_right = unmap_end < placeholder_end;
 
+        // Keep Protect from changing a retained page between the snapshot and its restore.
+        std::unique_lock protect_lock{protect_mutex, std::defer_lock};
+        kept_protections.clear();
+        size_t left_runs = 0;
+        if (split_left || split_right) {
+            protect_lock.lock();
+            if (split_left) {
+                FindProtectionRuns(placeholder_begin, unmap_begin);
+                left_runs = kept_protections.size();
+            }
+            if (split_right) {
+                FindProtectionRuns(unmap_end, placeholder_end);
+            }
+        }
+        const std::span<const ProtectionRun> runs{kept_protections};
+
         if (!pfn_UnmapViewOfFile2(process, virtual_base + placeholder_begin,
                                   MEM_PRESERVE_PLACEHOLDER)) {
             LOG_CRITICAL(HW_Memory, "Failed to unmap placeholder");
         }
-        // If we have to remap memory regions due to partial unmaps, we are in a data race as
-        // Windows doesn't support remapping memory without unmapping first. Avoid adding any extra
-        // logic within the panic region described below.
-
-        // Panic region, we are in a data race right now
+        // Guest accesses can still race the remap, including the brief interval between mapping
+        // a kept view read-write and restoring its protections.
         if (split_left || split_right) {
             Split(unmap_begin, unmap_end - unmap_begin);
+            if (split_left) {
+                MapKeptPiece(placeholder_begin, host_offset, unmap_begin - placeholder_begin,
+                             runs.first(left_runs));
+            }
+            if (split_right) {
+                MapKeptPiece(unmap_end, host_offset + unmap_end - placeholder_begin,
+                             placeholder_end - unmap_end, runs.subspan(left_runs));
+            }
+            protect_lock.unlock();
         }
-        if (split_left) {
-            MapView(placeholder_begin, host_offset, unmap_begin - placeholder_begin);
-        }
-        if (split_right) {
-            MapView(unmap_end, host_offset + unmap_end - placeholder_begin,
-                    placeholder_end - unmap_end);
-        }
-        // End panic region
 
         size_t coalesce_begin = unmap_begin;
         if (!split_left) {
@@ -429,11 +440,54 @@ private:
         return true;
     }
 
-    void MapView(size_t virtual_offset, size_t host_offset, size_t length) {
-        if (!pfn_MapViewOfFile3(backing_handle, process, virtual_base + virtual_offset, host_offset,
-                                length, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0)) {
-            LOG_CRITICAL(HW_Memory, "Failed to map placeholder");
+    struct ProtectionRun {
+        size_t offset;
+        size_t length;
+        DWORD flags;
+    };
+
+    void FindProtectionRuns(size_t offset, size_t end) {
+        while (offset < end) {
+            MEMORY_BASIC_INFORMATION info{};
+            if (VirtualQuery(virtual_base + offset, &info, sizeof(info)) != sizeof(info)) {
+                UNREACHABLE_MSG("Failed to query protection at {:#x}, error {}", offset,
+                                GetLastError());
+            }
+            if (info.State != MEM_COMMIT || info.Protect == 0) {
+                UNREACHABLE_MSG("Expected committed pages at {:#x}, got state {:#x}, protection {:#x}",
+                                offset, info.State, info.Protect);
+            }
+            const size_t region_end =
+                static_cast<size_t>(static_cast<u8*>(info.BaseAddress) - virtual_base) +
+                info.RegionSize;
+            const size_t run_end = (std::min)(region_end, end);
+            if (info.Protect != PAGE_READWRITE) {
+                kept_protections.push_back({offset, run_end - offset, info.Protect});
+            }
+            offset = run_end;
         }
+    }
+
+    void MapKeptPiece(size_t virtual_offset, size_t host_offset, size_t length,
+                      std::span<const ProtectionRun> runs) {
+        // Map read-write so a later Protect can make the pages writable again.
+        if (!MapView(virtual_offset, host_offset, length)) {
+            UNREACHABLE_MSG("Failed to remap kept view at {:#x}, error {}", virtual_offset,
+                            GetLastError());
+        }
+        for (const auto& run : runs) {
+            DWORD old_flags{};
+            if (!VirtualProtect(virtual_base + run.offset, run.length, run.flags, &old_flags)) {
+                UNREACHABLE_MSG("Failed to restore protection {:#x} for {:#x} bytes at {:#x}, error {}",
+                                run.flags, run.length, run.offset, GetLastError());
+            }
+        }
+    }
+
+    bool MapView(size_t virtual_offset, size_t host_offset, size_t length) {
+        return pfn_MapViewOfFile3(backing_handle, process, virtual_base + virtual_offset, host_offset,
+                                  length, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr,
+                                  0) != nullptr;
     }
 
     void Split(size_t virtual_offset, size_t length) {
@@ -481,6 +535,8 @@ private:
     PFN_UnmapViewOfFile2 pfn_UnmapViewOfFile2{};
 
     std::mutex placeholder_mutex;                                 ///< Mutex for placeholders
+    std::shared_mutex protect_mutex;
+    std::vector<ProtectionRun> kept_protections;
     boost::icl::separate_interval_set<size_t> placeholders;       ///< Mapped placeholders
     ::Common::unordered_map<size_t, size_t> placeholder_host_pointers; ///< Placeholder backing offset
 };
@@ -499,21 +555,21 @@ private:
 static void* ChooseVirtualBase(size_t virtual_size) {
     constexpr uintptr_t Map39BitSize = (1ULL << 39);
     constexpr uintptr_t Map36BitSize = (1ULL << 36);
-
-    // A reservation too large for the window between 36 and 39 bits goes where the kernel puts
-    // it, which on a 48-bit address space is above 36 bits too.
-    if (virtual_size > Map39BitSize - Map36BitSize) {
-        return mmap(nullptr, virtual_size, PROT_READ | PROT_WRITE,
+    const auto reserve = [virtual_size](void* hint) {
+        return mmap(hint, virtual_size, PROT_READ | PROT_WRITE,
                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_NOCORE, -1, 0);
-    }
-
-    // This is not a cryptographic application, we just want something random.
-    std::mt19937_64 rng;
+    };
 
     // We want to ensure we are allocating at an address aligned to the L2 block size.
     // For Qualcomm devices, we must also allocate memory above 36 bits.
-    const size_t lower = Map36BitSize / HugePageSize;
-    const size_t upper = (Map39BitSize - virtual_size) / HugePageSize;
+    constexpr size_t lower = Map36BitSize / HugePageSize;
+    const size_t upper =
+        virtual_size < Map39BitSize ? (Map39BitSize - virtual_size) / HugePageSize : 0;
+    if (upper <= lower) {
+        return reserve(nullptr);
+    }
+
+    std::mt19937_64 rng;
     const size_t range = upper - lower;
 
     // Try up to 64 times to allocate memory at random addresses in the range.
@@ -523,9 +579,7 @@ static void* ChooseVirtualBase(size_t virtual_size) {
 
         // Try to map.
         // Note: we may be able to take advantage of MAP_FIXED_NOREPLACE here.
-        void* map_pointer =
-            mmap(reinterpret_cast<void*>(hint_address), virtual_size, PROT_READ | PROT_WRITE,
-                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_NOCORE, -1, 0);
+        void* map_pointer = reserve(reinterpret_cast<void*>(hint_address));
 
         // If we successfully mapped, we're done.
         if (reinterpret_cast<uintptr_t>(map_pointer) == hint_address) {
@@ -538,7 +592,7 @@ static void* ChooseVirtualBase(size_t virtual_size) {
         }
     }
 
-    return MAP_FAILED;
+    return reserve(nullptr);
 }
 
 #else
@@ -629,12 +683,6 @@ public:
             LOG_WARNING(Common_Memory, "Host page size {:#x} does not support fastmem", page_size);
             return false;
         }
-#ifdef HAS_NCE
-        if (page_size != static_cast<long>(PageAlignment) && Settings::IsNceEnabled()) {
-            LOG_WARNING(Common_Memory, "Host page size {:#x} does not support fastmem with NCE", page_size);
-            return false;
-        }
-#endif
         host_page_size = static_cast<size_t>(page_size);
         // Backing memory initialization
 #if defined(__sun__) || defined(__HAIKU__) || defined(__NetBSD__) || defined(__DragonFly__)
@@ -667,7 +715,11 @@ public:
         fd = memfd_create("HostMemory", 0);
 #endif
         bool use_anon = false;
+#ifdef HAS_NCE
+        if (fd < 0) {
+#else
         if (fd <= 0) {
+#endif
             LOG_WARNING(Common_Memory, "memfd_create: {}", strerror(errno));
             use_anon = true;
         }
@@ -680,12 +732,16 @@ public:
             }
         }
         if (use_anon) {
+#ifdef HAS_NCE
+            return false;
+#else
             LOG_WARNING(Common_Memory, "Using private mappings instead of shared ones");
             backing_base = static_cast<u8*>(mmap(nullptr, backing_size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE | MAP_NOCORE, -1, 0));
             if (fd > 0) {
                 fd = -1;
                 close(fd);
             }
+#endif
         } else {
             backing_base = static_cast<u8*>(mmap(nullptr, backing_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_NOCORE, fd, 0));
         }
@@ -695,7 +751,7 @@ public:
         }
 
         // Virtual memory initialization
-        virtual_base = virtual_map_base = static_cast<u8*>(ChooseVirtualBase(virtual_size));
+        virtual_base = static_cast<u8*>(ChooseVirtualBase(virtual_size));
         if (virtual_base == MAP_FAILED) {
             LOG_CRITICAL(HW_Memory, "mmap failed: {}", strerror(errno));
             return false;
@@ -745,13 +801,6 @@ public:
     }
 
     void Map(size_t virtual_offset, size_t host_offset, size_t length, MemoryPermission perms) {
-        // Intersect the range with our address space.
-        const size_t intended_offset = virtual_offset;
-        AdjustMap(&virtual_offset, &length);
-        if (length != 0) {
-            host_offset += virtual_offset - intended_offset;
-        }
-
         if (page_states) {
             if (length == 0) {
                 return;
@@ -789,9 +838,6 @@ public:
         // The method name is wrong. We're still talking about the virtual range.
         // We don't want to unmap, we want to reserve this memory.
 
-        // Intersect the range with our address space.
-        AdjustMap(&virtual_offset, &length);
-
         if (page_states) {
             if (length == 0) {
                 return;
@@ -811,9 +857,6 @@ public:
     }
 
     void Protect(size_t virtual_offset, size_t length, bool read, bool write, bool execute) {
-        // Intersect the range with our address space.
-        AdjustMap(&virtual_offset, &length);
-
         if (page_states) {
             if (length == 0) {
                 return;
@@ -845,16 +888,25 @@ public:
         ASSERT_MSG(ret == 0, "mprotect failed: {}", strerror(errno));
     }
 
-    void EnableDirectMappedAddress() {
-        virtual_base = nullptr;
+#ifdef HAS_NCE
+    bool PrepareDirectMapping(size_t offset, size_t length) {
+        if (fd < 0 || host_page_size != PageAlignment) {
+            return false;
+        }
+        auto* const test = mmap(nullptr, PageAlignment, PROT_READ | PROT_EXEC, MAP_SHARED, fd, 0);
+        if (test == MAP_FAILED) {
+            return false;
+        }
+        munmap(test, PageAlignment);
+        return mprotect(virtual_base + offset, length, PROT_NONE) == 0;
     }
+#endif
 
     const size_t backing_size; ///< Size of the backing memory in bytes
     const size_t virtual_size; ///< Size of the virtual address placeholder in bytes
 
     u8* backing_base{reinterpret_cast<u8*>(MAP_FAILED)};
     u8* virtual_base{reinterpret_cast<u8*>(MAP_FAILED)};
-    u8* virtual_map_base{reinterpret_cast<u8*>(MAP_FAILED)};
 
 private:
     /// Release all resources in the object
@@ -863,8 +915,8 @@ private:
             munmap(page_states, page_states_size);
         }
 
-        if (virtual_map_base != MAP_FAILED) {
-            int ret = munmap(virtual_map_base, virtual_size);
+        if (virtual_base != MAP_FAILED) {
+            int ret = munmap(virtual_base, virtual_size);
             ASSERT_MSG(ret == 0, "munmap failed: {}", strerror(errno));
         }
 
@@ -876,27 +928,6 @@ private:
         if (fd != -1) {
             int ret = close(fd);
             ASSERT_MSG(ret == 0, "close failed: {}", strerror(errno));
-        }
-    }
-
-    void AdjustMap(size_t* virtual_offset, size_t* length) {
-        if (virtual_base != nullptr) {
-            return;
-        }
-
-        // If we are direct mapped, we want to make sure we are operating on a region
-        // that is in range of our virtual mapping.
-        size_t intended_start = *virtual_offset;
-        size_t intended_end = intended_start + *length;
-        size_t address_space_start = reinterpret_cast<size_t>(virtual_map_base);
-        size_t address_space_end = address_space_start + virtual_size;
-
-        if (address_space_start > intended_end || intended_start > address_space_end) {
-            *virtual_offset = 0;
-            *length = 0;
-        } else {
-            *virtual_offset = (std::max)(intended_start, address_space_start);
-            *length = (std::min)(intended_end, address_space_end) - *virtual_offset;
         }
     }
 
@@ -936,8 +967,7 @@ private:
     };
 
     size_t StateIndex(size_t virtual_offset) const {
-        const size_t base = virtual_base != nullptr ? 0 : reinterpret_cast<size_t>(virtual_map_base);
-        return (virtual_offset - base) / PageAlignment;
+        return virtual_offset / PageAlignment;
     }
 
     HostPage ResolveHostPage(size_t virtual_offset) const {
@@ -1074,6 +1104,9 @@ void HostMemory::Swap(HostMemory& other) noexcept {
     std::swap(backing_base, other.backing_base);
     std::swap(virtual_base, other.virtual_base);
     std::swap(virtual_base_offset, other.virtual_base_offset);
+#ifdef HAS_NCE
+    std::swap(direct_mapped, other.direct_mapped);
+#endif
     std::swap(granules, other.granules);
     std::swap(num_granules, other.num_granules);
     std::swap(fallback_buffer, other.fallback_buffer);
@@ -1085,6 +1118,11 @@ std::atomic<u64> g_mapped_bytes{};
 
 void HostMemory::Map(size_t virtual_offset, size_t host_offset, size_t length, MemoryPermission perms, bool separate_heap) {
 #if !(defined(__OPENORBIS__) || defined(__managarm__))
+#ifdef HAS_NCE
+    if (!NormalizeVirtualOffset(virtual_offset, length)) {
+        UNREACHABLE_MSG("Native map outside the fastmem arena");
+    }
+#endif
     ASSERT(virtual_offset % PageAlignment == 0);
     ASSERT(host_offset % PageAlignment == 0);
     ASSERT(length % PageAlignment == 0);
@@ -1100,6 +1138,11 @@ void HostMemory::Map(size_t virtual_offset, size_t host_offset, size_t length, M
 
 void HostMemory::Unmap(size_t virtual_offset, size_t length, bool separate_heap) {
 #if !(defined(__OPENORBIS__) || defined(__managarm__))
+#ifdef HAS_NCE
+    if (!NormalizeVirtualOffset(virtual_offset, length)) {
+        UNREACHABLE_MSG("Native unmap outside the fastmem arena");
+    }
+#endif
     ASSERT(virtual_offset % PageAlignment == 0);
     ASSERT(length % PageAlignment == 0);
     ASSERT(virtual_offset + length <= virtual_size);
@@ -1113,6 +1156,11 @@ void HostMemory::Unmap(size_t virtual_offset, size_t length, bool separate_heap)
 
 void HostMemory::Protect(size_t virtual_offset, size_t length, MemoryPermission perm) {
 #if !(defined(__OPENORBIS__) || defined(__managarm__))
+#ifdef HAS_NCE
+    if (!NormalizeVirtualOffset(virtual_offset, length)) {
+        UNREACHABLE_MSG("Native protection change outside the fastmem arena");
+    }
+#endif
     ASSERT(virtual_offset % PageAlignment == 0);
     ASSERT(length % PageAlignment == 0);
     ASSERT(virtual_offset + length <= virtual_size);
@@ -1145,7 +1193,11 @@ void HostMemory::HintCold(size_t physical_offset, size_t length,
 #endif
     };
     hint(backing_base + physical_offset);
-    if (virtual_offset && virtual_base != nullptr && *virtual_offset + length <= virtual_size) {
+    if (virtual_offset && virtual_base != nullptr &&
+#ifdef HAS_NCE
+        NormalizeVirtualOffset(*virtual_offset, length) &&
+#endif
+        *virtual_offset + length <= virtual_size) {
         hint(virtual_base + *virtual_offset);
     }
 }
@@ -1359,12 +1411,44 @@ void HostMemory::ForgetContents() {
     }
 }
 
-void HostMemory::EnableDirectMappedAddress() {
-#if !(defined(__OPENORBIS__) || defined(__managarm__))
-    if (impl) {
-        impl->EnableDirectMappedAddress();
-        virtual_size += reinterpret_cast<uintptr_t>(virtual_base);
+#ifdef HAS_NCE
+bool HostMemory::EnableDirectMappedAddress() {
+    constexpr size_t AddressSpaceStart = 1ULL << 36;
+    constexpr size_t AddressSpaceEnd = 1ULL << 39;
+    const auto base = reinterpret_cast<size_t>(virtual_base);
+    if (!impl || base < AddressSpaceStart || base >= AddressSpaceEnd ||
+        virtual_size > AddressSpaceEnd - base) {
+        return false;
     }
+    if (!direct_mapped) {
+        direct_mapped = impl->PrepareDirectMapping(virtual_base_offset, virtual_size);
+    }
+    return direct_mapped;
+}
+
+bool HostMemory::NormalizeVirtualOffset(size_t& address, size_t length) const noexcept {
+    if (!direct_mapped) {
+        return true;
+    }
+    const auto base = reinterpret_cast<size_t>(virtual_base);
+    if (address < base || length > virtual_size || address - base > virtual_size - length) {
+        return false;
+    }
+    address -= base;
+    return true;
+}
+#endif
+
+void HostMemory::ResetVirtualMappings() {
+    size_t address = 0;
+#ifdef HAS_NCE
+    if (direct_mapped) {
+        address = reinterpret_cast<size_t>(virtual_base);
+    }
+#endif
+    Unmap(address, virtual_size, false);
+#ifdef HAS_NCE
+    direct_mapped = false;
 #endif
 }
 

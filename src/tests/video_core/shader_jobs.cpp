@@ -595,6 +595,14 @@ TEST_CASE("Shader job stage exceptions fail only that job", "[video_core][shader
     REQUIRE(stats.in_flight_bytes == 0);
 }
 
+// On macOS a stage RunOrWait takes runs on a thread with a larger stack that the caller joins.
+// The tests below show it ran there by the workers being busy while it finished.
+#ifdef __APPLE__
+constexpr bool StagesRunOnCaller = false;
+#else
+constexpr bool StagesRunOnCaller = true;
+#endif
+
 TEST_CASE("RunOrWait runs a queued job on the waiting thread", "[video_core][shader_jobs]") {
     ShaderJobScheduler scheduler{Config(1, 1)};
     Gate gate;
@@ -612,8 +620,10 @@ TEST_CASE("RunOrWait runs a queued job on the waiting thread", "[video_core][sha
     REQUIRE(timed_out);
     REQUIRE(job.Status() == ShaderJobStatus::Done);
     REQUIRE(job.Priority() == NeedNow);
-    REQUIRE(cpu_thread == std::this_thread::get_id());
-    REQUIRE(driver_thread == std::this_thread::get_id());
+    if constexpr (StagesRunOnCaller) {
+        REQUIRE(cpu_thread == std::this_thread::get_id());
+    }
+    REQUIRE(driver_thread == cpu_thread);
     REQUIRE(stats.priorities[0].done == 1);
     REQUIRE(stats.priorities[0].running == 1);
     REQUIRE(blocker.Status() == ShaderJobStatus::Done);
@@ -654,7 +664,9 @@ TEST_CASE("RunOrWait runs the driver stage of a job whose CPU stage it waited ou
     REQUIRE(returned);
     REQUIRE(driver_still_busy);
     REQUIRE(job.Status() == ShaderJobStatus::Done);
-    REQUIRE(driver_thread == waited.get());
+    if constexpr (StagesRunOnCaller) {
+        REQUIRE(driver_thread == waited.get());
+    }
 }
 
 #ifdef __linux__
@@ -782,7 +794,7 @@ TEST_CASE("ParallelFor calls every index once, helped by the calling thread",
     const auto self = std::this_thread::get_id();
     std::atomic<int> here{};
     VideoCommon::ParallelFor(scheduler, 50, [&](size_t) {
-        if (std::this_thread::get_id() == self) {
+        if (!StagesRunOnCaller || std::this_thread::get_id() == self) {
             ++here;
         }
     });
@@ -862,6 +874,54 @@ TEST_CASE("A lookup waits for a prebuild a worker is building", "[video_core][sh
     REQUIRE(pipeline != nullptr);
     REQUIRE(waited.has_value());
     REQUIRE(builds == 1);
+}
+
+TEST_CASE("A nonwaiting lookup leaves the running prebuild registered until it completes",
+          "[video_core][shader_jobs][prebuild]") {
+    struct BlockingPipeline {
+        Gate& building;
+        Gate& release;
+        int builds{};
+
+        void Build() {
+            ++builds;
+            building.Open();
+            release.Wait();
+        }
+        bool Failed() const {
+            return false;
+        }
+    };
+
+    ShaderJobScheduler scheduler{Config(1, 1)};
+    Gate building;
+    Gate release;
+    Vulkan::ScheduledPrebuild<int, BlockingPipeline> prebuild{scheduler};
+    const auto translate = [&] {
+        return std::make_unique<BlockingPipeline>(building, release);
+    };
+    ShaderJobHandle job;
+    REQUIRE(prebuild.Add(1, 0, 0, translate, &job));
+    building.Wait();
+
+    auto lookup = std::async(std::launch::async, [&] { return prebuild.TryTakeReady(1); });
+    const auto status = lookup.wait_for(2s);
+    const bool still_registered =
+        status == std::future_status::ready && !prebuild.Add(1, 0, 0, translate);
+    release.Open();
+    REQUIRE(status == std::future_status::ready);
+    REQUIRE_FALSE(lookup.get().has_value());
+    REQUIRE(still_registered);
+
+    job.Wait();
+    const auto ready = prebuild.TryTakeReady(1);
+    REQUIRE(ready.has_value());
+    REQUIRE(*ready != nullptr);
+    REQUIRE((*ready)->builds == 1);
+    const auto missing = prebuild.TryTakeReady(1);
+    REQUIRE(missing.has_value());
+    REQUIRE(*missing == nullptr);
+    REQUIRE(prebuild.Finished()->taken_unfinished == 0);
 }
 
 TEST_CASE("Prebuilds built in the background are taken without building again",

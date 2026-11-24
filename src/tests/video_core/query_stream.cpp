@@ -4,12 +4,14 @@
 #include <atomic>
 #include <deque>
 #include <mutex>
+#include <span>
 #include <thread>
 #include <vector>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include "video_core/query_cache/bank_base.h"
+#include "video_core/query_cache/query_cache.h"
 #include "video_core/query_cache/query_stream.h"
 
 namespace {
@@ -111,4 +113,43 @@ TEST_CASE("Query ids stay unique when the building thread changes", "[video_core
     building = false;
     fencing.join();
     CHECK_FALSE(reused_live);
+}
+
+namespace {
+
+struct FakeSyncRuntime {
+    template <typename Values>
+    void SyncValues(std::span<Values> values) {
+        synced.insert(synced.end(), values.begin(), values.end());
+    }
+    std::vector<VideoCommon::SyncValuesStruct> synced;
+};
+
+struct FakeSyncTraits {
+    using RuntimeType = FakeSyncRuntime;
+};
+
+} // Anonymous namespace
+
+TEST_CASE("Payload syncs by value keep stream order with query syncs",
+          "[video_core][query_cache]") {
+    FakeSyncRuntime runtime;
+    VideoCommon::GuestStreamer<FakeSyncTraits> streamer{0, runtime};
+    streamer.WriteCounter(0x1000, false, 1);
+    streamer.AddSyncValue(0x2000, 2, 4);
+    const size_t synced_by_caller = streamer.WriteCounter(0x3000, true, 3);
+    streamer.ForgetPendingSync(synced_by_caller);
+    streamer.AddSyncValue(0x1000, 4, 8);
+    REQUIRE(streamer.HasPendingSync());
+    streamer.SyncWrites();
+    CHECK_FALSE(streamer.HasPendingSync());
+    REQUIRE(runtime.synced.size() == 3);
+    CHECK(runtime.synced[0].address == 0x1000);
+    CHECK(runtime.synced[0].value == 1);
+    CHECK(runtime.synced[0].size == 4);
+    CHECK(runtime.synced[1].address == 0x2000);
+    CHECK(runtime.synced[1].value == 2);
+    CHECK(runtime.synced[2].address == 0x1000);
+    CHECK(runtime.synced[2].value == 4);
+    CHECK(runtime.synced[2].size == 8);
 }

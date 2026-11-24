@@ -294,7 +294,7 @@ private:
     struct FrontState;
     FrontState& Front(VideoCommon::GpuSplit& split);
     void ReleaseFront();
-    void FrontApply(FrontState& state, u32 method, u32 argument);
+    void FrontApply(FrontState& state, u32 method, u32 argument, bool from_macro = false);
     /// `last_call`: the method's last word (the back's is_last_call; macro writes are their own).
     void FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument,
                          bool last_call);

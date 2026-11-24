@@ -108,6 +108,7 @@ private:
 /// The first level of a mip chain (`level_bytes`, finest first) from which the levels down to the
 /// coarsest fit in `limit` bytes, or level_bytes.size() when not even the coarsest fits.
 [[nodiscard]] size_t FirstSampledLevel(std::span<const size_t> level_bytes, size_t limit);
+[[nodiscard]] std::optional<u32> ParseFrameDumpFirstPass(std::string_view value);
 
 /// EDEN_NX2_FRAME_DUMP=<dir> reads back one whole frame: the color targets of every pass, the
 /// images written by every compute dispatch and the presented image. EDEN_NX2_FRAME_DUMP_AT picks
@@ -127,6 +128,7 @@ public:
         u32 tic;
         ImageView* view;
         const Sampler* sampler;
+        std::optional<std::array<u64, 4>> tic_raw{};
     };
 
     /// A uniform or storage buffer binding. Its bytes come from guest memory, or from the host
@@ -158,8 +160,16 @@ public:
         return schedule.Capturing() && schedule.Sampled();
     }
 
+    [[nodiscard]] bool Focused() const noexcept {
+        return first_pass != 0;
+    }
+
+    [[nodiscard]] bool IncludesGraphicsPass() const noexcept {
+        return pass_index >= first_pass;
+    }
+
     [[nodiscard]] bool CapturingBuffers() const noexcept {
-        return schedule.Capturing() && schedule.Buffers();
+        return schedule.Capturing() && schedule.Buffers() && !Focused();
     }
 
     /// Whether a shader capture runs and this pipeline was not recorded yet this frame.
@@ -272,6 +282,7 @@ private:
     Scheduler& scheduler;
 
     FrameDumpSchedule schedule;
+    u32 first_pass{};
     bool truncated{};
     bool write_raw{true};
     size_t size_cap{};

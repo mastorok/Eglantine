@@ -8,6 +8,7 @@
 #include <string>
 #include "common/fs/path_util.h"
 #include "core/file_sys/vfs/vfs.h"
+#include "core/hle/result.h"
 
 namespace FileSys {
 
@@ -163,6 +164,10 @@ std::string VfsFile::GetExtension() const {
 }
 
 VfsDirectory::~VfsDirectory() = default;
+
+Result VfsDirectory::DeleteFileWithResult(std::string_view name) {
+    return DeleteFile(name) ? ResultSuccess : ResultUnknown;
+}
 
 std::optional<u8> VfsFile::ReadByte(std::size_t offset) const {
     u8 out{};

@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <deque>
 #include <filesystem>
+#include <functional>
 #include <unordered_map>
 #include <unordered_set>
 #include <memory>
@@ -137,11 +138,29 @@ public:
                            TextureCache& texture_cache, VideoCore::ShaderNotify& shader_notify_);
     ~PipelineCache();
 
-    [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipeline();
+    /// key_unchanged: no register the key reads changed since this cache's last lookup, which
+    /// the caller made (EDEN_NX2_RENDER_UNLEND_FAST_DELTA).
+    [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipeline(bool key_unchanged = false);
+    [[nodiscard]] u64 GraphicsLookups() const noexcept {
+        return graphics_lookups;
+    }
+    /// Whether the last lookup kept the current pipeline without refreshing the key.
+    [[nodiscard]] bool LastLookupKept() const noexcept {
+        return last_lookup_kept;
+    }
+
+    [[nodiscard]] const DynamicFeatures& Features() const noexcept {
+        return dynamic_features;
+    }
 
     void TickFrame();
 
     [[nodiscard]] ComputePipeline* CurrentComputePipeline(u64& native_key);
+    /// EDEN_NX2_RENDER_UNLEND_DISPATCH, on the back: CurrentComputePipeline when it is a plain
+    /// hit (the shader known, its entry built, no rebuild pending or due, no game hook acting);
+    /// nullptr, having created or retired nothing, otherwise. A retire stamps GPURender's tick,
+    /// which posted dispatches it has not recorded yet would outlive.
+    [[nodiscard]] ComputePipeline* UnlentComputePipeline(u64& native_key);
 
     /// Whether a Switch 2 dispatch whose compute pipeline is still building is skipped instead
     /// of waiting for the build, as native_async_draws decides for draws. Skipping leaves the
@@ -158,6 +177,8 @@ public:
 
 private:
     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipelineSlowPath();
+
+    [[nodiscard]] bool SkipPendingMeshDraw() const;
 
     /// Returns `pipeline` when it is built or its draw must wait for it, nullptr when the draw
     /// may be skipped while it builds (asynchronous shaders, CanDiscardPendingDraw).
@@ -251,9 +272,11 @@ private:
     /// Cancels the v2 prebuild and waits for its running stages
     void StopBackgroundJobs();
 
-    void SerializeVulkanPipelineCache(const std::filesystem::path& filename,
+    /// Returns true when the file was written and replaced the previous one.
+    bool SerializeVulkanPipelineCache(const std::filesystem::path& filename,
                                       const vk::PipelineCache& pipeline_cache, u32 cache_version);
 
+    /// Sets vulkan_pipeline_cache_restored when the file's contents were read back.
     vk::PipelineCache LoadVulkanPipelineCache(const std::filesystem::path& filename,
                                               u32 expected_cache_version);
 
@@ -262,8 +285,8 @@ private:
     /// Queues one write of the driver pipeline cache file on the serialization thread, with no
     /// throttle, or writes it now where reading the cache during a build crashes. For the end of
     /// a precache: its builds never reach the timed flush, which counts only pipelines built
-    /// during play.
-    void QueueVulkanPipelineCacheSave();
+    /// during play. `after_save` runs once the file was written, never when the write failed.
+    void QueueVulkanPipelineCacheSave(std::function<void()> after_save = {});
 
     /// One build of the shader precache: a compute pipeline built and destroyed
     struct PrecacheJob {
@@ -293,6 +316,8 @@ private:
     VideoCore::ShaderNotify& shader_notify;
     bool use_asynchronous_shaders{};
     bool use_vulkan_pipeline_cache{};
+    /// Whether this boot's Vulkan pipeline cache started from the saved file, not empty
+    bool vulkan_pipeline_cache_restored{};
     /// The pipelines' builds, the prebuild and the precache. Declared before the pipelines, whose
     /// builds it runs.
     std::optional<VideoCommon::ShaderJobScheduler> shader_jobs;
@@ -310,6 +335,8 @@ private:
     bool mesh_vertex_inputs_seeded{};
     /// graphics_key holds vertex input another key lent it instead of the registers'
     bool vertex_input_lent{};
+    u64 graphics_lookups{};
+    bool last_lookup_kept{};
 
     /// Destroys graphics pipelines unused for a while, once the GPU is done with them.
     void EvictUnusedPipelines();
@@ -346,6 +373,10 @@ private:
     /// (used_pipelines) are built at boot; the rest are built when first needed, and not stored
     /// again. Each built pipeline holds driver memory (title 1: 6.5k cached, a quarter used).
     std::unordered_set<u64> disk_pipelines;
+    /// Key hashes of disk records the background prebuild found lacking a value the translator
+    /// reads: the pipeline built when first needed is recorded again and supersedes the record.
+    std::unordered_set<u64> incomplete_prebuilds;
+    std::mutex incomplete_prebuilds_mutex;
     std::unordered_map<u64, u8> used_pipelines; ///< Key hash -> sessions since it was last used
     std::unordered_set<const GraphicsPipeline*> used_this_session;
     std::chrono::steady_clock::time_point used_pipelines_saved{};

@@ -95,9 +95,26 @@ struct GpuSplitTestAccess {
         return GpuSplit::RingWords - 1;
     }
 
+    /// EDEN_NX2_RENDER_WAITS_E's view of both positions and the guest write mark.
+    static void SetPositions(GpuSplit& split, u64 consumed, u64 played, u64 mark) {
+        split.two_positions = true;
+        split.waits_e = true;
+        split.consumed.store(consumed);
+        split.played.store(played);
+        split.guest_write_op.store(mark);
+    }
+
+    static bool Reached(const GpuSplit& split, u64 target, DrainSite site) {
+        return split.Reached(target, split.UsesEngine(site), std::memory_order_acquire);
+    }
+
     /// The front waits for the back to reach a position (WaitFor).
     static bool FrontWaits(const GpuSplit& split) {
         return split.wait_target.load() != ~u64{0};
+    }
+
+    static bool FrontWaitRegistered(const GpuSplit& split) {
+        return split.front_waiting.load();
     }
 
     static u64 Execute(GpuSplit& split, u64 position, u64 available) {
@@ -845,6 +862,96 @@ TEST_CASE("Constant buffer data goes through the bound buffer's translation and 
     f.memory.FlushCaching();
     REQUIRE(recorder.constant_data == Ranges{{0x30040, 4}});
 
+    // Data memory already holds stays out of the delta once a full resolve read memory, while
+    // the page's CPU writes notify, unless the page may be GPU-written. The GPU-written bitmap is
+    // process-wide: start from none.
+    Tegra::Nx2ClearGpuWrittenPages();
+    FastDraw::g_delta = {};
+    FastDraw::NoteHandlesRead();
+    call(CbOffset, 0x40);
+    call(CbData, 5);
+    // An unwatched page: guest CPU writes to it land unseen.
+    REQUIRE(FastDraw::g_delta.num_device_writes == 1);
+    REQUIRE(FastDraw::g_delta.device_begin[0] == 0x30040);
+    f.device_memory.UpdatePagesCachedCount(0x30000, 0x1000, 1);
+    SCOPE_EXIT {
+        f.device_memory.UpdatePagesCachedCount(0x30000, 0x1000, -1);
+    };
+    // Starting to watch it counts as a change: writes made before may not have been read.
+    FastDraw::g_delta = {};
+    call(CbOffset, 0x40);
+    call(CbData, 5);
+    REQUIRE(FastDraw::g_delta.num_device_writes == 1);
+    FastDraw::g_delta = {};
+    FastDraw::NoteHandlesRead();
+    call(CbOffset, 0x40);
+    call(CbData, 5);
+    REQUIRE(FastDraw::g_delta.num_writes == 0);
+    REQUIRE(FastDraw::g_delta.num_device_writes == 0);
+    call(CbData, 7);
+    REQUIRE(FastDraw::g_delta.num_device_writes == 1);
+    REQUIRE(FastDraw::g_delta.device_begin[0] == 0x30044);
+    FastDraw::g_delta = {};
+    Tegra::Nx2MarkGpuWritten(0x30040, 4);
+    call(CbOffset, 0x40);
+    call(CbData, 5);
+    Tegra::Nx2ClearGpuWrittenPages();
+    REQUIRE(FastDraw::g_delta.num_device_writes == 1);
+    REQUIRE(FastDraw::g_delta.device_begin[0] == 0x30040);
+
+    // A guest CPU write since that resolve (a handle A -> B), then an upload repeating B: the
+    // delta still records it, so the next draw finds its handle words written and reads them
+    // again instead of keeping A. A resolve that reads memory between the write's start and
+    // its store doesn't lose it: the write is landing, then flagged.
+    FastDraw::g_delta = {};
+    FastDraw::NoteHandlesRead();
+    FastDraw::BeginMemoryChange();
+    FastDraw::NoteHandlesRead();
+    const u32 cpu_word = 9;
+    std::memcpy(replacement + 0x40, &cpu_word, sizeof(cpu_word));
+    call(CbOffset, 0x40);
+    call(CbData, 9);
+    REQUIRE(FastDraw::g_delta.num_writes == 1);
+    REQUIRE(FastDraw::g_delta.num_device_writes == 1);
+    REQUIRE(FastDraw::g_delta.device_begin[0] == 0x30040);
+    FastDraw::EndMemoryChange();
+    {
+        FastDraw::Delta next;
+        FastDraw::TakeDelta(next);
+        FastDraw::DeviceSpans spans;
+        spans.Update(f.memory, 0x100040, 4);
+        const std::array<std::pair<u32, u32>, 1> handle_words{{{0x40, 0x44}}};
+        REQUIRE(next.ReachesWords(0x100000, handle_words, spans));
+    }
+    // Until a full resolve reads memory again.
+    call(CbOffset, 0x40);
+    call(CbData, 9);
+    REQUIRE(FastDraw::g_delta.num_device_writes == 1);
+    FastDraw::g_delta = {};
+    FastDraw::NoteHandlesRead();
+    call(CbOffset, 0x40);
+    call(CbData, 9);
+    REQUIRE(FastDraw::g_delta.num_device_writes == 0);
+    // Writes that don't tell the caches (WriteBlockUnsafe, audio capture buffers) count too.
+    const u32 unsafe_word = 11;
+    REQUIRE(process.GetMemory().WriteBlockUnsafe(0x20040, &unsafe_word, sizeof(unsafe_word)));
+    REQUIRE(word(replacement + 0x40) == 11);
+    REQUIRE(FastDraw::g_changes_landing.load() == 0);
+    call(CbOffset, 0x40);
+    call(CbData, 11);
+    REQUIRE(FastDraw::g_delta.num_device_writes == 1);
+    FastDraw::g_delta = {};
+    FastDraw::NoteHandlesRead();
+    // After anything the guest CPU could have synchronised with, it may have written pages the
+    // caches don't watch.
+    FastDraw::NoteSync();
+    call(CbOffset, 0x40);
+    call(CbData, 11);
+    REQUIRE(FastDraw::g_delta.num_device_writes == 1);
+    REQUIRE(FastDraw::g_delta.device_begin[0] == 0x30040);
+    f.memory.FlushCaching();
+    recorder.constant_data.clear();
+
     // A buffer the texture headers lie in takes the general path, which checks each write.
     engine.regs.tex_header.address_high = 0;
     engine.regs.tex_header.address_low = 0x100400;
@@ -1351,6 +1458,51 @@ TEST_CASE("Split drain waits for the back's idle hook",
     }
 }
 
+TEST_CASE("Split front parks while waiting for ring space or the idle hook",
+          "[video_core][gpu_split_dependencies]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    Fixture f;
+    f.system.Initialize();
+    auto split = std::make_unique<VideoCommon::GpuSplit>();
+    std::atomic<bool> release{};
+    bool slept = false;
+    const auto unblock = [&] {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{2};
+        while (!(slept = Access::FrontWaitRegistered(*split)) &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{1});
+        }
+        release.store(true);
+        release.notify_one();
+    };
+
+    SECTION("full ring") {
+        std::vector<u32> payload(Access::NearWrap() + 1);
+        Access::Start(*split, f.system);
+        split->Defer([&release] { release.wait(false); });
+        split->DeferWords([](std::span<const u32>) {}, payload);
+        std::jthread unblock_back{unblock};
+        split->DeferWords([](std::span<const u32>) {}, payload);
+        unblock_back.join();
+        CHECK(slept);
+        split->Drain();
+        split->Stop();
+    }
+
+    SECTION("idle hook") {
+        split->SetIdleHook(
+            [](void* arg) { static_cast<std::atomic<bool>*>(arg)->wait(false); }, &release);
+        Access::Start(*split, f.system);
+        split->Defer([] {});
+        split->WaitUntil(split->Position(), VideoCommon::DrainSite::Other);
+        std::jthread unblock_hook{unblock};
+        split->Drain();
+        unblock_hook.join();
+        CHECK(slept);
+        split->Stop();
+    }
+}
+
 TEST_CASE("Split command list fetches wait only for the writers before the last host sync",
           "[video_core][gpu_split_dependencies]") {
     using Access = VideoCommon::GpuSplitTestAccess;
@@ -1469,6 +1621,36 @@ TEST_CASE("Split command list fetches wait only for the writers before the last 
     other = true;
     later = true;
     split.Drain(VideoCommon::DrainSite::Other);
+}
+
+TEST_CASE("Front waits on game memory and lists end at the back's position past guest writes",
+          "[video_core][gpu_split_dependencies]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    using VideoCommon::DrainSite;
+    const auto split_owner = std::make_unique<VideoCommon::GpuSplit>(); // Too big for the stack
+    VideoCommon::GpuSplit& split = *split_owner;
+
+    // No guest write op: the back's position, while GPURender is behind.
+    Access::SetPositions(split, 100, 40, 0);
+    REQUIRE(Access::Reached(split, 90, DrainSite::ListWriters));
+    REQUIRE(Access::Reached(split, 100, DrainSite::MacroDmaRead));
+    REQUIRE_FALSE(Access::Reached(split, 101, DrainSite::ListSync));
+    // Acquires and the other sites keep waiting for GPURender.
+    REQUIRE_FALSE(Access::Reached(split, 90, DrainSite::Acquire));
+    REQUIRE_FALSE(Access::Reached(split, 90, DrainSite::MacroDmaFlush));
+    REQUIRE_FALSE(Access::Reached(split, 90, DrainSite::SafeRead));
+
+    // A guest write op before the target: GPURender must have played it.
+    Access::SetPositions(split, 100, 40, 61);
+    REQUIRE_FALSE(Access::Reached(split, 90, DrainSite::SemaphoreFlush));
+    Access::SetPositions(split, 100, 61, 61);
+    REQUIRE(Access::Reached(split, 90, DrainSite::SemaphoreFlush));
+
+    // A newer op at or past the target hides older ones: GPURender's position.
+    Access::SetPositions(split, 100, 89, 96);
+    REQUIRE_FALSE(Access::Reached(split, 90, DrainSite::ListFlush));
+    Access::SetPositions(split, 100, 90, 96);
+    REQUIRE(Access::Reached(split, 90, DrainSite::ListFlush));
 }
 
 TEST_CASE("Split restart resets writer positions without replaying old releases",

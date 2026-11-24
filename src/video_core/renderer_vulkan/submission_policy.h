@@ -31,10 +31,11 @@ inline std::optional<u32> ParseBudget(std::string_view value) {
 }
 
 constexpr Action Advance(u32& counter, bool native, bool android,
-                         u32 native_budget = DefaultNativeBudget, u32 legacy_budget = 4096) {
+                         u32 native_budget = DefaultNativeBudget, u32 legacy_budget = 4096,
+                         bool pass_boundary = false) {
     ++counter;
     if (native && !android) {
-        if (counter >= native_budget) {
+        if (counter >= native_budget || (pass_boundary && counter >= native_budget / 2)) {
             counter = 0;
             return Action::Flush;
         }

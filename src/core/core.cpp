@@ -19,6 +19,7 @@
 #include "common/memory_detect.h"
 #include "common/nx2_sampler.h"
 #include "common/adpf.h"
+#include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
 #include "common/shutdown_progress.h"
@@ -73,6 +74,7 @@
 #include "core/hle/service/sm/sm.h"
 #include "core/internal_network/local_redirect.h"
 #include "core/internal_network/network.h"
+#include "core/loader/deconstructed_rom_directory.h"
 #include "core/loader/loader.h"
 #include "core/loader/nx.h"
 #include "core/memory.h"
@@ -137,7 +139,7 @@ FileSys::VirtualFile GetGameFileFromPath(const FileSys::VirtualFilesystem& vfs,
     }
 
     if (Common::FS::IsDir(path)) {
-        return vfs->OpenFile(path + "/main", FileSys::OpenMode::Read);
+        return Loader::ResolveLooseProgram(vfs->OpenDirectory(path, FileSys::OpenMode::Read));
     }
 
     return vfs->OpenFile(path, FileSys::OpenMode::Read);
@@ -163,20 +165,9 @@ std::optional<u64> FindSwitch2Program(const FileSys::VirtualFile& file, u64 prog
     FileSys::ProgramMetadata metadata;
     if (FileSys::NupContainer::IsNupFile(file)) {
         FileSys::NupContainer nup{file};
-        if (nup.GetStatus() != Loader::ResultStatus::Success) {
-            return std::nullopt;
-        }
-        const auto base = nup.FindBasePackage();
-        const auto update = nup.FindBestUpdatePackage();
-        std::optional<std::size_t> program;
-        if (update && nup.GetExeFSDir(*update) != nullptr) {
-            program = update;
-        } else if (base && nup.GetExeFSDir(*base) != nullptr) {
-            program = base;
-        }
-        const auto exefs = program ? nup.GetExeFSDir(*program) : nullptr;
-        const auto npdm = exefs != nullptr ? exefs->GetFile("main.npdm") : nullptr;
-        return Switch2ProgramId(metadata, npdm);
+        const auto program = nup.SelectProgram();
+        return program ? Switch2ProgramId(metadata, program->exefs->GetFile("main.npdm"))
+                       : std::nullopt;
     }
     const auto type = file != nullptr ? Loader::IdentifyFile(file) : Loader::FileType::Unknown;
     if (type == Loader::FileType::NX) {
@@ -233,6 +224,12 @@ struct System::Impl {
 
     u64 program_id;
 
+    void EnsureFilesystem() {
+        if (virtual_filesystem == nullptr) {
+            virtual_filesystem = std::make_shared<FileSys::RealVfsFilesystem>();
+        }
+    }
+
     bool Initialize(System& system) {
         try {
             device_memory.emplace();
@@ -249,10 +246,7 @@ struct System::Impl {
         core_timing.SetMulticore(is_multicore);
         core_timing.Initialize([&system]() { system.RegisterHostThread(); });
 
-        // Create a default fs if one doesn't already exist.
-        if (virtual_filesystem == nullptr) {
-            virtual_filesystem = std::make_shared<FileSys::RealVfsFilesystem>();
-        }
+        EnsureFilesystem();
         if (content_provider == nullptr) {
             content_provider = std::make_unique<FileSys::ContentProviderUnion>();
         }
@@ -418,6 +412,10 @@ struct System::Impl {
             return SystemResultStatus::ErrorMemoryAllocation;
         }
         Kernel::Nx2ThreadStats::ReadSwitch();
+#if defined(ARCHITECTURE_x86_64)
+        core_timing.ConfigureInlineCntpct(!Kernel::Nx2ThreadStats::g_enabled &&
+                                         !system.DebuggerEnabled());
+#endif
         Service::FileSystem::ReadTraceScope::ReadSwitch();
         kernel.Initialize();
         return SystemResultStatus::Success;
@@ -498,15 +496,14 @@ struct System::Impl {
         }
 
         VideoCommon::StutterTrace::BootMarker("boot_start");
+        EnsureFilesystem();
         if (params.launch_type == Service::AM::LaunchType::FrontendInitiated) {
             fs_controller.InitTempStorage();
         }
 
-        const std::optional<u64> switch2_program_id =
-            virtual_filesystem != nullptr
-                ? FindSwitch2Program(GetGameFileFromPath(virtual_filesystem, filepath),
-                                     params.program_id, params.program_index)
-                : std::nullopt;
+        const auto file = GetGameFileFromPath(virtual_filesystem, filepath);
+        const auto switch2_program_id =
+            FindSwitch2Program(file, params.program_id, params.program_index);
         const bool switch2_program = switch2_program_id.has_value();
         Kernel::KSystemControl::SetApplicationProgramId(switch2_program_id.value_or(0));
         Settings::SetCurrentProgramIsSwitch2(switch2_program);
@@ -563,8 +560,6 @@ struct System::Impl {
             current_application_filepath = filepath;
         }
 
-        const auto file = GetGameFileFromPath(virtual_filesystem, filepath);
-
         // Create the application process
         Loader::ResultStatus load_result{};
         std::vector<u8> control;
@@ -587,6 +582,22 @@ struct System::Impl {
             return SystemResultStatus::ErrorGetLoader;
         }
 
+        kernel.SetApplicationProcess(process->GetHandle());
+#ifdef HAS_HYPERVISOR
+        const bool has_hypervisor = static_cast<bool>(process->GetHandle()->GetMemory().GetHypervisor());
+        if (has_hypervisor && !cpu_manager.Initialize(process->GetHandle())) {
+            LOG_WARNING(Core, "Hypervisor vCPU setup failed; reloading the guest with Dynarmic");
+            process.reset();
+            ShutdownMainProcess();
+            SetShuttingDown(false);
+            allow_hypervisor_for_load = false;
+            SCOPE_EXIT {
+                allow_hypervisor_for_load = true;
+            };
+            return Load(system, emu_window, filepath, params);
+        }
+#endif
+
         if (app_loader->ReadProgramId(params.program_id) != Loader::ResultStatus::Success) {
             LOG_ERROR(Core, "Failed to find program id for ROM!");
         }
@@ -604,9 +615,6 @@ struct System::Impl {
         // Track launch time for frontend launches
         LaunchTimestampCache::SaveLaunchTimestamp(params.program_id);
 
-        // Make the process created be the application
-        kernel.SetApplicationProcess(process->GetHandle());
-
         // Set up the rest of the system.
         SystemResultStatus init_result{SetupForApplicationProcess(system, emu_window)};
         if (init_result != SystemResultStatus::Success) {
@@ -616,7 +624,10 @@ struct System::Impl {
             return init_result;
         }
         // Waiting for GPU before initializing CPU
-        cpu_manager.Initialize();
+#ifdef HAS_HYPERVISOR
+        if (!has_hypervisor)
+#endif
+            cpu_manager.Initialize();
 
         // Initialize cheat engine
         if (cheat_engine) {
@@ -629,7 +640,7 @@ struct System::Impl {
 
         if (Settings::values.gamecard_inserted) {
             if (Settings::values.gamecard_current_game) {
-                fs_controller.SetGameCard(GetGameFileFromPath(virtual_filesystem, filepath));
+                fs_controller.SetGameCard(file);
             } else if (!Settings::values.gamecard_path.GetValue().empty()) {
                 const auto& gamecard_path = Settings::values.gamecard_path.GetValue();
                 fs_controller.SetGameCard(GetGameFileFromPath(virtual_filesystem, gamecard_path));
@@ -800,6 +811,9 @@ struct System::Impl {
     std::optional<Tegra::Host1x::Host1x> host1x_core;
     std::optional<Core::DeviceMemory> device_memory;
     bool guest_memory_released{};
+#ifdef HAS_HYPERVISOR
+    bool allow_hypervisor_for_load{true};
+#endif
     std::optional<AudioCore::AudioCore> audio_core;
     std::optional<Memory::CheatEngine> cheat_engine;
     std::optional<Tools::Freezer> memory_freezer;
@@ -817,8 +831,10 @@ struct System::Impl {
 
     /// Service manager
     std::shared_ptr<Service::SM::ServiceManager> service_manager;
-    /// ContentProviderUnion instance
-    std::unique_ptr<FileSys::ContentProviderUnion> content_provider;
+    /// ContentProviderUnion instance. Empty until a frontend sets its own, so a System nobody gave
+    /// a provider (tests, tools) still has one to look titles up in.
+    std::unique_ptr<FileSys::ContentProviderUnion> content_provider =
+        std::make_unique<FileSys::ContentProviderUnion>();
     /// AppLoader used to load the current executing application
     std::unique_ptr<Loader::AppLoader> app_loader;
     std::stop_source stop_event;
@@ -929,6 +945,12 @@ SystemResultStatus System::Load(Frontend::EmuWindow& emu_window, const std::stri
 bool System::IsPoweredOn() const {
     return impl->is_powered_on.load(std::memory_order::relaxed);
 }
+
+#ifdef HAS_HYPERVISOR
+bool System::IsHypervisorAllowedForLoad() const {
+    return impl->allow_hypervisor_for_load;
+}
+#endif
 
 void System::PrepareReschedule(const u32 core_index) {
     impl->kernel.PrepareReschedule(core_index);
@@ -1356,6 +1378,9 @@ void System::NotifyApplicationChanged(u64 program_id) {
 }
 
 void System::ApplySettings() {
+#if defined(ARCHITECTURE_x86_64)
+    impl->core_timing.RefreshInlineCntpct();
+#endif
     impl->RefreshTime(*this);
 
     if (IsPoweredOn()) {

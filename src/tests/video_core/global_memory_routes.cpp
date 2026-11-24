@@ -21,6 +21,7 @@
 #include "shader_recompiler/host_translate_info.h"
 #include "shader_recompiler/ir_opt/passes.h"
 #include "shader_recompiler/profile.h"
+#include "video_core/renderer_vulkan/pipeline_shader_emission.h"
 
 namespace {
 using namespace Shader;
@@ -229,6 +230,54 @@ TEST_CASE("Selecting the buffer searches the bound buffers in one function that 
     REQUIRE(searches.size() == 1);
     // The 32, 64 and 128-bit load and store each call it
     CHECK(searches.front().second.size() == 6);
+}
+
+TEST_CASE("NVIDIA compute uses single-candidate routes except for the #619 shaders",
+          "[shader][global_memory_routes]") {
+    constexpr u64 ordinary{0x1234};
+    Profile profile{};
+    profile.supported_spirv = 0x00010600;
+    profile.support_int64 = true;
+    profile.support_descriptor_aliasing = true;
+    profile.unified_descriptor_binding = true;
+    profile.min_ssbo_alignment = 16;
+    profile.select_global_memory_buffer = true;
+    const auto emit = [&](Stage stage, u64 hash, bool single, bool use_pipeline_policy) {
+        Fixture fixture;
+        fixture.program.stage = stage;
+        fixture.program.info.is_task = stage == Stage::Task;
+        fixture.program.info.is_mesh = stage == Stage::Mesh;
+        if (single) {
+            auto& routes = fixture.program.global_memory_routes;
+            REQUIRE(routes.size() == 1);
+            const u32 first_candidate{routes.front().front()};
+            routes.push_back({first_candidate});
+            fixture.program.global_memory_route.at(fixture.routed) = 1;
+        }
+        Backend::Bindings bindings;
+        if (use_pipeline_policy) {
+            return Vulkan::EmitPipelineShader(profile, {}, fixture.program, bindings, hash);
+        }
+        return Backend::SPIRV::EmitSPIRV(profile, {}, fixture.program, bindings);
+    };
+
+    const auto all_buffers{emit(Stage::Compute, ordinary, true, false)};
+    CHECK(emit(Stage::Compute, 0xf98012dc9a4465ffULL, true, true) == all_buffers);
+    CHECK(emit(Stage::Compute, 0xe78efceda31f97a8ULL, true, true) == all_buffers);
+    CHECK(emit(Stage::Compute, ordinary, false, true) == all_buffers);
+    for (Stage stage : {Stage::Task, Stage::Mesh}) {
+        CHECK(emit(stage, ordinary, true, true) == emit(stage, ordinary, true, false));
+    }
+    const auto single{emit(Stage::Compute, ordinary, true, true)};
+    const auto selections{SelectionsPerFunction(single)};
+    REQUIRE(selections.size() == 10);
+    CHECK(selections[7] == 1);
+    CHECK(selections[8] == 1);
+    const auto searches{NotInlinedCallers(single)};
+    REQUIRE(searches.size() == 1);
+    CHECK(searches.front().second.size() == 6);
+    Dump(all_buffers, "single_candidate_all_buffers");
+    Dump(single, "single_candidate_routed");
 }
 
 TEST_CASE("Task and mesh programs search the bound buffers inline",

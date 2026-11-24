@@ -375,6 +375,15 @@ std::ostream& operator<<(std::ostream& os, ResultStatus status) {
 AppLoader::AppLoader(FileSys::VirtualFile file_) : file(std::move(file_)) {}
 AppLoader::~AppLoader() = default;
 
+ResultStatus AppLoader::ReadDeveloper(std::string& developer) {
+    FileSys::NACP control;
+    if (const ResultStatus result = ReadControlData(control); result != ResultStatus::Success) {
+        return result;
+    }
+    developer = control.GetDeveloperName();
+    return ResultStatus::Success;
+}
+
 ResultStatus AppLoader::ReadDisplayVersion(std::string& version) {
     FileSys::NACP control;
     if (const ResultStatus result = ReadControlData(control); result != ResultStatus::Success) {

@@ -23,6 +23,7 @@
 #include <cstring>
 #include <string>
 
+#include "common/assert.h"
 #include "common/dkb_cpu_trace.h"
 #include "common/logging.h"
 #include "common/settings.h"
@@ -42,6 +43,27 @@ namespace VideoCommon {
 
 namespace {
 
+// CheckRenderRead's stamps, hashed by page: the writer, the device page and the low 36 bits of
+// the back's packet count (24 bits wrapped after 16.7M packets, and a page stamped at boot read
+// ahead of GPURender once it was 8.4M packets old).
+constexpr size_t StampSlots = size_t{1} << 16;
+constexpr u64 StampPageBits = 12;
+constexpr u64 StampSeqBits = 36;
+constexpr u64 StampSeqMask = (u64{1} << StampSeqBits) - 1;
+constexpr u64 StampPageMask = (u64{1} << 24) - 1;
+constexpr u64 StampTagShift = 60;
+static_assert(Tegra::MaxwellDeviceTraits::device_virtual_bits - StampPageBits <= 24);
+
+const char* WriterName(u64 writer) {
+    static constexpr std::array<const char*, 5> names{
+        "word write", "block write", "constant buffer data", "payload release", "CPU write gather"};
+    return writer < names.size() ? names[writer] : "unknown";
+}
+
+size_t StampSlot(u64 page) {
+    return static_cast<size_t>((page ^ (page >> 16) ^ (page >> 32)) & (StampSlots - 1));
+}
+
 void Pause() {
 #if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
     _mm_pause();
@@ -53,8 +75,6 @@ void Pause() {
     std::this_thread::yield();
 #endif
 }
-
-[[maybe_unused]] std::atomic<u32> g_back_thread_id{};
 
 BackIdleTrace::FrontState WaitState(DrainSite site) {
     return site == DrainSite::ListWriters || site == DrainSite::ListCopies ||
@@ -90,15 +110,11 @@ private:
 } // Anonymous namespace
 
 void GpuSplit::CheckOwner(const char* where) {
+    if (!instance.BackRunning() || OwnsScheduler()) {
+        return;
+    }
 #ifdef _WIN32
-    // Also while the back is idle: its idle hook submits (Scheduler::FlushDeferred).
-    if (!instance.back_running.load(std::memory_order_acquire)) {
-        return;
-    }
     const DWORD thread = GetCurrentThreadId();
-    if (thread == g_back_thread_id.load(std::memory_order_relaxed)) {
-        return;
-    }
     static std::atomic<u32> reports{};
     if (reports.fetch_add(1) >= 12) {
         return;
@@ -119,13 +135,9 @@ void GpuSplit::CheckOwner(const char* where) {
                              reinterpret_cast<uintptr_t>(frames[i]) -
                                  reinterpret_cast<uintptr_t>(module));
     }
-    LOG_ERROR(HW_GPU, "GPU split owner check: {} on thread {} while the back runs; stack:{}",
+    LOG_ERROR(HW_GPU, "GPU split owner check: {} on thread {} without scheduler ownership; stack:{}",
               where, thread, stack);
 #else
-    // Also while the back is idle: its idle hook submits (Scheduler::FlushDeferred).
-    if (on_back_thread || !instance.back_running.load(std::memory_order_acquire)) {
-        return;
-    }
     static std::atomic<u32> reports{};
     if (reports.fetch_add(1) >= 12) {
         return;
@@ -141,12 +153,22 @@ void GpuSplit::CheckOwner(const char* where) {
         std::free(symbols);
     }
 #endif
-    LOG_ERROR(HW_GPU, "GPU split owner check: {} on a thread other than the back; stack:{}", where,
+    LOG_ERROR(HW_GPU, "GPU split owner check: {} without scheduler ownership; stack:{}", where,
               stack);
 #endif
 }
 
 GpuSplit GpuSplit::instance;
+
+bool GpuSplit::RenderThreadOn() {
+    const char* const follower = std::getenv("EDEN_NX2_RENDER_FOLLOWER");
+    return follower != nullptr ? follower[0] != '0' : Settings::values.render_thread.GetValue();
+}
+
+bool GpuSplit::RenderSwitch(const char* name) {
+    const char* const value = std::getenv(name);
+    return value == nullptr || value[0] != '0';
+}
 
 void GpuSplit::MaybeStart(Core::System& system_) {
     static const char mode = [] {
@@ -183,6 +205,211 @@ void GpuSplit::MaybeStart(Core::System& system_) {
                          std::getenv("EDEN_NX2_GUEST_THREAD_STATS") != nullptr;
     ring = std::make_unique<u64[]>(RingWords);
     ++starts; // Before the back starts: its holds name entries with it (EntryTag)
+    // EDEN_NX2_RENDER_FOLLOWER: record warm direct draws on GPURender. Off by default; the
+    // render_thread setting or EDEN_NX2_RENDER_FOLLOWER=1 turns it on with every switch of the port
+    // below, <switch>=0 turns one off. EDEN_NX2_RENDER_FOLLOWER overrides the setting either way.
+    const bool render_requested = render_follower_requested;
+    const char* const follower_env = std::getenv("EDEN_NX2_RENDER_FOLLOWER");
+    LOG_INFO(HW_GPU, "GPU render thread: {} ({})", render_requested ? "on" : "off",
+             follower_env != nullptr ? fmt::format("EDEN_NX2_RENDER_FOLLOWER={}", follower_env)
+                                     : std::string{"setting"});
+    if (render_requested && !render_follower_supported) {
+        LOG_INFO(HW_GPU, "GPU render follower: unsupported on this renderer or driver");
+    } else if (render_requested) {
+        // EDEN_NX2_RENDER_SPIN_US: how long each side polls before it parks (0 parks at once).
+        const char* const spin = std::getenv("EDEN_NX2_RENDER_SPIN_US");
+        const auto spin_time = spin != nullptr
+                                   ? std::chrono::microseconds{std::strtoul(spin, nullptr, 10)}
+                                   : std::chrono::duration_cast<std::chrono::microseconds>(
+                                         Nx2RenderFollower::DefaultSpin);
+        render_overlap_entries = 0;
+        render_joins = 0;
+        render_parks = 0;
+        join_sites = {};
+        lend_sites = {};
+        // EDEN_NX2_RENDER_RING=1: the back posts while earlier packets are unplayed (a ring of
+        // packets); without it a post waits for the packet before it, as the single slot did.
+        const bool ahead = RenderSwitch("EDEN_NX2_RENDER_RING");
+        render_lock_parks = 0;
+        // EDEN_NX2_RENDER_PLAYED=1: the front's waits read GPURender's position (FrontPosition).
+        two_positions = RenderSwitch("EDEN_NX2_RENDER_PLAYED");
+        // EDEN_NX2_RENDER_OWNS=1: GPURender owns the scheduler, the texture cache, the guest
+        // descriptor queue and the query cache; the back lends it every call into them.
+        render_owns = RenderSwitch("EDEN_NX2_RENDER_OWNS");
+        // EDEN_NX2_RENDER_UNLEND=1: warm direct draws go to GPURender unlent.
+        const bool unlend_wanted = RenderSwitch("EDEN_NX2_RENDER_UNLEND");
+        render_unlend = render_owns && render_follower_arena && unlend_wanted;
+        // EDEN_NX2_RENDER_WAITS_E=1: the front's game memory and list waits read the back's
+        // position (Fritchii 347d15c12).
+        const bool waits_wanted = RenderSwitch("EDEN_NX2_RENDER_WAITS_E");
+        waits_e = waits_wanted && two_positions;
+        if (waits_wanted && !waits_e) {
+            LOG_WARNING(HW_GPU, "EDEN_NX2_RENDER_WAITS_E needs EDEN_NX2_RENDER_PLAYED=1: ignored");
+        }
+        guest_write_op.store(0, std::memory_order_relaxed);
+        // Render follower port, step 8: posted render ops, one switch each.
+        static constexpr std::array<const char*, static_cast<size_t>(PostedOp::Count)>
+            post_switches{"EDEN_NX2_RENDER_POST_IDLE_HOOK",   "EDEN_NX2_RENDER_POST_FLUSH",
+                          "EDEN_NX2_RENDER_POST_FLUSH",       "EDEN_NX2_RENDER_POST_FENCE",
+                          "EDEN_NX2_RENDER_POST_INVAL",       "EDEN_NX2_RENDER_POST_INLINE",
+                          "EDEN_NX2_RENDER_POST_CONDITIONAL", "EDEN_NX2_RENDER_POST_QUERY",
+                          "EDEN_NX2_RENDER_POST_QUERY",       "EDEN_NX2_RENDER_POST_SIGNAL_FENCE",
+                          "EDEN_NX2_RENDER_POST_WFI",         "EDEN_NX2_RENDER_POST_FENCE_REPORT",
+                          "EDEN_NX2_RENDER_LIST_WORDS_E"};
+        for (size_t op = 0; op < posts.size(); ++op) {
+            const bool post_wanted = RenderSwitch(post_switches[op]);
+            posts[op] = post_wanted && render_unlend;
+            posted[op] = 0;
+            fences_lent = {};
+            if (post_wanted && !render_unlend) {
+                LOG_WARNING(HW_GPU, "{} needs EDEN_NX2_RENDER_UNLEND=1: ignored",
+                            post_switches[op]);
+            }
+        }
+        list_words.snapshots = list_words.owed = list_words.lent = list_words.moved = 0;
+        list_words.unmapped.store(0, std::memory_order_relaxed);
+        const bool inval_wanted = RenderSwitch("EDEN_NX2_RENDER_INVAL_E");
+        inval_e = inval_wanted && render_unlend;
+        invalidations = {};
+        for (auto& count : unparked) {
+            count.store(0, std::memory_order_relaxed);
+        }
+        if (inval_wanted && !inval_e) {
+            LOG_WARNING(HW_GPU, "EDEN_NX2_RENDER_INVAL_E needs EDEN_NX2_RENDER_UNLEND=1: ignored");
+        }
+        const bool gather_wanted = RenderSwitch("EDEN_NX2_RENDER_GATHER_E");
+        gather_e = gather_wanted && inval_e && posts[static_cast<size_t>(PostedOp::Invalidation)];
+        gathers.applied = gathers.lent = 0;
+        gathers.off_owner.store(0, std::memory_order_relaxed);
+        if (gather_wanted && !gather_e) {
+            LOG_WARNING(HW_GPU, "EDEN_NX2_RENDER_GATHER_E needs EDEN_NX2_RENDER_INVAL_E=1 and "
+                                "EDEN_NX2_RENDER_POST_INVAL=1: ignored");
+        }
+        const bool soft_wanted = RenderSwitch("EDEN_NX2_RENDER_SOFT_RELEASE_E");
+        soft_release_e = soft_wanted && render_unlend;
+        soft_releases = 0;
+        if (soft_wanted && !soft_release_e) {
+            LOG_WARNING(HW_GPU,
+                        "EDEN_NX2_RENDER_SOFT_RELEASE_E needs EDEN_NX2_RENDER_UNLEND=1: ignored");
+        }
+        const bool payload_wanted = RenderSwitch("EDEN_NX2_RENDER_PAYLOAD_E");
+        payload_e = payload_wanted && render_unlend;
+        payloads = {};
+        if (payload_wanted && !payload_e) {
+            LOG_WARNING(HW_GPU,
+                        "EDEN_NX2_RENDER_PAYLOAD_E needs EDEN_NX2_RENDER_UNLEND=1: ignored");
+        }
+        const bool query_sync_wanted = RenderSwitch("EDEN_NX2_RENDER_QUERY_SYNC_E");
+        query_sync_e = query_sync_wanted && render_unlend;
+        query_sync.collected = query_sync.targets = query_sync.payload_values = 0;
+        query_sync.missing.store(0, std::memory_order_relaxed);
+        query_sync.stopped.store(false, std::memory_order_relaxed);
+        if (query_sync_wanted && !query_sync_e) {
+            LOG_WARNING(HW_GPU,
+                        "EDEN_NX2_RENDER_QUERY_SYNC_E needs EDEN_NX2_RENDER_UNLEND=1: ignored");
+        }
+        const bool mesh_wanted = RenderSwitch("EDEN_NX2_RENDER_UNLEND_MESH");
+        unlend_mesh = mesh_wanted && render_unlend;
+        unlent_emulated_mesh.store(0, std::memory_order_relaxed);
+        if (mesh_wanted && !unlend_mesh) {
+            LOG_WARNING(HW_GPU,
+                        "EDEN_NX2_RENDER_UNLEND_MESH needs EDEN_NX2_RENDER_UNLEND=1: ignored");
+        }
+        const bool clear_wanted = RenderSwitch("EDEN_NX2_RENDER_UNLEND_CLEAR");
+        unlend_clear = clear_wanted && render_unlend;
+        clears.unlent = 0;
+        clears.lent = {};
+        clears.view_differences.store(0, std::memory_order_relaxed);
+        if (clear_wanted && !unlend_clear) {
+            LOG_WARNING(HW_GPU,
+                        "EDEN_NX2_RENDER_UNLEND_CLEAR needs EDEN_NX2_RENDER_UNLEND=1: ignored");
+        }
+        const bool dispatch_wanted = RenderSwitch("EDEN_NX2_RENDER_UNLEND_DISPATCH");
+        unlend_dispatch = dispatch_wanted && render_unlend;
+        dispatches.unlent = dispatches.indirect = dispatches.list_slots = dispatches.tails = 0;
+        dispatches.lent = {};
+        dispatches.failed.store(0, std::memory_order_relaxed);
+        dispatches.slots_unheld.store(0, std::memory_order_relaxed);
+        if (dispatch_wanted && !unlend_dispatch) {
+            LOG_WARNING(HW_GPU,
+                        "EDEN_NX2_RENDER_UNLEND_DISPATCH needs EDEN_NX2_RENDER_UNLEND=1: ignored");
+        }
+        const bool fast_delta_wanted = RenderSwitch("EDEN_NX2_RENDER_UNLEND_FAST_DELTA");
+        unlend_fast_delta = fast_delta_wanted && render_unlend;
+        fast_delta.kept = fast_delta.looked_up = fast_delta.differs = 0;
+        fast_delta.inputs_kept.store(0, std::memory_order_relaxed);
+        fast_delta.inputs_differ.store(0, std::memory_order_relaxed);
+        if (fast_delta_wanted && !unlend_fast_delta) {
+            LOG_WARNING(
+                HW_GPU,
+                "EDEN_NX2_RENDER_UNLEND_FAST_DELTA needs EDEN_NX2_RENDER_UNLEND=1: ignored");
+        }
+        const bool query_flush_wanted = RenderSwitch("EDEN_NX2_RENDER_QUERY_FLUSH_E");
+        query_flush_e = query_flush_wanted && render_unlend;
+        query_flushes_nothing_pending = 0;
+        reports_landed_untracked.store(0, std::memory_order_relaxed);
+        posted_waits_synced.store(0, std::memory_order_relaxed);
+        guest_syncs_unlent.store(0, std::memory_order_relaxed);
+        if (query_flush_wanted && !query_flush_e) {
+            LOG_WARNING(HW_GPU,
+                        "EDEN_NX2_RENDER_QUERY_FLUSH_E needs EDEN_NX2_RENDER_UNLEND=1: ignored");
+        }
+        const bool flush_wanted = RenderSwitch("EDEN_NX2_RENDER_FLUSH_E");
+        flush_e = flush_wanted && render_unlend;
+        flushes_answered = {};
+        flushes_lent = {};
+        flushes_verified = 0;
+        flushes_wrong = 0;
+        if (flush_wanted && !flush_e) {
+            LOG_WARNING(HW_GPU, "EDEN_NX2_RENDER_FLUSH_E needs EDEN_NX2_RENDER_UNLEND=1: ignored");
+        }
+        if (posts[static_cast<size_t>(PostedOp::Invalidation)] && !inval_e) {
+            LOG_WARNING(HW_GPU,
+                        "EDEN_NX2_RENDER_POST_INVAL needs EDEN_NX2_RENDER_INVAL_E=1: ignored");
+        }
+        engine_early.store(0, std::memory_order_relaxed);
+        if (unlend_wanted && !render_unlend) {
+            LOG_WARNING(HW_GPU, "EDEN_NX2_RENDER_UNLEND needs EDEN_NX2_RENDER_OWNS=1 and "
+                                "EDEN_NX2_BUFFER_ARENA=1: ignored");
+        }
+        unlend.unlent = 0;
+        unlend.lent = {};
+        unlend.verified = 0;
+        unlend.lookup_lends = 0;
+        unlend.stream_drains = 0;
+        unlend.skipped_back_flushes = 0;
+        unlend.failed = 0;
+        unlend.owed_patches = 0;
+        unlend.owed_table_reads = 0;
+        unlend.reads_ahead.store(0, std::memory_order_relaxed);
+        unlend.frees_ahead.store(0, std::memory_order_relaxed);
+        for (auto& count : reads_ahead_by) {
+            count.store(0, std::memory_order_relaxed);
+        }
+        pool_ranges = {};
+        if (render_unlend) {
+            if (!stamps) {
+                stamps = std::make_unique<std::atomic<u64>[]>(StampSlots);
+            }
+            // Fast draws' delta reads GPURender's scheduler state at the back's draw, and the
+            // packet does not carry it yet: they stay off while draws go unlent.
+            fast_draw_restore = Nx2FastDraw::g_enabled.exchange(false, std::memory_order_relaxed);
+        }
+        owner_on_e.store(0, std::memory_order_relaxed);
+        owner_on_r.store(0, std::memory_order_relaxed);
+        render_follower.emplace(spin_time, ahead);
+        render_thread = std::jthread([this] { RenderLoop(); });
+        LOG_INFO(HW_GPU,
+                 "GPU render follower: enabled, polls {} us before parking, {}, front waits "
+                 "for {}{}{}",
+                 spin_time.count(),
+                 ahead ? "posts ahead of unplayed packets" : "one packet at a time",
+                 two_positions ? "GPURender's position" : "the back's position",
+                 waits_e ? " (the back's for game memory and lists)" : "",
+                 render_unlend ? ", owns the renderer state (warm direct draws unlent)"
+                 : render_owns ? ", owns the renderer state (the back lends every call)"
+                               : "");
+    }
     back_thread = std::jthread([this](std::stop_token stop_token) { BackLoop(stop_token); });
     active = true;
     const char* jit = std::getenv("EDEN_NX2_MME_JIT");
@@ -199,6 +426,30 @@ void GpuSplit::Stop() {
     wake.fetch_add(1, std::memory_order_seq_cst);
     wake.notify_one();
     back_thread.join();
+    if (render_follower) {
+        render_follower->Stop();
+        render_thread.join();
+        render_follower.reset();
+        two_positions = false;
+        waits_e = false;
+        render_owns = false;
+        posts = {};
+        if (render_unlend && fast_draw_restore) {
+            Nx2FastDraw::g_enabled.store(true, std::memory_order_relaxed);
+        }
+        render_unlend = false;
+        inval_e = false;
+        gather_e = false;
+        flush_e = false;
+        query_flush_e = false;
+        unlend_mesh = false;
+        unlend_clear = false;
+        unlend_dispatch = false;
+        unlend_fast_delta = false;
+        soft_release_e = false;
+        payload_e = false;
+        query_sync_e = false;
+    }
     active = false;
     // The split is static and outlives the emulation session. The next session's back thread
     // starts reading at 0: with the old positions kept it skipped through the new, empty ring a
@@ -241,6 +492,7 @@ void GpuSplit::Stop() {
     front_macros = false;
     published.store(0, std::memory_order_relaxed);
     consumed.store(0, std::memory_order_relaxed);
+    played.store(0, std::memory_order_relaxed);
     back_idle_at.store(~u64{0}, std::memory_order_relaxed);
     back_waiting.store(false, std::memory_order_relaxed);
     front_waiting.store(false, std::memory_order_relaxed);
@@ -268,16 +520,17 @@ void GpuSplit::WaitForSpace(size_t words) {
     Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
     const CountedWait counted{DrainSite::RingFull};
     const u64 start = Nx2Profile::Enabled() ? Nx2Profile::Ticks() : 0;
+    const u64 target = write_position + words - RingWords;
     for (u32 spins = 0;; ++spins) {
-        consumed_cache = consumed.load(std::memory_order_acquire);
-        if (write_position + words - consumed_cache <= RingWords) {
+        consumed_cache = FrontPosition(std::memory_order_acquire);
+        if (consumed_cache >= target) {
             Nx2Profile::AddDrain(DrainSite::RingFull, start);
             return;
         }
         if (spins < 4096) {
             Pause();
         } else {
-            std::this_thread::yield();
+            SleepForBack(target);
         }
     }
 }
@@ -298,8 +551,13 @@ void GpuSplit::Publish() {
 
 void GpuSplit::Drain(DrainSite site) {
     FlushState();
-    consumed_cache = consumed.load(std::memory_order_acquire);
-    if (consumed_cache == write_position && BackQuiet()) {
+    const bool on_engine = UsesEngine(site);
+    const auto reached = [&] {
+        return on_engine ? ReachedOnEngine(write_position, std::memory_order_acquire)
+                         : consumed_cache >= write_position;
+    };
+    consumed_cache = FrontPosition(std::memory_order_acquire);
+    if (reached() && BackQuiet()) {
         return;
     }
     Publish();
@@ -311,9 +569,12 @@ void GpuSplit::Drain(DrainSite site) {
     // from its idle hook afterwards, and the caller may use the scheduler once this returns.
     bool hook_asked = false;
     for (u32 spins = 0;; ++spins) {
-        consumed_cache = consumed.load(std::memory_order_acquire);
-        if (consumed_cache == write_position) {
+        consumed_cache = FrontPosition(std::memory_order_acquire);
+        if (reached()) {
             if (BackQuiet()) {
+                if (on_engine && consumed_cache < write_position) {
+                    engine_early.fetch_add(1, std::memory_order_relaxed);
+                }
                 publish_every = 8;
                 Nx2Profile::AddDrain(site, start);
                 return;
@@ -322,15 +583,14 @@ void GpuSplit::Drain(DrainSite site) {
                 RequestIdleHook();
                 hook_asked = true;
             }
-            // Backoff sleeps only while entries are unconsumed: spin until the hook is done.
             if (spins < 16384) {
                 Pause();
             } else {
-                std::this_thread::yield();
+                SleepForBack(write_position, true, on_engine);
             }
             continue;
         }
-        Backoff(spins, write_position);
+        Backoff(spins, write_position, on_engine);
     }
 }
 
@@ -453,13 +713,18 @@ std::optional<GpuSplit::SettledWord> GpuSplit::SettledWordAt(const Tegra::Memory
 }
 
 GpuSplit::FencedHold GpuSplit::TrackFencedWrite() {
-    if (!on_back_thread) {
+    const bool playing = PlayingUnlent() && playing_position != ~u64{0};
+    if (!OnBackThread() && !playing) {
+        if (check_owner && on_render_thread) {
+            LOG_ERROR(HW_GPU, "GPU split owner check: render packet tried to publish a fence hold");
+        }
         return {};
     }
     std::scoped_lock lock{fenced_mutex};
     // Never below what the back published as consumed: a hold taken between entries (the idle
     // hook) holds the entries after it.
-    const u64 tag = std::max(EntryTag(back_entry_start), fenced_sealed);
+    const u64 tag =
+        std::max(EntryTag(playing ? playing_position : back_entry_start), fenced_sealed);
     if (fenced_entries.empty() || fenced_entries.back().tag != tag) {
         fenced_entries.push_back({tag, 0});
     }
@@ -659,8 +924,13 @@ bool GpuSplit::WaitForSyncedWriters() {
 
 bool GpuSplit::WaitFor(u64 target, DrainSite site) {
     FlushState();
-    consumed_cache = consumed.load(std::memory_order_acquire);
-    if (consumed_cache >= target) {
+    const bool on_engine = UsesEngine(site);
+    const auto reached = [&](u64 position) {
+        return on_engine ? ReachedOnEngine(position, std::memory_order_acquire)
+                         : consumed_cache >= position;
+    };
+    consumed_cache = FrontPosition(std::memory_order_acquire);
+    if (reached(target)) {
         return false;
     }
     Nx2Profile::Scope scope{Nx2Profile::Zone::WriterWait};
@@ -681,17 +951,20 @@ bool GpuSplit::WaitFor(u64 target, DrainSite site) {
     Publish();
     const u64 start = Nx2Profile::Enabled() ? Nx2Profile::Ticks() : 0;
     for (u32 spins = 0;; ++spins) {
-        consumed_cache = consumed.load(std::memory_order_acquire);
+        consumed_cache = FrontPosition(std::memory_order_acquire);
         if (past_release && !release_ran) {
-            if (consumed_cache < release) {
-                Backoff(spins, release);
+            if (!reached(release)) {
+                Backoff(spins, release, on_engine);
                 continue;
             }
             release_ran = Clock::now();
             wait_target.store(target, std::memory_order_seq_cst);
             spins = 0;
         }
-        if (consumed_cache >= target) {
+        if (reached(target)) {
+            if (on_engine && consumed_cache < target) {
+                engine_early.fetch_add(1, std::memory_order_relaxed);
+            }
             wait_target.store(~u64{0}, std::memory_order_relaxed);
             Nx2Profile::AddDrain(site, start);
             if (release != 0) {
@@ -708,24 +981,62 @@ bool GpuSplit::WaitFor(u64 target, DrainSite site) {
             }
             return true;
         }
-        Backoff(spins, target);
+        Backoff(spins, target, on_engine);
     }
 }
 
-void GpuSplit::Backoff(u32 spins, u64 target) {
+bool GpuSplit::SiteOnEngine(DrainSite site) noexcept {
+    switch (site) {
+    case DrainSite::MacroDmaRead:
+    case DrainSite::MacroDmaWrites:
+    case DrainSite::SemaphoreFlush:
+    case DrainSite::ListWriters:
+    case DrainSite::ListCopies:
+    case DrainSite::ListSync:
+    case DrainSite::ListFlush:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool GpuSplit::ReachedOnEngine(u64 target, std::memory_order order) const {
+    // The back ran `target`, and GPURender played the newest guest write op from before it. The
+    // mark is read after "consumed": an op in an entry the back ran is in it. A newer mark (at
+    // `target` or later) may hide an older one: then GPURender's position.
+    if (consumed.load(order) < target) {
+        return false;
+    }
+    const u64 mark = guest_write_op.load(std::memory_order_acquire);
+    if (mark == 0) {
+        return true;
+    }
+    if (mark - 1 < target) {
+        return played.load(order) > mark - 1;
+    }
+    return played.load(order) >= target;
+}
+
+void GpuSplit::Backoff(u32 spins, u64 target, bool on_engine) {
     if (spins < 16384) {
         Pause();
         return;
     }
+    SleepForBack(target, false, on_engine);
+}
+
+void GpuSplit::SleepForBack(u64 target, bool wait_for_idle, bool on_engine) {
     if (!back_running.load(std::memory_order_acquire)) {
         std::this_thread::yield();
         return;
     }
-    // A long wait sleeps until the back stores a new position (port of #161's front_wake): the
-    // back checks front_waiting after each store, the front checks the position after setting it.
+    // The back checks front_waiting after publishing progress or going quiet. Recheck after
+    // registering and taking the wake snapshot so progress before or during registration counts.
     front_waiting.store(true, std::memory_order_seq_cst);
     const u32 seen = front_wake.load(std::memory_order_seq_cst);
-    if (consumed.load(std::memory_order_seq_cst) < target) {
+    if (back_running.load(std::memory_order_seq_cst) &&
+        (!Reached(target, on_engine, std::memory_order_seq_cst) ||
+         (wait_for_idle && !back_quiet.load(std::memory_order_seq_cst)))) {
         front_wake.wait(seen, std::memory_order_seq_cst);
     }
     front_waiting.store(false, std::memory_order_relaxed);
@@ -807,13 +1118,26 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
         back_engine = reinterpret_cast<Tegra::Engines::EngineInterface*>(entry[1]);
         return 2;
     case Kind::Method: {
+        using Tegra::Engines::Maxwell3D;
         const u32 method = static_cast<u32>((head >> 8) & 0xffff);
         const u32 argument = static_cast<u32>(head >> 32);
         auto* const engine = back_engine;
+        if (render_follower && method == MAXWELL3D_REG_INDEX(draw.end) &&
+            engine->reports_fast_draw_breaks) {
+            auto* const maxwell3d = static_cast<Maxwell3D*>(engine);
+            maxwell3d->ConsumeSink(*system);
+            if ((head & HasSegment) != 0) {
+                maxwell3d->current_dma_segment = entry[1];
+            }
+            render_terminal_draw = true;
+            const Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
+            maxwell3d->CallMethod(*system, method, argument, (head & (Direct | IsLast)) != 0);
+            render_terminal_draw = false;
+            return (head & HasSegment) != 0 ? 2 : 1;
+        }
         if (engine->fast_maxwell3d) {
             // Nx2Perf: as below without the profile zones (off with fast_maxwell3d) and the
             // virtual call.
-            using Tegra::Engines::Maxwell3D;
             auto* const maxwell3d = static_cast<Maxwell3D*>(engine);
             constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
             if (method - cb_data < 16 && (head & HasSegment) == 0) {
@@ -915,6 +1239,453 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
     return 1;
 }
 
+void GpuSplit::LendRenderCall(const std::source_location& site, void (*call)(void*),
+                              void* argument) {
+    CheckRenderLocks();
+    const Nx2Profile::Scope scope{Nx2Profile::Zone::SplitWait};
+    const bool parked = render_follower->Lend(back_entry_start, call, argument);
+    render_parks += parked ? 1 : 0;
+    lend_sites.Note(site, parked);
+    // GPURender's raise after the lent packet may have read the back's position from before it
+    // (Fritchii 3ee8856d2): the front waited for a raise nobody made.
+    if (two_positions) {
+        RaisePlayed();
+    }
+}
+
+void GpuSplit::RaisePlayed() {
+    // A Dekker pair (Fritchii 5fc615545): the back stores "consumed" and then reads GPURender's
+    // count, GPURender stores its count and then reads "consumed". Without the fence both could
+    // read the other's old value and raise "played" short, and the front waits for good.
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    const u64 target = std::min(consumed.load(std::memory_order_acquire), render_follower->Floor());
+    u64 current = played.load(std::memory_order_relaxed);
+    while (current < target &&
+           !played.compare_exchange_weak(current, target, std::memory_order_seq_cst)) {
+    }
+    if (current < target) {
+        NotifyFront();
+    }
+}
+
+void GpuSplit::NoteOwner(bool on_render, const char* where, const std::source_location& site) {
+    auto& count = on_render ? owner_on_r : owner_on_e;
+    if (count.fetch_add(1, std::memory_order_relaxed) < 8) {
+        LOG_ERROR(HW_GPU, "GPU render follower: {} on {} ({}:{}), owned by {}", where,
+                  on_render ? "GPURender outside a lent call" : "the back", site.file_name(),
+                  site.line(), on_render ? "the back" : "GPURender");
+        if (check_owner) {
+            CheckOwner(where);
+        }
+    }
+}
+
+void GpuSplit::CheckRenderLocks() {
+    for (const auto* const lock : render_locks) {
+        if (lock != nullptr && lock->HeldByCurrentThread()) {
+            if (render_lock_parks++ == 0) {
+                LOG_ERROR(HW_GPU, "GPU render follower: the back waited for GPURender holding a "
+                                  "cache lock its packets may take");
+            }
+            return;
+        }
+    }
+}
+
+void GpuSplit::WaitRender(std::source_location site) {
+    if (on_back_thread && RenderPending()) {
+        ++render_joins;
+        const Nx2Profile::Scope scope{Nx2Profile::Zone::SplitWait};
+        const bool parked = render_follower->Wait();
+        render_parks += parked ? 1 : 0;
+        join_sites.Note(site, parked);
+    }
+}
+
+void GpuSplit::SiteCounts::Note(const std::source_location& site, bool parked) {
+    Site* slot = nullptr;
+    for (size_t i = 0; i < used; ++i) {
+        // Inline functions name their file once per translation unit.
+        if (sites[i].line == site.line() &&
+            (sites[i].file == site.file_name() ||
+             std::strcmp(sites[i].file, site.file_name()) == 0)) {
+            slot = &sites[i];
+            break;
+        }
+    }
+    if (slot == nullptr) {
+        if (used == sites.size()) {
+            ++other;
+            return;
+        }
+        slot = &sites[used++];
+        *slot = {site.file_name(), site.function_name(), site.line(), 0, 0};
+    }
+    ++slot->count;
+    slot->parks += parked ? 1 : 0;
+}
+
+void GpuSplit::SiteCounts::Log(const char* what) const {
+    std::array<const Site*, 64> order;
+    for (size_t i = 0; i < used; ++i) {
+        order[i] = &sites[i];
+    }
+    std::sort(order.begin(), order.begin() + used,
+              [](const Site* a, const Site* b) { return a->count > b->count; });
+    std::string text;
+    for (size_t i = 0; i < used; ++i) {
+        const Site& site = *order[i];
+        std::string_view function{site.function};
+        function = function.substr(0, function.find('('));
+        function = function.substr(function.rfind(' ') + 1);
+        std::string_view file{site.file};
+        file = file.substr(file.find_last_of("/\\") + 1);
+        text += fmt::format("{}{} ({}:{}) {} ({} parked)", i != 0 ? ", " : "", function, file,
+                            site.line, site.count, site.parks);
+    }
+    if (other != 0) {
+        text += fmt::format(", other sites {}", other);
+    }
+    LOG_INFO(HW_GPU, "GPU render follower {} by site: {}", what, text.empty() ? "none" : text);
+}
+
+void GpuSplit::RenderLoop() {
+    Common::SetCurrentThreadName("GPURender");
+    Common::SetCurrentThreadPriority(Common::ThreadPriority::High);
+    Common::SetCurrentThreadToPerformanceCores();
+    system->RegisterHostThread();
+    on_render_thread = true;
+    const bool profile = Nx2Profile::Enabled();
+    const auto cpu_start = profile ? Common::CurrentThreadCpuTimeNs() : std::nullopt;
+    u64 packets{};
+    Nx2Profile::Report("GPU render thread");
+    for (;;) {
+        const auto kind = [&] {
+            const Nx2Profile::Scope scope{Nx2Profile::Zone::SplitWait};
+            return render_follower->PlayNext();
+        }();
+        if (kind == Nx2RenderFollower::Kind::Stop) {
+            break;
+        }
+        if (two_positions) {
+            RaisePlayed();
+        }
+        ++packets;
+        Nx2Profile::Report("GPU render thread");
+    }
+    const double joined = packets != 0 ? 100.0 * static_cast<double>(render_joins) /
+                                             static_cast<double>(packets)
+                                       : 0.0;
+    const auto cpu_end = profile ? Common::CurrentThreadCpuTimeNs() : std::nullopt;
+    const auto& follower = *render_follower;
+    const bool played_short = two_positions && played.load(std::memory_order_acquire) !=
+                                                   consumed.load(std::memory_order_acquire);
+    LOG_INFO(HW_GPU,
+             "GPU render follower: {} packets ({} lent), {} overlapping entries, {} joins ({:.1f}% "
+             "of packets), {} parked, ring depth up to {}, {} room waits, {} wraps; must be 0: {} "
+             "out of order, {} parks holding a cache lock, {} played short at stop{}{}",
+             packets, follower.Lent(), render_overlap_entries, render_joins, joined, render_parks,
+             follower.MaxDepth(), follower.RoomWaits(), follower.Wraps(), follower.OutOfOrder(),
+             render_lock_parks, played_short ? 1 : 0,
+             render_owns ? fmt::format(", {} owner on E, {} owner on R",
+                                       owner_on_e.load(std::memory_order_relaxed),
+                                       owner_on_r.load(std::memory_order_relaxed))
+                         : std::string{},
+             cpu_start && cpu_end ? fmt::format(", {:.3f} ms thread CPU",
+                                                static_cast<double>(*cpu_end - *cpu_start) / 1e6)
+                                  : std::string{});
+    join_sites.Log("joins");
+    lend_sites.Log("lends");
+    if (waits_e) {
+        LOG_INFO(HW_GPU,
+                 "GPU render follower: {} front waits on the back's position ended before "
+                 "GPURender got there",
+                 engine_early.load(std::memory_order_relaxed));
+    }
+    if (render_unlend) {
+        LogUnlend();
+    }
+    if (std::ranges::any_of(posts, [](bool on) { return on; })) {
+        LOG_INFO(
+            HW_GPU,
+            "GPU render posted ops: {} idle hooks, {} flushes, {} fragment barriers, {} "
+            "invalidation halves, {} inline uploads, {} conditional rendering ends, {} waits for "
+            "idle; must be 0: {} frame ticks, {} owed list word landings on GPURender outside a "
+            "lent call, {} posted waits for idle with a query sync pending",
+            posted[static_cast<size_t>(PostedOp::IdleHook)],
+            posted[static_cast<size_t>(PostedOp::FlushCommands)],
+            posted[static_cast<size_t>(PostedOp::FragmentBarrier)],
+            posted[static_cast<size_t>(PostedOp::Invalidation)],
+            posted[static_cast<size_t>(PostedOp::Inline)],
+            posted[static_cast<size_t>(PostedOp::ConditionalEnd)],
+            posted[static_cast<size_t>(PostedOp::WaitForIdle)],
+            unparked[static_cast<size_t>(Unparked::FrameTick)].load(std::memory_order_relaxed),
+            unparked[static_cast<size_t>(Unparked::OwedLanding)].load(std::memory_order_relaxed),
+            posted_waits_synced.load(std::memory_order_relaxed));
+        if (posts[static_cast<size_t>(PostedOp::QueryReport)]) {
+            LOG_INFO(HW_GPU,
+                     "GPU render posted queries: {} Z-pass resets, {} Z-pass reports, {} query "
+                     "flushes skipped; must be 0: {} reports translated differently on GPURender",
+                     posted[static_cast<size_t>(PostedOp::QueryReset)],
+                     posted[static_cast<size_t>(PostedOp::QueryReport)], query_flushes_skipped,
+                     posted_reports_moved.load(std::memory_order_relaxed));
+        }
+        if (posts[static_cast<size_t>(PostedOp::Fence)] ||
+            posts[static_cast<size_t>(PostedOp::SignalFence)] ||
+            posts[static_cast<size_t>(PostedOp::FenceReport)]) {
+            LOG_INFO(
+                HW_GPU,
+                "GPU render posted fences: {} posted, {} SignalFence posted, {} fence reports "
+                "posted, lent: {} delayed, {} query sync owed, {} buffer flushes to commit, {} "
+                "without a 3D engine; must be 0: {} payload syncs on GPURender outside a lent call",
+                posted[static_cast<size_t>(PostedOp::Fence)],
+                posted[static_cast<size_t>(PostedOp::SignalFence)],
+                posted[static_cast<size_t>(PostedOp::FenceReport)],
+                fences_lent[static_cast<size_t>(FenceLent::Delayed)],
+                fences_lent[static_cast<size_t>(FenceLent::QueryOwed)],
+                fences_lent[static_cast<size_t>(FenceLent::BufferHalf)],
+                fences_lent[static_cast<size_t>(FenceLent::NoView)],
+                guest_syncs_unlent.load(std::memory_order_relaxed));
+        }
+    }
+    if (inval_e) {
+        const auto count = [this](InvalSite site) {
+            return invalidations[static_cast<size_t>(site)];
+        };
+        LOG_INFO(HW_GPU,
+                 "GPU render invalidations: buffer halves on the back: {} draws, {} gathers, {} "
+                 "regions; lent: {} image page, {} shader page, {} query page, {} GPU-written "
+                 "buffer page, {} registered before the second look",
+                 count(InvalSite::Draw), count(InvalSite::Gather), count(InvalSite::Region),
+                 count(InvalSite::Texture), count(InvalSite::Shader), count(InvalSite::Query),
+                 count(InvalSite::GpuWritten), count(InvalSite::Recheck));
+    }
+    if (posts[static_cast<size_t>(PostedOp::ListWords)]) {
+        LOG_INFO(HW_GPU,
+                 "GPU render list words on the back: {} snapshots, {} owed word copies posted, {} "
+                 "lent (slot buffers not made yet, or the list indirect check); must be 0: {} owed "
+                 "word stamps moved before the post, {} owed words waited for unmapped",
+                 list_words.snapshots, list_words.owed, list_words.lent, list_words.moved,
+                 list_words.unmapped.load(std::memory_order_relaxed));
+    }
+    if (gather_e) {
+        LOG_INFO(HW_GPU,
+                 "GPU render GPU-written page gathers on the back: {} with collected uploads, {} "
+                 "lent (a write the buffer cache would not upload); must be 0: {} GPU-written page "
+                 "writes on the back without the scheduler or a collected upload",
+                 gathers.applied, gathers.lent, gathers.off_owner.load(std::memory_order_relaxed));
+    }
+    if (soft_release_e) {
+        LOG_INFO(HW_GPU, "GPU render unforced fence releases returned on the back: {}",
+                 soft_releases);
+    }
+    if (payload_e) {
+        LOG_INFO(HW_GPU,
+                 "GPU render payload releases on the back: {} written, {} lent for a read "
+                 "download; must be 0: {} posted syncs with payload host syncs left on the back",
+                 payloads.written, payloads.lent, payloads.syncs_left);
+    }
+    if (query_sync_e) {
+        LOG_INFO(HW_GPU,
+                 "GPU render query syncs on the back: {} posted syncs collected ({} buffer "
+                 "targets, {} payload values); must be 0: {} query syncs without a target",
+                 query_sync.collected, query_sync.targets, query_sync.payload_values,
+                 query_sync.missing.load(std::memory_order_relaxed));
+    }
+    if (unlend_mesh) {
+        LOG_INFO(HW_GPU, "GPU render unlent mesh draws: must be 0: {} on an emulated mesh pipeline",
+                 unlent_emulated_mesh.load(std::memory_order_relaxed));
+    }
+    if (unlend_clear) {
+        const auto lent = [this](ClearLent reason) {
+            return clears.lent[static_cast<size_t>(reason)];
+        };
+        LOG_INFO(HW_GPU,
+                 "GPU render unlent clears: {} unlent, lent: {} diagnostics, {} verify, {} volume "
+                 "slices, {} gathers; must be 0: {} view differences on a verify clear",
+                 clears.unlent, lent(ClearLent::Diagnostics), lent(ClearLent::Verify),
+                 lent(ClearLent::Volume), lent(ClearLent::Gather),
+                 clears.view_differences.load(std::memory_order_relaxed));
+    }
+    if (unlend_fast_delta) {
+        LOG_INFO(HW_GPU,
+                 "GPU render unlent fast draws: {} kept the pipeline, {} looked it up; GPURender "
+                 "kept the vertex input {} times; must be 0: {} kept pipelines a lookup changed, "
+                 "{} kept vertex inputs that differ",
+                 fast_delta.kept, fast_delta.looked_up,
+                 fast_delta.inputs_kept.load(std::memory_order_relaxed), fast_delta.differs,
+                 fast_delta.inputs_differ.load(std::memory_order_relaxed));
+    }
+    if (unlend_dispatch) {
+        const auto lent = [this](DispatchLent reason) {
+            return dispatches.lent[static_cast<size_t>(reason)];
+        };
+        LOG_INFO(HW_GPU,
+                 "GPU render unlent dispatches: {} unlent ({} indirect, {} list slot), {} lent "
+                 "tails (list copies, early downloads); lent: {} diagnostics, {} lookup not a "
+                 "plain hit, {} not built or unsupported bindings, {} Ocarina hooks, {} grid over "
+                 "the limit, {} list slot not held, {} list owes, {} gathers, {} no 3D engine; "
+                 "must be 0: {} GPURender could not configure, {} list slots not held at play",
+                 dispatches.unlent, dispatches.indirect, dispatches.list_slots, dispatches.tails,
+                 lent(DispatchLent::Diagnostics), lent(DispatchLent::Lookup),
+                 lent(DispatchLent::NotBuilt), lent(DispatchLent::Hook), lent(DispatchLent::Grid),
+                 lent(DispatchLent::SlotUnheld), lent(DispatchLent::ListOwed),
+                 lent(DispatchLent::Gather), lent(DispatchLent::NoView),
+                 dispatches.failed.load(std::memory_order_relaxed),
+                 dispatches.slots_unheld.load(std::memory_order_relaxed));
+    }
+    if (query_flush_e) {
+        LOG_INFO(HW_GPU,
+                 "GPU render query flushes on the back: {} with no report still to land; must be "
+                 "0: {} reports landed untracked",
+                 query_flushes_nothing_pending,
+                 reports_landed_untracked.load(std::memory_order_relaxed));
+    }
+    if (flush_e) {
+        LOG_INFO(
+            HW_GPU,
+            "GPU render flushes on the back: FlushRegion {} answered, {} lent; "
+            "MustFlushRegion {} answered, {} lent; {} answers checked by a lend, must be 0: {} "
+            "found GPU-modified",
+            flushes_answered[static_cast<size_t>(FlushSite::Flush)],
+            flushes_lent[static_cast<size_t>(FlushSite::Flush)],
+            flushes_answered[static_cast<size_t>(FlushSite::MustFlush)],
+            flushes_lent[static_cast<size_t>(FlushSite::MustFlush)], flushes_verified,
+            flushes_wrong);
+    }
+}
+
+void GpuSplit::NotePools(GPUVAddr tic, u64 tic_size, GPUVAddr tsc, u64 tsc_size) {
+    const u64 packet = render_follower->Pushed() + 1;
+    for (const auto& [begin, size] : {std::pair{tic, tic_size}, std::pair{tsc, tsc_size}}) {
+        if (begin == 0 || size == 0) {
+            continue;
+        }
+        PoolRange* slot = &pool_ranges[0];
+        for (PoolRange& range : pool_ranges) {
+            if (range.begin == begin && range.end == begin + size) {
+                slot = &range;
+                break;
+            }
+            if (range.packet < slot->packet) {
+                slot = &range;
+            }
+        }
+        *slot = {begin, begin + size, packet};
+    }
+}
+
+void GpuSplit::GuardPools(GPUVAddr gpu_addr, u64 size) {
+    const u64 done = render_follower->Played();
+    const GPUVAddr end = gpu_addr + size;
+    for (const PoolRange& range : pool_ranges) {
+        if (range.packet > done && gpu_addr < range.end && range.begin < end) {
+            ++unlend.stream_drains;
+            CheckRenderLocks();
+            const bool parked = render_follower->Wait();
+            render_parks += parked ? 1 : 0;
+            join_sites.Note(std::source_location::current(), parked);
+            return;
+        }
+    }
+}
+
+void GpuSplit::Stamp(DAddr device_addr, u64 size, Writer writer) {
+    const u64 seq = render_follower->Pushed() & StampSeqMask;
+    const u64 tag = static_cast<u64>(writer) << StampTagShift;
+    for (u64 page = device_addr >> StampPageBits;
+         page <= (device_addr + (std::max)(size, u64{1}) - 1) >> StampPageBits; ++page) {
+        stamps[StampSlot(page)].store(tag | (page << StampSeqBits) | seq,
+                                      std::memory_order_release);
+    }
+}
+
+void GpuSplit::CheckRenderRead(DAddr device_addr, u64 size) {
+    if (!stamps || size == 0) {
+        return;
+    }
+    // The back stamps the writes it applies itself, fences, then looks at the page filters again
+    // (EDEN_NX2_RENDER_INVAL_E): either it saw this image's registration or this sees its stamp.
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    const u64 packet = (render_follower->Played() + 1) & StampSeqMask;
+    for (u64 page = device_addr >> StampPageBits; page <= (device_addr + size - 1) >> StampPageBits;
+         ++page) {
+        const u64 stamp = stamps[StampSlot(page)].load(std::memory_order_acquire);
+        if (((stamp >> StampSeqBits) & StampPageMask) != page) {
+            continue;
+        }
+        const u64 written = stamp & StampSeqMask;
+        if (((written - packet) & StampSeqMask) < (StampSeqMask >> 1)) {
+            const u64 tag = stamp >> StampTagShift;
+            reads_ahead_by[tag].fetch_add(1, std::memory_order_relaxed);
+            // The guest CPU wrote these bytes before the back gathered them, at no place in the
+            // stream: with one thread the image made here would read them as well. And nothing is
+            // lost: the back missed this image's registration, so the image holds the write and
+            // the page filter sends later ones to it. Counted apart, not as reads ahead.
+            if (tag == static_cast<u64>(Writer::Gather)) {
+                return;
+            }
+            if (unlend.reads_ahead.fetch_add(1, std::memory_order_relaxed) < 8) {
+                u64 idle = 0;
+                for (const auto& post : idle_posts) {
+                    const u64 at = post.load(std::memory_order_relaxed) & StampSeqMask;
+                    if (((at - packet) & StampSeqMask) <= ((written - packet) & StampSeqMask) &&
+                        at != 0) {
+                        idle = at;
+                    }
+                }
+                LOG_ERROR(HW_GPU,
+                          "GPU render unlend: GPURender read {:#x}+{:#x} for packet {}, which the "
+                          "back wrote after it posted packet {} ({}); posted wait for idle or "
+                          "fence between them: {}",
+                          device_addr, size, packet, written, WriterName(tag),
+                          idle != 0 ? fmt::format("packet {}", idle) : std::string{"none"});
+            }
+            return;
+        }
+    }
+}
+
+void GpuSplit::LogUnlend() const {
+    static constexpr std::array<const char*, static_cast<size_t>(UnlendReason::Count)> names{
+        "verify",      "indirect",  "texture",      "diagnostics",
+        "fast draw",   "feedback",  "inline index", "quads",
+        "uint8 index", "mesh",      "not built",    "texture buffers",
+        "repack",      "list owes", "gather",       "indirect reset",
+    };
+    std::string lent;
+    u64 total = 0;
+    for (size_t i = 0; i < names.size(); ++i) {
+        total += unlend.lent[i];
+        if (unlend.lent[i] != 0) {
+            lent += fmt::format(" {}:{}", names[i], unlend.lent[i]);
+        }
+    }
+    std::string ahead;
+    for (size_t tag = 0; tag < reads_ahead_by.size(); ++tag) {
+        if (const u64 count = reads_ahead_by[tag].load(std::memory_order_relaxed);
+            count != 0 && tag != static_cast<size_t>(Writer::Gather)) {
+            ahead += fmt::format(" {}:{}", WriterName(tag), count);
+        }
+    }
+    LOG_INFO(
+        HW_GPU,
+        "GPU render unlend: texture reads ahead by writer:{}; {} reads of guest CPU writes the "
+        "back gathered after the draw (CPU writes have no place in the stream)",
+        ahead.empty() ? " none" : ahead,
+        reads_ahead_by[static_cast<size_t>(Writer::Gather)].load(std::memory_order_relaxed));
+    LOG_INFO(HW_GPU,
+             "GPU render unlend: {} draws unlent, {} lent (by reason:{}); {} lookup lends, {} "
+             "stream write drains, {} GPURender flushes without the back's half, {} unlent draws "
+             "GPURender could not configure, {} owed list word patches in unlent packets; must be "
+             "0: {} texture reads ahead, {} buffer frees ahead, {} owed list words read through a "
+             "storage buffer table",
+             unlend.unlent, total, lent.empty() ? " none" : lent, unlend.lookup_lends,
+             unlend.stream_drains, unlend.skipped_back_flushes, unlend.failed, unlend.owed_patches,
+             unlend.reads_ahead.load(std::memory_order_relaxed),
+             unlend.frees_ahead.load(std::memory_order_relaxed), unlend.owed_table_reads);
+}
+
 void GpuSplit::BackLoop(std::stop_token stop_token) {
     const Common::DkbCpuTrace::Registration cpu_trace{Common::DkbCpuTrace::Role::GpuBack};
     const StutterTrace::ThreadScope stutter_thread{StutterTrace::Thread::Back};
@@ -927,9 +1698,6 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
         Common::PinCurrentThread(Common::PinnedRole::GpuBack);
     }
     system->RegisterHostThread();
-#ifdef _WIN32
-    g_back_thread_id.store(GetCurrentThreadId(), std::memory_order_relaxed);
-#endif
     u64 read_position = 0;
     const bool idle_trace = BackIdleTrace::Enabled();
     u64 idle_since = 0;
@@ -964,10 +1732,14 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 // The front may already see everything consumed: Drain() waits for back_quiet
                 // too, so the deferred submit can't overlap whatever the front does next.
                 if (!back_quiet.load(std::memory_order_relaxed)) {
+                    if (!Posts(PostedOp::IdleHook)) {
+                        WaitRender();
+                    }
                     if (idle_hook != nullptr) {
                         idle_hook(idle_argument);
                     }
-                    back_quiet.store(true, std::memory_order_release);
+                    back_quiet.store(true, std::memory_order_seq_cst);
+                    NotifyFront();
                 }
                 available = published.load(std::memory_order_acquire);
             }
@@ -996,12 +1768,19 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
         back_quiet.store(false, std::memory_order_seq_cst);
         while (read_position != available) {
             const size_t index = read_position & RingMask;
+            // A draw packet records beside every entry: the scheduler joins it (JoinRender).
+            if (RenderPending()) {
+                ++render_overlap_entries;
+            }
             back_entry_start = read_position;
             const size_t size =
                 Execute(&ring[index], std::min<u64>(available - read_position, RingWords - index));
             read_position += size != 0 ? size : RingWords - index;
             if (hook_requested.load(std::memory_order_relaxed) &&
                 idle_hook != nullptr) [[unlikely]] {
+                if (!Posts(PostedOp::IdleHook)) {
+                    WaitRender();
+                }
                 hook_requested.store(false, std::memory_order_seq_cst);
                 idle_hook(idle_argument);
             }
@@ -1012,13 +1791,25 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 read_position != available) {
                 SealFencedEntries(read_position);
                 consumed.store(read_position, std::memory_order_seq_cst);
+                if (two_positions) {
+                    RaisePlayed();
+                }
                 last_store = read_position;
                 NotifyFront();
             }
         }
+        // No join: the front's waits read "played" with EDEN_NX2_RENDER_PLAYED=1 (FrontPosition),
+        // and it takes the scheduler only once the back is quiet (above, after its join).
         SealFencedEntries(read_position);
         consumed.store(read_position, std::memory_order_seq_cst);
+        if (two_positions) {
+            RaisePlayed();
+        }
         NotifyFront();
+    }
+    WaitRender();
+    if (two_positions) {
+        RaisePlayed();
     }
     back_running.store(false, std::memory_order_seq_cst);
     front_wake.fetch_add(1, std::memory_order_seq_cst);

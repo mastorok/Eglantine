@@ -75,6 +75,12 @@ public:
         return ref->second.storage_id;
     }
 
+    /// EDEN_NX2_RENDER_UNLEND: GPURender points the cache at its register view of the channel
+    /// while it plays an unlent draw. Returns the engine it used.
+    Tegra::Engines::Maxwell3D* SwapMaxwell3D(Tegra::Engines::Maxwell3D* engine) noexcept {
+        return std::exchange(maxwell3d, engine);
+    }
+
 protected:
     static constexpr size_t UNSET_CHANNEL{(std::numeric_limits<size_t>::max)()};
 

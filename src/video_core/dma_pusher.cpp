@@ -34,6 +34,7 @@
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
+#include "video_core/nx2_mme_capture.h"
 #include "video_core/guest_memory.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
@@ -184,11 +185,15 @@ public:
 
     /// Waits until job `number` and the ones before it ran.
     void WaitFor(u64 number) const {
-        for (u32 spins = 0; completed.load(std::memory_order_acquire) < number; ++spins) {
+        for (u32 spins = 0;; ++spins) {
+            const u64 done = completed.load(std::memory_order_acquire);
+            if (done >= number) {
+                return;
+            }
             if (spins < 4096) {
                 CopierPause();
             } else {
-                std::this_thread::yield();
+                completed.wait(done, std::memory_order_acquire);
             }
         }
     }
@@ -227,6 +232,7 @@ private:
             for (; done != available; ++done) {
                 Copy(jobs[done % Capacity]);
                 completed.store(done + 1, std::memory_order_release);
+                completed.notify_all();
             }
         }
     }
@@ -487,7 +493,8 @@ bool DmaPusher::Step() {
     if (prefetch_size > 0) {
         const std::span<const CommandHeader> commands{command_list.prefetch_command_list};
         command_resume_offset +=
-            ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
+            ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset,
+                            "prefetch");
         if (puller.HasPendingAcquire()) {
             return false;
         }
@@ -538,10 +545,6 @@ bool DmaPusher::Step() {
             }
         }
         if (command_resume_offset == 0) {
-            // A method's data continues across GP entries, whatever their level: title 4 ends a
-            // main entry after a macro's first word and supplies the remaining parameters in a
-            // 5-word subroutine entry. EDEN_NX2_PARK_SPLIT_METHODS restores the old guess (an
-            // entry elsewhere is a call that starts clean; resume where the split one ended).
             static const bool park_split_methods = std::getenv("EDEN_NX2_PARK_SPLIT_METHODS") != nullptr;
             if (g_nx2_ampere) {
                 if (static u32 split_logs{}; dma_state.method_count != 0 && split_logs < 64) {
@@ -559,8 +562,26 @@ bool DmaPusher::Step() {
                     LOG_DEBUG(HW_GPU, "  previous entry ends {:08x}; next entry starts {:08x}",
                               fmt::join(prev_words, " "), fmt::join(next_words, " "));
                 }
-                if (park_split_methods) {
-                    ResolveSplitMethod(header.addr);
+                // Macro payloads can span noncontiguous entries of any size. For a register
+                // write, treat a mismatched entry as a call only if the split resumes later at
+                // the end of the previous entry.
+                const bool park_call =
+                    !park_split_methods && dma_state.method_count != 0 &&
+                    dma_state.method < MacroRegistersStart && header.addr != split_method_end &&
+                    header.size != dma_state.method_count &&
+                    SplitResumesLater(command_list, dma_pushbuffer_subindex + 1);
+                if (park_call) {
+                    static std::atomic<u32> reported{};
+                    if (reported.fetch_add(1) < 8) {
+                        LOG_INFO(HW_GPU,
+                                 "Split method {:#x} ({} left) on ch {}: entry {:#x}+{} is a "
+                                 "call, the method resumes at {:#x}",
+                                 dma_state.method, dma_state.method_count, channel_state.bind_id,
+                                 u64{header.addr}, u64{header.size}, split_method_end);
+                    }
+                }
+                if (park_split_methods || park_call || !parked_methods.empty()) {
+                    ResolveSplitMethod(header.addr, park_split_methods || park_call);
                 }
             }
             if (dma_pushbuffer_subindex < command_list.submit_hashes.size()) {
@@ -613,7 +634,7 @@ bool DmaPusher::Step() {
         // how often the words parsed differ from the copy, by the reason the copy was skipped.
         static const bool live_read_check = std::getenv("EDEN_NX2_LIVE_READ_CHECK") != nullptr;
         const CommandHeader* const submitted_copy =
-            live_read_check && !submitted &&
+            (live_read_check || VideoCommon::MmeCapture::active) && !submitted &&
                     dma_pushbuffer_subindex < command_list.submitted_offsets.size() &&
                     !std::ranges::binary_search(command_list.deferred_entries,
                                                 static_cast<u32>(dma_pushbuffer_subindex))
@@ -672,22 +693,24 @@ bool DmaPusher::Step() {
                 header.size};
             RecordParsedEntry(header, commands);
             Nx2CmdPageDiag::CountEntry(Nx2CmdPageDiag::Path::Submitted);
-            command_resume_offset += ProcessCommands(commands, 0);
+            command_resume_offset += ProcessCommands(commands, 0, "snapshot");
         } else if (use_safe) {
             Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, Tegra::Memory::GuestMemoryFlags::SafeRead>headers(memory_manager, dma_state.dma_get, header.size, &command_headers);
             const std::span<const CommandHeader> commands{headers.data(), headers.size()};
             RecordParsedEntry(header, commands);
-            if (submitted_copy != nullptr) {
+            if (live_read_check && submitted_copy != nullptr) {
                 CheckLiveRead(live_read_reason, header, commands, submitted_copy);
             }
             Nx2CmdPageDiag::CountEntry(Nx2CmdPageDiag::Path::Safe);
             command_resume_offset +=
-                ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
+                ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset,
+                                "safe read", submitted_copy);
         } else if (!caches_flushed && gpu_written && TakeGpuWrittenListWords(header)) {
             // The words stay on the host GPU; the front parses their slot placeholders.
             const std::span<const CommandHeader> commands{command_headers.data(), header.size};
             command_resume_offset +=
-                ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
+                ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset,
+                                "GPU slots", submitted_copy);
         } else if (bool pending = false;
                    !caches_flushed &&
                    (ReadGpuWrittenCommands(dma_state.dma_get, static_cast<u32>(header.size),
@@ -702,13 +725,14 @@ bool DmaPusher::Step() {
             }
             const std::span<const CommandHeader> commands{command_headers.data(), header.size};
             RecordParsedEntry(header, commands);
-            if (submitted_copy != nullptr) {
+            if (live_read_check && submitted_copy != nullptr) {
                 CheckLiveRead(live_read_reason, header, commands, submitted_copy);
             }
             Nx2CmdPageDiag::CountEntry(Nx2CmdPageDiag::Path::Copy);
             const bool traced = begin_list_trace(ListTrace::Path::Copied);
             command_resume_offset +=
-                ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
+                ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset,
+                                "GPU copy", submitted_copy);
             if (traced) {
                 end_list_trace();
             }
@@ -721,13 +745,14 @@ bool DmaPusher::Step() {
             Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, Tegra::Memory::GuestMemoryFlags::UnsafeRead>headers(memory_manager, dma_state.dma_get, header.size, &command_headers);
             const std::span<const CommandHeader> commands{headers.data(), headers.size()};
             RecordParsedEntry(header, commands);
-            if (submitted_copy != nullptr) {
+            if (live_read_check && submitted_copy != nullptr) {
                 CheckLiveRead(live_read_reason, header, commands, submitted_copy);
             }
             Nx2CmdPageDiag::CountEntry(Nx2CmdPageDiag::Path::Slow);
             const bool traced = flushed && begin_list_trace(ListTrace::Path::Flushed);
             command_resume_offset +=
-                ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
+                ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset,
+                                "live read", submitted_copy);
             if (traced) {
                 end_list_trace();
             }
@@ -774,7 +799,23 @@ bool DmaPusher::Step() {
     return true;
 }
 
-size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_t word_offset) {
+size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_t word_offset,
+                                  std::string_view source, const CommandHeader* snapshot) {
+    if (VideoCommon::MmeCapture::active && g_nx2_ampere) {
+        std::array<u32, 128> words;
+        const auto shown = std::span{words}.first(std::min(commands.size(), words.size()));
+        for (size_t i = 0; i < shown.size(); ++i) {
+            shown[i] = commands[i].argument;
+        }
+        VideoCommon::MmeCapture::RecordEntry(
+            fmt::format("as={} ch={} source={} entry_va={:#x} offset={} words={} "
+                        "pending_method={:#x} pending_words={} sub={} non_inc={} once={}: {:08x}",
+                        memory_manager.GetID(), channel_state.bind_id, source,
+                        source == "prefetch" ? u64{0} : static_cast<u64>(dma_state.dma_get),
+                        word_offset, commands.size(), dma_state.method, dma_state.method_count,
+                        dma_state.subchannel, dma_state.non_incrementing, dma_increment_once,
+                        fmt::join(shown, " ")));
+    }
     for (size_t index = 0; index < commands.size();) {
         // Data word of methods command
         if (dma_state.method_count && dma_state.non_incrementing) {
@@ -783,6 +824,10 @@ size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_
             u32 max_write = u32(std::min<std::size_t>(index + dma_state.method_count, commands.size()) - index);
             if (g_nx2_ampere && dma_state.method < non_puller_methods) {
                 max_write = 1; // a semaphore acquire may suspend the channel after any word
+            }
+            if (VideoCommon::MmeCapture::active) {
+                CaptureMmeWords({&command_header.argument, max_write}, word_offset + index, source,
+                                snapshot);
             }
             CallMultiMethod(&command_header.argument, max_write);
             dma_state.method_count -= max_write;
@@ -822,6 +867,10 @@ size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_
             auto const command_header = commands[index]; //can copy
             dma_state.dma_word_offset = u64((word_offset + index) * sizeof(u32));
             dma_state.is_last_call = dma_state.method_count <= 1;
+            if (VideoCommon::MmeCapture::active) {
+                CaptureMmeWords({&command_header.argument, 1}, word_offset + index, source,
+                                snapshot);
+            }
             CallMethod(command_header.argument);
             dma_state.method += !dma_state.non_incrementing ? 1 : 0;
             dma_state.non_incrementing |= dma_increment_once;
@@ -845,6 +894,11 @@ size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_
                 dma_state.method = command_header.method;
                 dma_state.subchannel = command_header.subchannel;
                 dma_state.dma_word_offset = u64(-s64(dma_state.dma_get)); // negate to set address as 0
+                if (VideoCommon::MmeCapture::active) {
+                    const u32 argument = command_header.arg_count;
+                    CaptureMmeWords({&argument, 1}, word_offset + index, source, snapshot,
+                                    command_header.argument);
+                }
                 CallMethod(command_header.arg_count);
                 dma_state.non_incrementing = true;
                 dma_increment_once = false;
@@ -867,18 +921,19 @@ size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_
 }
 
 // NVN on Switch 2 ends GPFIFO entries in the middle of a method's data and calls another command
-// buffer (e.g. a compute dispatch) before the entry that carries the rest, which starts right
-// where the first one ended. An entry starting anywhere else is such a call: run it with a clean
-// method state and resume the unfinished method when the stream continues at that address.
-void DmaPusher::ResolveSplitMethod(GPUVAddr entry_address) {
+// buffer before the entry that carries the rest. Run the call with a clean method state and
+// resume the unfinished method when the stream continues at its split address.
+void DmaPusher::ResolveSplitMethod(GPUVAddr entry_address, bool park) {
     const auto continued = std::ranges::find(parked_methods, entry_address,
                                              &ParkedMethod::resume_address);
+    const bool can_park =
+        park || (continued != parked_methods.end() && dma_state.method < MacroRegistersStart);
     std::optional<ParkedMethod> resume;
     if (continued != parked_methods.end()) {
         resume = *continued;
         parked_methods.erase(continued);
     }
-    if (dma_state.method_count != 0 && entry_address != split_method_end) {
+    if (can_park && dma_state.method_count != 0 && entry_address != split_method_end) {
         if (parked_methods.size() == MaxParkedMethods) {
             static std::atomic<u32> reported{};
             if (reported.fetch_add(1) < 8) {
@@ -907,7 +962,17 @@ void DmaPusher::ResolveSplitMethod(GPUVAddr entry_address) {
         dma_state.method_count = resume->method_count;
         dma_state.non_incrementing = resume->non_incrementing;
         dma_increment_once = resume->increment_once;
+        split_method_end = entry_address;
     }
+}
+
+bool DmaPusher::SplitResumesLater(const CommandList& list, size_t from) const {
+    for (size_t i = from; i < list.command_lists.size(); ++i) {
+        if (list.command_lists[i].size > 0 && list.command_lists[i].addr == split_method_end) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void DmaPusher::SetState(const CommandHeader& command_header) {
@@ -930,6 +995,36 @@ bool DmaPusher::WantsSegment() const {
     const auto engine = subchannel_type[dma_state.subchannel];
     return engine == Engines::EngineTypes::KeplerCompute ||
            (engine == Engines::EngineTypes::Maxwell3D && dma_state.method >= MacroRegistersStart);
+}
+
+void DmaPusher::CaptureMmeWords(std::span<const u32> words, size_t word_offset,
+                                std::string_view source, const CommandHeader* snapshot,
+                                u32 inline_header) const {
+    const u32 method = dma_state.method;
+    if (!g_nx2_ampere || (method != 0 && method - 0x45 >= 4)) {
+        return;
+    }
+    const u32 sub = dma_state.subchannel;
+    auto line = fmt::format("dma as={} ch={} sub={} engine={} source={} entry_va={:#x} word={} "
+                            "method={:#x} pending={} args={:08x}",
+                            memory_manager.GetID(), channel_state.bind_id, sub,
+                            VideoCommon::MmeCapture::EngineId(subchannels[sub]), source,
+                            source == "prefetch" ? u64{0} : static_cast<u64>(dma_state.dma_get),
+                            word_offset, method, dma_state.method_count, fmt::join(words, " "));
+    if (inline_header != 0) {
+        fmt::format_to(std::back_inserter(line), " inline_header={:08x}", inline_header);
+    }
+    if (snapshot != nullptr) {
+        line += " snapshot_differences:";
+        for (size_t i = 0; i < words.size(); ++i) {
+            const auto& submitted = snapshot[word_offset + i];
+            const u32 actual = inline_header != 0 ? inline_header : words[i];
+            if (actual != submitted.argument) {
+                fmt::format_to(std::back_inserter(line), " {}:{:08x}", i, submitted.argument);
+            }
+        }
+    }
+    VideoCommon::MmeCapture::Record(std::move(line));
 }
 
 void DmaPusher::CallMethod(u32 argument) {

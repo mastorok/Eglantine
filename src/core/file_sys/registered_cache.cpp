@@ -1229,6 +1229,10 @@ const ExternalContentProvider* ContentProviderUnion::GetExternalProvider() const
     return static_cast<const ExternalContentProvider*>(providers[size_t(ContentProviderUnionSlot::External)]);
 }
 
+ManualContentProvider::ManualContentProvider(
+    std::function<std::vector<u8>(u64)> read_application_icon_)
+    : read_application_icon(std::move(read_application_icon_)) {}
+
 ManualContentProvider::~ManualContentProvider() = default;
 
 void ManualContentProvider::AddEntry(TitleType title_type, ContentRecordType content_type, u64 title_id, VirtualFile file) {
@@ -1338,6 +1342,28 @@ bool ManualContentProvider::AddEntriesFromContainer(VirtualFile file, bool only_
 void ManualContentProvider::ClearAllEntries() {
     entries.clear();
     multi_version_entries.clear();
+}
+
+void ManualContentProvider::ReplaceApplicationPaths(GameListApplicationPaths paths) {
+    application_paths = std::move(paths);
+}
+
+std::optional<std::string> ManualContentProvider::GetApplicationPath(u64 program_id) const {
+    const auto it = application_paths.find(program_id);
+    return it != application_paths.end() ? std::optional{it->second} : std::nullopt;
+}
+
+std::vector<u8> ManualContentProvider::ReadApplicationIcon(u64 program_id) const {
+    return read_application_icon ? read_application_icon(program_id) : std::vector<u8>{};
+}
+
+std::vector<u64> ManualContentProvider::ListApplicationFiles() const {
+    std::vector<u64> program_ids;
+    program_ids.reserve(application_paths.size());
+    for (const auto& [program_id, path] : application_paths) {
+        program_ids.push_back(program_id);
+    }
+    return program_ids;
 }
 
 void ManualContentProvider::Refresh() {}

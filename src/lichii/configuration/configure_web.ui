@@ -153,6 +153,32 @@
     </widget>
    </item>
    <item>
+    <widget class="QGroupBox" name="group_mod_store">
+     <property name="title">
+      <string>Mod Store</string>
+     </property>
+     <layout class="QFormLayout" name="layout_mod_store">
+      <item row="0" column="0">
+       <widget class="QLabel" name="label_mod_store_api_url">
+        <property name="text">
+         <string>&amp;API base URL:</string>
+        </property>
+        <property name="buddy">
+         <cstring>edit_mod_store_api_url</cstring>
+        </property>
+       </widget>
+      </item>
+      <item row="0" column="1">
+       <widget class="QLineEdit" name="edit_mod_store_api_url">
+        <property name="toolTip">
+         <string>Leave blank to restore the default Mod Store address.</string>
+        </property>
+       </widget>
+      </item>
+     </layout>
+    </widget>
+   </item>
+   <item>
     <spacer name="verticalSpacer">
      <property name="orientation">
       <enum>Qt::Orientation::Vertical</enum>

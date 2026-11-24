@@ -57,6 +57,7 @@ struct Patch {
     u32 numeric_version{0};
     // Off until the user turns it on: disabled_addons then holds EnabledAddonKey(name).
     bool off_by_default{false};
+    std::string description{};
 };
 
 // The disabled_addons entry that turns on an add-on that is off by default.

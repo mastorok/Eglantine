@@ -29,11 +29,12 @@ from pathlib import Path
 SAMPLE_TRACE = "sample"
 
 
-def replay(cli, trace, out, extra=()):
+def replay(cli, trace, out, extra=(), environment=None):
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
     command = [str(cli), "--replay", str(trace), "--out", str(out), *extra]
-    result = subprocess.run(command, capture_output=True, text=True, errors="replace")
+    env = {**os.environ, **environment} if environment else None
+    result = subprocess.run(command, capture_output=True, text=True, errors="replace", env=env)
     if result.returncode != 0:
         tail = "\n".join(result.stderr.splitlines()[-20:])
         raise RuntimeError(f"{' '.join(command)} failed ({result.returncode}):\n{tail}")
@@ -171,7 +172,8 @@ def check(cli, corpus_path, traces_dir, out, require):
         work.mkdir(parents=True, exist_ok=True)
         if entry.get("source") == "generated":
             trace = work / "trace.lxtrace"
-            subprocess.run([str(cli), "--gpu-trace-sample", str(trace)], check=True)
+            generator = entry.get("generator", "--gpu-trace-sample")
+            subprocess.run([str(cli), generator, str(trace)], check=True)
         else:
             trace = Path(traces_dir or ".") / entry["file"]
             if not trace.exists():
@@ -185,10 +187,12 @@ def check(cli, corpus_path, traces_dir, out, require):
         start = entry.get("roundtrip_from")
         extra = [] if start is None else ["--record", str(work / "recorded.lxtrace"),
                                           "--record-from", str(start)]
-        result = replay(cli, trace, work / "frames", extra)
+        environment = entry.get("environment")
+        result = replay(cli, trace, work / "frames", extra, environment)
         device = device_class(result.get("renderer", ""))
         if start is not None:
-            again = replay(cli, work / "recorded.lxtrace", work / "recorded")
+            again = replay(cli, work / "recorded.lxtrace", work / "recorded",
+                           environment=environment)
             tail = [frame["hash"] for frame in result["frames"]][start:]
             if [frame["hash"] for frame in again["frames"]] != tail:
                 print(f"{trace_id}: FAIL, the trace recorded from present {start} replays to "

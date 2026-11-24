@@ -11,6 +11,11 @@
 #include <thread>
 #include <vector>
 
+#ifdef __linux__
+#include <fstream>
+#include <string>
+#endif
+
 #include <catch2/catch_test_macros.hpp>
 
 #ifdef _WIN32
@@ -267,6 +272,79 @@ TEST_CASE("HostMemory: Partial sparse middle unmap and check bindings", "[common
     REQUIRE(ptr[0x0000] == 19);
     REQUIRE(ptr[0x3fff] == 12);
 }
+
+#if defined(_WIN32) || defined(__linux__)
+TEST_CASE("HostMemory: Partial unmap preserves the protections of both kept pieces",
+          "[common][host_memory]") {
+    if (!MapsSingleGuestPages()) {
+        SKIP("Host pages larger than 4 KiB only map whole host pages");
+    }
+    constexpr size_t Page = 0x1000;
+    constexpr size_t VirtualOffset = 0x80000;
+    constexpr size_t BackingOffset = 0x20000;
+    HostMemory mem(BACKING_SIZE, VIRTUAL_SIZE);
+    REQUIRE(mem.VirtualBasePointer() != nullptr);
+    mem.Map(VirtualOffset, BackingOffset, 6 * Page, PERMS, HEAP);
+    u8* const view = mem.VirtualBasePointer() + VirtualOffset;
+    const auto protection = [view](size_t page) {
+        const u8* const address = view + page * Page;
+#ifdef _WIN32
+        MEMORY_BASIC_INFORMATION info{};
+        REQUIRE(VirtualQuery(address, &info, sizeof(info)) == sizeof(info));
+        switch (info.Protect) {
+        case PAGE_READWRITE:
+            return PERMS;
+        case PAGE_READONLY:
+            return Common::MemoryPermission::Read;
+        case PAGE_NOACCESS:
+            return Common::MemoryPermission{};
+        }
+#else
+        const auto pointer = reinterpret_cast<uintptr_t>(address);
+        std::ifstream maps{"/proc/self/maps"};
+        std::string line;
+        while (std::getline(maps, line)) {
+            unsigned long long begin{}, end{};
+            char perms[5]{};
+            if (std::sscanf(line.c_str(), "%llx-%llx %4s", &begin, &end, perms) == 3 &&
+                begin <= pointer && pointer < end) {
+                auto permission = Common::MemoryPermission{};
+                if (perms[0] == 'r') {
+                    permission |= Common::MemoryPermission::Read;
+                }
+                if (perms[1] == 'w') {
+                    permission |= Common::MemoryPermission::Write;
+                }
+                return permission;
+            }
+        }
+#endif
+        FAIL("Could not determine the protection of kept page " << page);
+        return Common::MemoryPermission{};
+    };
+
+    view[5 * Page] = 0x15;
+    mem.Protect(VirtualOffset, Page, Common::MemoryPermission::Read);
+    mem.Protect(VirtualOffset + 4 * Page, Page, Common::MemoryPermission{});
+    mem.Protect(VirtualOffset + 5 * Page, Page, Common::MemoryPermission::Read);
+    REQUIRE(protection(0) == Common::MemoryPermission::Read);
+    REQUIRE(protection(4) == Common::MemoryPermission{});
+
+    mem.Unmap(VirtualOffset + 2 * Page, 2 * Page, HEAP);
+
+    REQUIRE(protection(0) == Common::MemoryPermission::Read);
+    REQUIRE(protection(1) == PERMS);
+    REQUIRE(protection(4) == Common::MemoryPermission{});
+    REQUIRE(protection(5) == Common::MemoryPermission::Read);
+    REQUIRE(view[5 * Page] == 0x15);
+
+    mem.Protect(VirtualOffset + 4 * Page, 2 * Page, PERMS);
+    REQUIRE(protection(4) == PERMS);
+    REQUIRE(protection(5) == PERMS);
+    view[4 * Page] = 0x24;
+    REQUIRE(mem.BackingBasePointer()[BackingOffset + 4 * Page] == 0x24);
+}
+#endif
 
 #ifdef _WIN32
 TEST_CASE("HostMemory: Trim zero pages keeps contents", "[common]") {

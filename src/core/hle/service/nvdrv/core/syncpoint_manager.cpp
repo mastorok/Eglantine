@@ -46,13 +46,22 @@ u32 SyncpointManager::FindFreeSyncpoint() {
             return i;
         }
     }
-    ASSERT_MSG(false, "Failed to find a free syncpoint!");
     return 0;
 }
 
 u32 SyncpointManager::AllocateSyncpoint(bool client_managed) {
+    const auto id = TryAllocateSyncpoint(client_managed);
+    ASSERT_MSG(id.has_value(), "Failed to find a free syncpoint!");
+    return id.value_or(0);
+}
+
+std::optional<u32> SyncpointManager::TryAllocateSyncpoint(bool client_managed) {
     std::lock_guard lock(reservation_lock);
-    return ReserveSyncpoint(FindFreeSyncpoint(), client_managed);
+    const u32 id = FindFreeSyncpoint();
+    if (id == 0) {
+        return std::nullopt;
+    }
+    return ReserveSyncpoint(id, client_managed);
 }
 
 void SyncpointManager::FreeSyncpoint(u32 id) {

@@ -1,0 +1,45 @@
+{
+  "summary": "Browse mods in Lichii, get back the FPS lost in build 366, and try new frame generation options.",
+  "changes": [
+    {
+      "icon": "apps",
+      "title": "Mod Store",
+      "body": "Open Tools → Mod Store or Add-Ons → Browse Mods. Find GameBanana mods and over 11,000 Switch 1 listings for 60 FPS and ultrawide patches and cheats. Lichii checks patch build IDs against your game."
+    },
+    {
+      "icon": "cpu",
+      "title": "FPS recovery after build 366",
+      "body": "Build 366's third GPU thread cut FPS by about 70% in one Ocarina of Time test. It's back off by default. To try the reworked version, go to Graphics → Advanced → Render thread (experimental)."
+    },
+    {
+      "icon": "sparkles",
+      "title": "FlyHigh on Windows",
+      "body": "FlyHigh is an optional neural frame generator for Vulkan games in SDR on x86-64 Windows. Choose it in the frame generation menu and accept the model license to download it."
+    },
+    {
+      "icon": "clock",
+      "title": "Better Lichii Optical Flow",
+      "body": "Optical Flow tracks faster camera pans and small sprite movements more accurately. Generated frames show less ghosting around moving outlines."
+    },
+    {
+      "icon": "gamepad",
+      "title": "Wonder, Pokopia, and Ori",
+      "body": "Mario Wonder's Switch 2 Edition gets a built-in 60 FPS patch. Pokopia 2.0.1 boots again, and Ori and the Will of the Wisps can replace Spirit Trial ghosts without freezing on Windows."
+    },
+    {
+      "icon": "bug",
+      "title": "Game graphics fixes",
+      "body": "Fixes broken battle sprites in Final Fantasy Resonance on AMD, missing gloom in Hyrule Warriors: Age of Imprisonment, and black or flickering trims in Ocarina of Time."
+    },
+    {
+      "icon": "layers",
+      "title": "Less texture spill on low-VRAM GPUs",
+      "body": "Lichii decodes large ASTC texture arrays in smaller batches so their temporary images don't spill into system RAM."
+    },
+    {
+      "icon": "download",
+      "title": "Better shader precompilation",
+      "body": "Turning on Precompile All Shaders sets shader precache to Always for that game. Lichii reuses pipelines built earlier in the same session and shows how many shader builds remain."
+    }
+  ]
+}

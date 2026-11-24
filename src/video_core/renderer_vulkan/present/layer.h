@@ -69,6 +69,8 @@ private:
     void CreateDescriptorSets(const Device& device, VkDescriptorSetLayout layout);
     void CreateStagingBuffer(const Device& device, const Tegra::FramebufferConfig& framebuffer);
     void CreateRawImages(const Device& device, const Tegra::FramebufferConfig& framebuffer);
+    void CreateRawImage(const Device& device, const Tegra::FramebufferConfig& framebuffer,
+                        size_t image_index);
 
     void RefreshResources(const Device& device, const Tegra::FramebufferConfig& framebuffer);
     void SetAntiAliasPass(const Device& device);

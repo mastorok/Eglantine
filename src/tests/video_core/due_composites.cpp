@@ -7,6 +7,7 @@
 #include <functional>
 #include <mutex>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <catch2/catch_test_macros.hpp>
@@ -84,6 +85,9 @@ struct Presents {
     std::mutex shown_mutex;
     std::vector<DAddr> shown;
     std::vector<std::thread::id> threads;
+    // Each present's completion: its address, the composites shown by then, and its thread.
+    std::vector<std::pair<DAddr, size_t>> done;
+    std::vector<std::thread::id> done_threads;
     std::atomic<int> compositing{};
     std::atomic<int> overlaps{};
 
@@ -109,7 +113,12 @@ struct Presents {
                 };
                 due.Reached(
                     layers, std::this_thread::get_id() == owner.Id(), composite,
-                    [this, composite] { owner.Post([this, composite] { due.Run(composite); }); });
+                    [this, composite] { owner.Post([this, composite] { due.Run(composite); }); },
+                    [this, address = layers[0].address] {
+                        std::scoped_lock lk{shown_mutex};
+                        done.emplace_back(address, shown.size());
+                        done_threads.push_back(std::this_thread::get_id());
+                    });
             });
         });
         owner.Sync();
@@ -175,6 +184,25 @@ TEST_CASE("Fences two service threads reach together never overlap composites",
     REQUIRE(presents.shown.size() == Count);
     REQUIRE(presents.overlaps.load() == 0);
     for (const auto thread : presents.threads) {
+        REQUIRE(thread == presents.owner.Id());
+    }
+}
+
+TEST_CASE("A present's completion runs on the owner after its composite",
+          "[video_core][due_composites]") {
+    Presents presents;
+    presents.Present(0x1000, 5, 1);
+    presents.Present(0x2000, 5, 2);
+    REQUIRE(presents.done.empty());
+    std::thread service{[&] {
+        presents.syncpoints.IncrementGuest(5);
+        presents.syncpoints.IncrementGuest(5);
+    }};
+    service.join();
+    presents.owner.Sync();
+    using Done = std::pair<DAddr, size_t>;
+    REQUIRE(presents.done == std::vector<Done>{{0x1000, 1}, {0x2000, 2}});
+    for (const auto thread : presents.done_threads) {
         REQUIRE(thread == presents.owner.Id());
     }
 }

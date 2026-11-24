@@ -55,6 +55,10 @@ class FenceManager {
     static constexpr bool can_async_check = Traits::HAS_ASYNC_CHECK;
 
 public:
+    /// EDEN_NX2_RENDER_POST_FENCE: GPURender plays a fence the back posted, whose buffer half the
+    /// back found empty: the commit leaves the back's buffer cache alone.
+    bool skip_buffer_half{};
+
     /// Notify the fence manager about a new frame
     void TickFrame() {
         std::unique_lock lock(ring_guard);
@@ -421,7 +425,7 @@ private:
                 flushes.committed |= TextureFlushes;
             }
         }
-        {
+        if (!skip_buffer_half) {
             std::scoped_lock lock{buffer_cache.mutex};
             if (buffer_cache.HasUncommittedFlushes()) {
                 buffer_cache.CommitAsyncFlushes();

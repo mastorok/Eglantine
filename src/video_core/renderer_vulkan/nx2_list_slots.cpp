@@ -83,7 +83,8 @@ bool Nx2ListSlots::NoteOwed(DAddr device_addr, u32 value, u32 guest_word) {
                             VkDeviceSize{slot} * SlotWordBytes + VkDeviceSize{word} * 4, 4};
     RecordCopies(*buffer, *landing, std::span{&copy, 1});
     RecordHostBarrier();
-    owed.Note(device_addr, value, scheduler.CurrentTick());
+    owed.Note(device_addr, value,
+              BufferArena::Collecting() ? arena.Now() | StampBit : scheduler.CurrentTick());
     return true;
 }
 
@@ -91,7 +92,7 @@ void Nx2ListSlots::TakeDone() {
     taken.clear();
     owed.TakeDone(
         [this](u64 tick) {
-            return scheduler.IsFree(tick);
+            return (tick & StampBit) != 0 ? arena.IsFree(tick & ~StampBit) : scheduler.IsFree(tick);
         },
         taken);
 }
@@ -99,7 +100,16 @@ void Nx2ListSlots::TakeDone() {
 void Nx2ListSlots::WaitForTaken() {
     u64 tick = 0;
     for (const auto& word : taken) {
-        tick = (std::max)(tick, word.tick);
+        u64 word_tick = word.tick;
+        if ((word_tick & StampBit) != 0) {
+            // Lent, every op the back posted before ran: its stamps are mapped.
+            const std::optional<u64> mapped = arena.TickOf(word_tick & ~StampBit);
+            if (!mapped) {
+                VideoCommon::GpuSplit::Get().NoteOwedStampUnmapped();
+            }
+            word_tick = mapped.value_or(scheduler.CurrentTick());
+        }
+        tick = (std::max)(tick, word_tick);
     }
     scheduler.Wait(tick);
 }
@@ -234,6 +244,12 @@ void Nx2ListSlots::Prepare() {
 }
 
 void Nx2ListSlots::RecordCopies(VkBuffer src, VkBuffer dst, std::span<const VkBufferCopy> regions) {
+    if (BufferArena::Collecting()) {
+        // The same barriers around the copy (BufferArena::Exec).
+        arena.OutsideRenderPass();
+        arena.Copy(src, dst, regions, BufferArena::CopyMode::Plain, true);
+        return;
+    }
     static constexpr VkMemoryBarrier READ_BARRIER{
         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
         .pNext = nullptr,
@@ -258,6 +274,10 @@ void Nx2ListSlots::RecordCopies(VkBuffer src, VkBuffer dst, std::span<const VkBu
 }
 
 void Nx2ListSlots::RecordHostBarrier() {
+    if (BufferArena::Collecting()) {
+        arena.CopyBarrier(BufferArena::Barrier::HostRead);
+        return;
+    }
     scheduler.Record([](vk::CommandBuffer cmdbuf) {
         // A fence makes device writes available, not visible to the host.
         static constexpr VkMemoryBarrier HOST_BARRIER{

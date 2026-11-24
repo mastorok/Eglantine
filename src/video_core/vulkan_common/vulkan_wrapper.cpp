@@ -344,7 +344,8 @@ bool Load(VkInstance instance, InstanceDispatch& dld) noexcept {
            X(vkEnumerateDeviceExtensionProperties) && X(vkEnumeratePhysicalDevices) &&
            X(vkGetDeviceProcAddr) && X(vkGetPhysicalDeviceFormatProperties) &&
            X(vkGetPhysicalDeviceMemoryProperties) && X(vkGetPhysicalDeviceMemoryProperties2) &&
-           X(vkGetPhysicalDeviceProperties) && X(vkGetPhysicalDeviceQueueFamilyProperties);
+           X(vkGetPhysicalDeviceProperties) && X(vkGetPhysicalDeviceQueueFamilyProperties) &&
+           X(vkGetPhysicalDeviceSparseImageFormatProperties);
 #undef X
 }
 

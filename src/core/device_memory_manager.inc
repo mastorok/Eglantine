@@ -29,6 +29,7 @@
 #include "core/device_memory.h"
 #include "core/device_memory_manager.h"
 #include "core/memory.h"
+#include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_perf.h"
 
 namespace Core {
@@ -831,6 +832,14 @@ void DeviceMemoryManager<Traits>::UpdatePagesCachedCountNoLock(DAddr addr, size_
     u64 cache_bytes = 0;
     const auto MarkRegionCaching = &DeviceMemoryManager<Traits>::DeviceMethods::MarkRegionCaching;
 
+    // A page that starts or stops being watched counts as a change to memory for fast draws
+    // (writes to unwatched pages tell no one), from before its count changes until its
+    // protection does.
+    bool watch_changed = false;
+    VideoCommon::Nx2FastDraw::BeginMemoryChange();
+    SCOPE_EXIT {
+        VideoCommon::Nx2FastDraw::EndMemoryChange(watch_changed);
+    };
     std::atomic_thread_fence(std::memory_order_acquire);
     const size_t page_end = Common::DivCeil(addr + size, Memory::LICHII_PAGESIZE);
     size_t page = addr >> Memory::LICHII_PAGEBITS;
@@ -881,6 +890,7 @@ void DeviceMemoryManager<Traits>::UpdatePagesCachedCountNoLock(DAddr addr, size_
         count.fetch_add(static_cast<CounterType>(delta), std::memory_order_release);
 
         // Assume delta is either -1 or 1
+        watch_changed |= count.load(std::memory_order::relaxed) == (delta > 0 ? 1 : 0);
         if (count.load(std::memory_order::relaxed) == 0) {
             if (uncache_bytes == 0) {
                 uncache_begin = vpage;
@@ -907,6 +917,18 @@ void DeviceMemoryManager<Traits>::UpdatePagesCachedCountNoLock(DAddr addr, size_
         }
     }
     release_pending();
+}
+
+template <typename Traits>
+bool DeviceMemoryManager<Traits>::IsRangeCached(DAddr addr, size_t size) const {
+    const size_t page_end = Common::DivCeil(addr + size, Memory::LICHII_PAGESIZE);
+    for (size_t page = addr >> Memory::LICHII_PAGEBITS; page != page_end; ++page) {
+        if (cached_pages->at(page >> subentries_shift).Count(page).load(
+                std::memory_order_acquire) == 0) {
+            return false;
+        }
+    }
+    return true;
 }
 
 template <typename Traits>

@@ -56,24 +56,38 @@ bool NewFile(const fs::path& path, u64 size) {
 }
 
 bool RemoveFile(const fs::path& path) {
+    std::error_code ec;
+    return RemoveFile(path, ec);
+}
+
+bool RemoveFile(const fs::path& path, std::error_code& ec) {
+    ec.clear();
     if (!ValidatePath(path)) {
+        ec = std::make_error_code(std::errc::invalid_argument);
         LOG_ERROR(Common_Filesystem, "Input path is not valid, path={}", PathToUTF8String(path));
         return false;
     }
 
-    if (!Exists(path)) {
+    const auto status = fs::status(path, ec);
+    if (status.type() == fs::file_type::not_found) {
+        ec.clear();
         LOG_DEBUG(Common_Filesystem, "Filesystem object at path={} does not exist",
                   PathToUTF8String(path));
         return true;
     }
 
-    if (!IsFile(path)) {
+    if (ec) {
+        LOG_ERROR(Common_Filesystem, "Failed to check the file at path={}, ec_message={}",
+                  PathToUTF8String(path), ec.message());
+        return false;
+    }
+    if (!fs::is_regular_file(status)) {
+        ec = std::make_error_code(fs::is_directory(status) ? std::errc::is_a_directory
+                                                          : std::errc::invalid_argument);
         LOG_ERROR(Common_Filesystem, "Filesystem object at path={} is not a file",
                   PathToUTF8String(path));
         return false;
     }
-
-    std::error_code ec;
 
     fs::remove(path, ec);
 

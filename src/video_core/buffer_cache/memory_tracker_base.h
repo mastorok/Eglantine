@@ -140,15 +140,19 @@ public:
 
     /// Flushes cached CPU writes, and notify the device_tracker about the deltas
     void FlushCachedWrites(VAddr query_cpu_addr, u64 query_size) noexcept {
-        synchronized_mask = 0;
+        // Each manager flushes all of its cached writes.
+        const VAddr first = Common::AlignDown(query_cpu_addr, HIGHER_PAGE_SIZE);
+        const VAddr last = Common::AlignUp(query_cpu_addr + query_size, HIGHER_PAGE_SIZE);
+        ForgetSynchronized(first, last - first);
         IteratePages<false>(query_cpu_addr, query_size, [](Manager* manager, [[maybe_unused]] u64 offset, [[maybe_unused]] size_t size) {
             manager->FlushCachedWrites();
         });
     }
 
     void FlushCachedWrites() noexcept {
-        if (!cached_pages.empty()) {
-            synchronized_mask = 0;
+        // Only the watched ranges in pages whose cached writes become CPU writes now.
+        for (auto id : cached_pages) {
+            ForgetSynchronized(VAddr{id} << HIGHER_PAGE_BITS, HIGHER_PAGE_SIZE);
         }
         for (auto id : cached_pages) {
             top_tier[id]->FlushCachedWrites();

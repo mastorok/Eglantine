@@ -809,10 +809,8 @@ std::optional<IPv4Address> GetRoomIPv4Address() {
     }
     if (const auto room_member = GetRoomMember().lock()) {
         // The room host and moderators are in the Moderator state instead of Joined
-        const auto state = room_member->GetState();
-        if (state == RoomMember::State::Joined || state == RoomMember::State::Moderator) {
-            return room_member->GetFakeIpAddress();
-        }
+        if (const auto identity = room_member->GetENetIdentity())
+            return identity->ip;
     }
     return std::nullopt;
 }

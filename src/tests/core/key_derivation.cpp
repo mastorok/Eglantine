@@ -9,9 +9,11 @@
 
 #include "common/fs/path_util.h"
 #include "common/hex_util.h"
+#include "common/scope_exit.h"
 #include "core/crypto/aes_util.h"
 #include "core/crypto/key_manager.h"
 #include "tests/common/restore_eden_path.h"
+#include "tests/common/temp_dir.h"
 
 namespace {
 
@@ -37,9 +39,7 @@ TEST_CASE("Keys of a generation the key file lacks are derived from its sources"
         SKIP("Keys are installed");
     }
 
-    const auto directory = std::filesystem::temp_directory_path() / "lichii-key-derivation-test";
-    std::filesystem::remove_all(directory);
-    std::filesystem::create_directories(directory);
+    const Tests::TempDir directory{"lichii-key-derivation-test"};
     {
         std::ofstream file{directory / "prod.keys"};
         const auto line = [&file](const std::string& name, u8 value) {
@@ -55,17 +55,20 @@ TEST_CASE("Keys of a generation the key file lacks are derived from its sources"
     }
 
     const auto previous = Common::FS::GetEdenPath(Common::FS::EdenPath::KeysDir);
-    Common::FS::SetEdenPath(Common::FS::EdenPath::KeysDir, directory);
-    keys.ReloadKeys();
-    Tests::RestoreEdenPath(Common::FS::EdenPath::KeysDir, previous);
+    {
+        // KeysDir is back before the folder is removed, even if the reload throws.
+        SCOPE_EXIT {
+            Tests::RestoreEdenPath(Common::FS::EdenPath::KeysDir, previous);
+        };
+        Common::FS::SetEdenPath(Common::FS::EdenPath::KeysDir, directory.Path());
+        keys.ReloadKeys();
+    }
 
     const auto master = Decrypt(Decrypt(Fill(2), Fill(3)), Fill(1));
     CHECK(keys.GetKey(S128KeyType::Master, 0x1F) == master);
     CHECK(keys.GetKey(S128KeyType::KeyArea, 0x1F, u64(KeyAreaKeyType::Application)) ==
           GenerateKeyEncryptionKey(Fill(4), master, Fill(5), Fill(6)));
     CHECK(keys.GetKey(S128KeyType::Titlekek, 0x1F) == Decrypt(master, Fill(7)));
-
-    std::filesystem::remove_all(directory);
 }
 
 TEST_CASE("Keyblob lines past the keyblob table are skipped", "[core][crypto]") {
@@ -73,9 +76,7 @@ TEST_CASE("Keyblob lines past the keyblob table are skipped", "[core][crypto]") 
     // AddressSanitizer the old code fails here with a global-buffer-overflow. The file holds
     // no other key, so the keys the other tests see are left as they were.
     auto& keys = KeyManager::Instance();
-    const auto directory = std::filesystem::temp_directory_path() / "lichii-keyblob-index-test";
-    std::filesystem::remove_all(directory);
-    std::filesystem::create_directories(directory);
+    const Tests::TempDir directory{"lichii-keyblob-index-test"};
     {
         std::ofstream file{directory / "prod.keys"};
         file << "keyblob_ff = " << std::string(0x90 * 2, 'a') << '\n';
@@ -85,13 +86,16 @@ TEST_CASE("Keyblob lines past the keyblob table are skipped", "[core][crypto]") 
 
     const auto titlekek_source = keys.GetKey(S128KeyType::Source, u64(SourceKeyType::Titlekek));
     const auto previous = Common::FS::GetEdenPath(Common::FS::EdenPath::KeysDir);
-    Common::FS::SetEdenPath(Common::FS::EdenPath::KeysDir, directory);
-    keys.ReloadKeys();
-    Tests::RestoreEdenPath(Common::FS::EdenPath::KeysDir, previous);
+    {
+        // KeysDir is back before the folder is removed, even if the reload throws.
+        SCOPE_EXIT {
+            Tests::RestoreEdenPath(Common::FS::EdenPath::KeysDir, previous);
+        };
+        Common::FS::SetEdenPath(Common::FS::EdenPath::KeysDir, directory.Path());
+        keys.ReloadKeys();
+    }
 
     CHECK(keys.GetKey(S128KeyType::Source, u64(SourceKeyType::Titlekek)) == titlekek_source);
-
-    std::filesystem::remove_all(directory);
 }
 
 } // namespace

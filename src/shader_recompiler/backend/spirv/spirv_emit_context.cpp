@@ -1096,9 +1096,17 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
     // accesses select among their own candidate buffers, and runs them when every access selects
     // among all bound buffers. The candidate routes exist for ANV's compile time (#1756), and
     // select_global_memory_buffer is on for the NVIDIA proprietary driver only.
-    if (!profile.select_global_memory_buffer) {
+    if (!profile.select_global_memory_buffer || profile.route_single_candidates) {
         global_memory_functions.resize(program.global_memory_routes.size() + 1);
-        global_memory_route = program.global_memory_route;
+        if (!profile.select_global_memory_buffer) {
+            global_memory_route = program.global_memory_route;
+        } else {
+            for (const auto& [inst, route] : program.global_memory_route) {
+                if (program.global_memory_routes[route].size() == 1) {
+                    global_memory_route.emplace(inst, route);
+                }
+            }
+        }
     } else {
         global_memory_functions.resize(1);
     }
@@ -1221,13 +1229,12 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
     // programs search inline: as calls, the first of two consecutive loads in Ocarina's tree task
     // program returned 0 on NVIDIA, so every tree cell drew its 256-record cap (upstream #907).
     Id search_function{};
-    const bool search_call{profile.select_global_memory_buffer && stage != Stage::Task &&
-                           stage != Stage::Mesh};
+    bool selects_all_buffers{};
     const auto define_body{[&](DefPtr ssbo_member, Id addr, const StorageTypeDefinition& type_def,
                                u32 shift, Id result_type, Id fallback, Routing routing,
                                auto&& callback) -> Id {
         const Id header_label{AddLabel()};
-        const bool select{routing != Routing::PerBuffer && profile.select_global_memory_buffer};
+        const bool select{routing != Routing::PerBuffer && selects_all_buffers};
         Route found_route;
         if (select && ValidId(search_function)) {
             for (const u32 index : buffers) {
@@ -1245,7 +1252,7 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
         }
         const auto& [candidates, route, route_base] = found_route;
         const bool has_value{result_type.value != void_id.value};
-        if (routing != Routing::PerBuffer && profile.select_global_memory_buffer) {
+        if (select) {
             if (candidates.empty()) {
                 return fallback;
             }
@@ -1525,6 +1532,10 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
     for (size_t route = 0; route < global_memory_functions.size(); ++route) {
         buffers = route == 0 ? std::span<const u32>{every_buffer}
                              : std::span<const u32>{program.global_memory_routes[route - 1]};
+        selects_all_buffers = profile.select_global_memory_buffer && route == 0;
+        if (profile.select_global_memory_buffer && route != 0 && buffers.size() != 1) {
+            continue;
+        }
         functions = &global_memory_functions[route];
         const Uses& use{uses[route]};
         // Every access through all buffers gets its functions; the 64 and 128-bit ones read and
@@ -1532,7 +1543,7 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
         const bool all{route == 0};
         const bool words{!profile.support_descriptor_aliasing &&
                          (use.accesses[1] || use.accesses[2])};
-        if (search_call) {
+        if (selects_all_buffers && stage != Stage::Task && stage != Stage::Mesh) {
             search_function = OpFunction(U32[3], spv::FunctionControlMask::DontInline,
                                          TypeFunction(U32[3], U64));
             const Id addr{OpFunctionParameter(U64)};
@@ -2068,8 +2079,11 @@ void EmitContext::DefineInputs(const IR::Program& program) {
         std::ranges::any_of(info.interpolation, [](Interpolation mode) {
             return mode == Interpolation::NoPerspective;
         })};
+    const bool quantized_frag_depth{stage == Stage::Fragment && info.stores_frag_depth &&
+                                    runtime_info.quantize_frag_depth_d24};
     if (loads.AnyComponent(IR::Attribute::PositionX) ||
-        info.passthrough.AnyComponent(IR::Attribute::PositionX) || noperspective_as_smooth) {
+        info.passthrough.AnyComponent(IR::Attribute::PositionX) || noperspective_as_smooth ||
+        quantized_frag_depth) {
         const bool is_fragment{stage == Stage::Fragment};
         if (!is_fragment && profile.has_broken_spirv_position_input) {
             need_input_position_indirect = true;

@@ -26,17 +26,21 @@ add_executable(tests
     video_core/hdr_output.cpp
     video_core/host_vsync.cpp
     core/mii_model.cpp
+    core/address_space.cpp
     core/nx2_streamplay.cpp
     core/nx2_gpu_only_regions.cpp
     core/nx2_video_ready.cpp
     core/general_channel.cpp
     core/home_menu.cpp
+    core/window_system.cpp
     core/native_home_bootstrap.cpp
     core/kernel_finish_termination.cpp
     core/nx2_thread_stats.cpp
     core/nx2_debug_server.cpp
     core/nx2_zip.cpp
     core/nx2_present_pacer.cpp
+    core/nx2_present_queue.cpp
+    core/nx2_syncpoint_allocator.cpp
     core/nx2_fence_action.cpp
     core/nx2_frame_interval.cpp
     core/ldn_lan_protocol.cpp
@@ -97,6 +101,7 @@ add_executable(tests
     core/nx_archive.cpp
     frontend_common/nx_archive.cpp
     core/vfs_vector.cpp
+    core/vfs_real.cpp
     core/kip_ini.cpp
     core/add_on_application_id.cpp
     core/ncz_cache.cpp
@@ -112,6 +117,7 @@ add_executable(tests
     video_core/ampere_logged_textures.cpp
     video_core/native_texture_header_index.cpp
     video_core/texture_alias_ticks.cpp
+    video_core/texture_cache_gob_layout.cpp
     video_core/sampled_views.cpp
     video_core/texture_handles.cpp
     video_core/ampere_selevet_modes.cpp
@@ -124,6 +130,7 @@ add_executable(tests
     video_core/framebuffer_clear_layers.cpp
     video_core/framebuffer_limits.cpp
     video_core/descriptor_limits.cpp
+    video_core/device_buffer_pool.cpp
     video_core/device_memory_asid.cpp
     video_core/unbacked_fallback.cpp
     video_core/eviction_age.cpp
@@ -135,6 +142,7 @@ add_executable(tests
     video_core/ampere_fast_fusion.cpp
     video_core/ampere_async_copy.cpp
     video_core/ampere_trap_guards.cpp
+    video_core/astc_bcn_batches.cpp
     video_core/async_draw_policy.cpp
     video_core/bounded_store.cpp
     video_core/pipeline_eviction_policy.cpp
@@ -151,6 +159,9 @@ add_executable(tests
     video_core/multi_range_refresh.cpp
     video_core/command_fetch_order.cpp
     video_core/gpu_trace.cpp
+    video_core/nx2_render_follower.cpp
+    video_core/buffer_arena.cpp
+    video_core/nx2_render_view.cpp
     video_core/gpu_written_pages.cpp
     video_core/nx2_semaphore_mirror.cpp
     video_core/command_writer.cpp
@@ -161,6 +172,7 @@ add_executable(tests
     video_core/pending_maps.cpp
     video_core/maxwell_fast_method.cpp
     hid_core/emulated_controller_config.cpp
+    hid_core/npad_assignment.cpp
     hid_core/sensor_info.cpp
     common/flat_allocator.cpp
     common/paged_scalar.cpp
@@ -203,6 +215,7 @@ add_executable(tests
     video_core/spirv_software_matrix.cpp
     video_core/spirv_program_name.cpp
     video_core/spirv_builtin_capabilities.cpp
+    video_core/spirv_frag_depth_d24.cpp
     video_core/spirv_min_max_denorms.cpp
     video_core/spirv_nan_safe_min_max.cpp
     video_core/spirv_scalar_constants.cpp
@@ -222,6 +235,7 @@ add_executable(tests
     common/fibers.cpp
     common/fs_iterate.cpp
     frontend_common/install_keys.cpp
+    frontend_common/play_time.cpp
     common/game_presets.cpp
     common/host_memory.cpp
     common/host_memory_failure.cpp
@@ -239,7 +253,6 @@ add_executable(tests
     common/scratch_buffer.cpp
     common/slot_vector.cpp
     common/sparse_large_vector.cpp
-    common/undefined_fix.cpp
     common/unique_function.cpp
     common/zstd_compression.cpp
     core/core_timing.cpp
@@ -279,6 +292,7 @@ add_executable(tests
     video_core/vp9_range_encoder.cpp
     video_core/nx2_gpu_mapping.cpp
     video_core/vertex_repack.cpp
+    video_core/vk_texel_buffer_range.cpp
     video_core/ampere_lowering.cpp
     video_core/ampere_geometry.cpp
     video_core/ampere_i2f.cpp
@@ -335,24 +349,92 @@ target_link_libraries(ncz_tests PRIVATE common OpenSSL::Crypto zstd::zstd
 add_test(NAME ncz_tests COMMAND ncz_tests)
 
 if (TARGET dynarmic::dynarmic)
-    target_sources(tests PRIVATE core/jit_codegen_options.cpp core/jit_ordered_loads.cpp core/window_trace.cpp)
+    target_sources(tests PRIVATE core/jit_codegen_options.cpp core/jit_ordered_loads.cpp
+        core/jit_vector_round_int16.cpp core/window_trace.cpp)
     target_link_libraries(tests PRIVATE dynarmic::dynarmic)
 endif()
 
 target_compile_definitions(tests PRIVATE
-    LICHII_NX_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/core/nx_fixtures")
+    LICHII_NX_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/core/nx_fixtures"
+    LICHII_TESTS_LOG_DIR="${CMAKE_CURRENT_BINARY_DIR}/test-log")
 
 add_test(NAME tests COMMAND tests)
+
+if ((HAS_NCE AND LINUX) OR HAS_HYPERVISOR)
+    enable_language(ASM)
+    add_executable(arm_cpu_guest_tests core/arm_cpu_guest.cpp core/arm_cpu_guest.S)
+    target_link_libraries(arm_cpu_guest_tests PRIVATE core video_core frontend_common
+        ${PLATFORM_LIBRARIES})
+    target_compile_options(arm_cpu_guest_tests PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:-Wno-unused-variable>)
+    if (HAS_HYPERVISOR)
+        set(native_backend hvf)
+        add_custom_command(TARGET arm_cpu_guest_tests POST_BUILD
+            COMMAND /usr/bin/codesign --force --sign -
+                --entitlements "${PROJECT_SOURCE_DIR}/dist/eglantine.entitlements"
+                "$<TARGET_FILE:arm_cpu_guest_tests>"
+            VERBATIM)
+        add_test(NAME arm_cpu_guest_hvf_execute_fault COMMAND arm_cpu_guest_tests hvf --execute-fault)
+        add_test(NAME arm_cpu_guest_hvf_revoke_fault COMMAND arm_cpu_guest_tests hvf --revoke-fault)
+        add_test(NAME arm_cpu_guest_hvf_relaunch COMMAND arm_cpu_guest_tests hvf --relaunch)
+        set_tests_properties(arm_cpu_guest_hvf_execute_fault arm_cpu_guest_hvf_revoke_fault
+            arm_cpu_guest_hvf_relaunch
+            PROPERTIES LABELS arm_cpu_guest RESOURCE_LOCK arm_cpu_guest TIMEOUT 35)
+    else()
+        set(native_backend nce)
+    endif()
+    add_test(NAME arm_cpu_guest_${native_backend} COMMAND arm_cpu_guest_tests ${native_backend})
+    add_test(NAME arm_cpu_guest_${native_backend}_nx2_clock
+        COMMAND arm_cpu_guest_tests ${native_backend} --nx2-clock)
+    add_test(NAME arm_cpu_guest_dynarmic COMMAND arm_cpu_guest_tests dynarmic)
+    add_test(NAME arm_cpu_guest_${native_backend}_fault
+        COMMAND arm_cpu_guest_tests ${native_backend} --fault)
+    add_test(NAME arm_cpu_guest_${native_backend}_permission_fault
+        COMMAND arm_cpu_guest_tests ${native_backend} --permission-fault)
+    set_tests_properties(
+        arm_cpu_guest_${native_backend} arm_cpu_guest_${native_backend}_nx2_clock
+        arm_cpu_guest_dynarmic arm_cpu_guest_${native_backend}_fault
+        arm_cpu_guest_${native_backend}_permission_fault
+        PROPERTIES LABELS arm_cpu_guest RESOURCE_LOCK arm_cpu_guest TIMEOUT 35)
+endif()
 
 add_executable(profile_migration_tests
     common/profile_migration.cpp)
 target_link_libraries(profile_migration_tests PRIVATE common Catch2::Catch2WithMain)
 add_test(NAME profile_migration_tests COMMAND profile_migration_tests)
 
+add_executable(ryujinx_save_link_tests common/ryujinx_save_link.cpp)
+target_link_libraries(ryujinx_save_link_tests PRIVATE common Catch2::Catch2WithMain)
+add_test(NAME ryujinx_save_link_tests COMMAND ryujinx_save_link_tests)
+
 add_executable(log_file_flush_tests
     common/log_file_flush.cpp)
 target_link_libraries(log_file_flush_tests PRIVATE common Catch2::Catch2WithMain)
 add_test(NAME log_file_flush_tests COMMAND log_file_flush_tests)
+
+# One process per test case: the log backend is made once per process.
+add_executable(log_file_lock_tests
+    common/log_file_lock.cpp)
+target_link_libraries(log_file_lock_tests PRIVATE common Catch2::Catch2WithMain)
+add_test(NAME log_file_lock_parents
+    COMMAND log_file_lock_tests "The log folder is created with its missing parents")
+add_test(NAME log_file_lock_live
+    COMMAND log_file_lock_tests "A second Lichii leaves a log another one still writes")
+add_test(NAME log_file_lock_third
+    COMMAND log_file_lock_tests "A third Lichii takes the next free log")
+add_test(NAME log_file_lock_full
+    COMMAND log_file_lock_tests "A Lichii that finds every log held keeps no log file")
+# The live cases wait for child processes: fail instead of hanging the run if one never ends.
+set_tests_properties(log_file_lock_parents log_file_lock_live log_file_lock_third
+    log_file_lock_full PROPERTIES TIMEOUT 60)
+# Catch2 exits with 4 when its only case skips (no posix_spawn on Windows): report it as skipped.
+# Only from Catch2 3.7.1 on, where failed assertions exit with 42: before that the exit code was
+# their count, and four failures would have read as a skip. The bundled Catch2 defines no version
+# here and is newer; a system one says which it is.
+if (NOT DEFINED Catch2_VERSION OR NOT Catch2_VERSION VERSION_LESS 3.7.1)
+    set_tests_properties(log_file_lock_parents log_file_lock_live log_file_lock_third
+        log_file_lock_full PROPERTIES SKIP_RETURN_CODE 4)
+endif()
 
 if (TARGET SDL3::SDL3)
     add_executable(sdl_window_state_tests lichii_cmd/sdl_window_state.cpp)

@@ -18,6 +18,14 @@ the maintainers, never into a public channel or issue. User names are replaced i
 settings even when the file log keeps them, and the Web Service and Multiplayer settings are left
 out.
 
+If a late graphics pass is missing because the GPU readback reached its 1 GiB cap, set
+`EDEN_NX2_FRAME_DUMP_FIRST_PASS` to a nonzero pass index before starting Lichii and capture once
+with Ctrl+F12. For example, `220` retains graphics pass 220 and later, their sampled inputs and
+the present source. Earlier passes still count, so the pass IDs do not renumber. This mode skips
+compute and buffer readbacks, and records the guest texture header as `tic_raw` beside the
+backing image's guest format and `native_tiling` flag. It also applies to direct frame dumps.
+Remove the setting after the capture; `0` leaves the usual whole-frame mode in place.
+
 Browse a bundle with `python3 -I tools/nx2/bundle_index.py <zip> [--out DIR]`. It unpacks the zip
 (refusing absolute paths, `..`, symlinks, more than 20000 entries or more than 2 GiB), writes
 `index.html` with the summary and a shaders table, and builds `frame/index.html` with

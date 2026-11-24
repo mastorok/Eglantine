@@ -20,6 +20,8 @@ struct PendingImageDownload {
     std::shared_ptr<Image> retired_image{};
     /// The image's modification tick when its contents were staged (asynchronous downloads).
     u64 tick{};
+    /// The GPU submission tick at deletion (0 on OpenGL).
+    u64 retired_tick{};
 
     Image& GetImage(Common::SlotVector<Image>& images) const {
         return retired_image ? *retired_image : images[object_id];
@@ -40,22 +42,24 @@ size_t DeduplicatePendingImageDownloads(Downloads& downloads, Common::SlotVector
     return previous_size - downloads.size();
 }
 
-// Cache slots may be recycled before queued GPU downloads are submitted or
-// consumed. Keep the actual image, including its metadata, until those finish.
+// Keep the original image past slot reuse. The caller holds the returned reference until
+// the delete tick completes, since the download's fence may precede other uses of the image.
 template <class Image, class Downloads, class Batches>
-bool RetainPendingImageDownloads(Common::SlotId id, Image& image, Downloads& pending,
-                                 Batches& submitted) {
+std::shared_ptr<Image> RetainPendingImageDownloads(Common::SlotId id, Image& image,
+                                                  Downloads& pending, Batches& submitted,
+                                                  u64 tick) {
     std::shared_ptr<Image> retained;
     const auto retain = [&](auto& downloads) {
         for (auto& download : downloads) {
             if (!download.is_swizzle || download.object_id != id || download.retired_image) continue;
             if (!retained) retained = std::make_shared<Image>(std::move(image));
             download.retired_image = retained;
+            download.retired_tick = tick;
         }
     };
     retain(pending);
     for (auto& downloads : submitted) retain(downloads);
-    return retained != nullptr;
+    return retained;
 }
 
 } // namespace VideoCommon

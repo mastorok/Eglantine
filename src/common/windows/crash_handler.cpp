@@ -119,8 +119,10 @@ void Report(EXCEPTION_POINTERS* pointers, const char* fail_fast) {
         return;
     }
     MINIDUMP_EXCEPTION_INFORMATION information{GetCurrentThreadId(), pointers, FALSE};
-    const BOOL written = write_dump(GetCurrentProcess(), GetCurrentProcessId(), file,
-                                    MiniDumpWithThreadInfo, &information, nullptr, nullptr);
+    const BOOL written = write_dump(
+        GetCurrentProcess(), GetCurrentProcessId(), file,
+        static_cast<MINIDUMP_TYPE>(MiniDumpWithThreadInfo | MiniDumpWithUnloadedModules),
+        &information, nullptr, nullptr);
     const DWORD error = written ? 0 : GetLastError();
     CloseHandle(file);
     LOG_CRASH("Host crash: minidump of process {} {} ({:#x})", GetCurrentProcessId(),

@@ -11,8 +11,10 @@
 #include <fmt/format.h>
 
 #include <QDesktopServices>
+#include <QHash>
 #include <QHeaderView>
 #include <QMenu>
+#include <QSignalBlocker>
 #include <QStandardItemModel>
 #include <QStandardPaths>
 #include <QString>
@@ -24,6 +26,7 @@
 #include "core/core.h"
 #include "core/file_sys/patch_manager.h"
 #include "core/loader/loader.h"
+#include "core/loader/nup.h"
 #include "frontend_common/mod_manager.h"
 #include "qt_common/abstract/frontend.h"
 #include "qt_common/config/uisettings.h"
@@ -77,6 +80,8 @@ ConfigurePerGameAddons::ConfigurePerGameAddons(Core::System& system_, QWidget* p
 
     connect(ui->folder, &QAbstractButton::clicked, this, &ConfigurePerGameAddons::InstallModFolder);
     connect(ui->zip, &QAbstractButton::clicked, this, &ConfigurePerGameAddons::InstallModZip);
+    connect(ui->browse_mods, &QAbstractButton::clicked, this,
+            &ConfigurePerGameAddons::BrowseModsRequested);
 
     connect(tree_view, &QTreeView::customContextMenuRequested, this,
             &ConfigurePerGameAddons::showContextMenu);
@@ -101,20 +106,20 @@ void ConfigurePerGameAddons::OnItemChanged(QStandardItem* item) {
     }
 }
 
+QString ConfigurePerGameAddons::AddonKey(const QStandardItem& item) {
+    const auto version = item.data(NUMERIC_VERSION);
+    if (version.isValid() && item.text() == QStringLiteral("Update")) {
+        return QStringLiteral("Update@%1").arg(version.toUInt());
+    }
+    return item.text();
+}
+
 void ConfigurePerGameAddons::ApplyConfiguration() {
     std::vector<std::string> disabled_addons;
 
     for (const auto& item : list_items) {
-        const auto disabled = item.front()->checkState() == Qt::Unchecked;
-        if (disabled) {
-            QVariant userData = item.front()->data(Qt::UserRole);
-            if (userData.isValid() && userData.canConvert<quint32>() &&
-                item.front()->text() == QStringLiteral("Update")) {
-                quint32 numeric_version = userData.toUInt();
-                disabled_addons.push_back(fmt::format("Update@{}", numeric_version));
-            } else {
-                disabled_addons.push_back(item.front()->text().toStdString());
-            }
+        if (item.front()->checkState() == Qt::Unchecked) {
+            disabled_addons.push_back(AddonKey(*item.front()).toStdString());
         }
     }
 
@@ -122,6 +127,11 @@ void ConfigurePerGameAddons::ApplyConfiguration() {
 
     std::sort(disabled_addons.begin(), disabled_addons.end());
     Settings::values.disabled_addons[title_id] = disabled_addons;
+    const QSignalBlocker block(item_model);
+    for (const auto& row : list_items) {
+        auto* const item = row.front();
+        item->setData(static_cast<int>(item->checkState()), LOADED_CHECK_STATE);
+    }
 }
 
 void ConfigurePerGameAddons::LoadFromFile(FileSys::VirtualFile file_) {
@@ -134,7 +144,30 @@ void ConfigurePerGameAddons::SetFile(FileSys::VirtualFile file_) {
 }
 
 void ConfigurePerGameAddons::SetTitleId(u64 id) {
-    this->title_id = id;
+    title_id = id;
+    ui->browse_mods->setEnabled(id != 0 && !system.IsPoweredOn());
+}
+
+void ConfigurePerGameAddons::ReloadAfterModStore(const QSet<QString>& store_toggled) {
+    QHash<QString, Qt::CheckState> pending;
+    for (const auto& row : list_items) {
+        const auto& item = *row.front();
+        if (item.checkState() != item.data(LOADED_CHECK_STATE).toInt()) {
+            const auto key = AddonKey(item);
+            if (!store_toggled.contains(key)) {
+                pending.insert(key, item.checkState());
+            }
+        }
+    }
+
+    LoadConfiguration();
+    for (const auto& row : list_items) {
+        auto* const item = row.front();
+        const auto it = pending.constFind(AddonKey(*item));
+        if (it != pending.cend()) {
+            item->setCheckState(*it);
+        }
+    }
 }
 
 void ConfigurePerGameAddons::InstallMods(const QStringList& mods) {
@@ -262,6 +295,9 @@ void ConfigurePerGameAddons::showContextMenu(const QPoint& pos) {
     QMenu menu(this);
 
     QAction* remove = menu.addAction(tr("&Delete"));
+    remove->setEnabled(std::any_of(selected.cbegin(), selected.cend(), [](const auto& row) {
+        return !row.data(PATCH_LOCATION).toString().isEmpty();
+    }));
     connect(remove, &QAction::triggered, this,
             [this, selected]() { AddonDeleteRequested(selected); });
 
@@ -296,7 +332,10 @@ void ConfigurePerGameAddons::LoadConfiguration() {
 
     const FileSys::PatchManager pm{title_id, system.GetFileSystemController(),
                                    system.GetContentProvider()};
-    const auto loader = Loader::GetLoader(system, file);
+    const auto loader = Loader::GetLoader(system, file, title_id);
+    if (!loader) {
+        return;
+    }
 
     FileSys::VirtualFile update_raw;
     loader->ReadUpdateRaw(update_raw);
@@ -311,12 +350,24 @@ void ConfigurePerGameAddons::LoadConfiguration() {
 
     bool has_enabled_update = false;
 
+    if (loader->GetFileType() == Loader::FileType::NUP) {
+        const auto& nup = static_cast<const Loader::AppLoader_NUP&>(*loader);
+        if (const auto version = nup.ReadContainerUpdateVersion()) {
+            auto* const name = new QStandardItem(tr("Update (NUP)"));
+            name->setToolTip(tr("This update is part of the NUP and cannot be disabled here."));
+            item_model->appendRow({name, new QStandardItem(QString::fromStdString(*version))});
+        }
+    }
+
     for (const auto& patch : patches) {
         const auto name = QString::fromStdString(patch.name);
 
         auto* const first_item = new QStandardItem;
         first_item->setText(name);
         first_item->setCheckable(true);
+        if (!patch.description.empty()) {
+            first_item->setToolTip(QString::fromStdString(patch.description));
+        }
 
         const bool is_external_update = patch.type == FileSys::PatchType::Update &&
                                         patch.source == FileSys::PatchSource::External &&
@@ -355,7 +406,9 @@ void ConfigurePerGameAddons::LoadConfiguration() {
             update_items.push_back(first_item);
         }
 
-        first_item->setCheckState(should_enable ? Qt::Checked : Qt::Unchecked);
+        const auto check_state = should_enable ? Qt::Checked : Qt::Unchecked;
+        first_item->setCheckState(check_state);
+        first_item->setData(static_cast<int>(check_state), LOADED_CHECK_STATE);
 
         list_items.push_back(QList<QStandardItem*>{
             first_item, new QStandardItem{QString::fromStdString(patch.version)}});

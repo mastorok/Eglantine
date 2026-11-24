@@ -137,7 +137,8 @@ Profile MakeProfile() {
 // With lane_id the mesh program writes its lane as the vertex's first attribute word.
 std::vector<u32> EmitProgram(Stage stage, bool as_compute, bool with_task,
                              Profile profile = MakeProfile(), bool lane_id = false,
-                             bool culled = false, const MeshInfo& mesh = TriangleMesh()) {
+                             bool culled = false, const MeshInfo& mesh = TriangleMesh(),
+                             u32 task_payload_stride = 0) {
     ObjectPool<IR::Inst> pool;
     IR::Block block{pool};
     IR::Program program;
@@ -181,7 +182,8 @@ std::vector<u32> EmitProgram(Stage stage, bool as_compute, bool with_task,
         runtime_info.mesh_task_payload_binding = PAYLOAD_BINDING;
         runtime_info.mesh_task_offsets_binding = OFFSETS_BINDING;
         runtime_info.mesh_task_args_binding = ARGS_BINDING;
-        runtime_info.mesh_task_payload_stride = program.mesh.payload_words;
+        runtime_info.mesh_task_payload_stride =
+            task_payload_stride != 0 ? task_payload_stride : program.mesh.payload_words;
     }
     Backend::Bindings bindings;
     return SPIRV::EmitSPIRV(profile, runtime_info, program, bindings);
@@ -525,4 +527,169 @@ TEST_CASE("Mesh fallback pixel programs read per-primitive outputs flat",
     const std::vector<u32> native{EmitPixelProgram(false)};
     REQUIRE(HasDecoration(native, spv::Decoration::PerPrimitiveEXT));
     REQUIRE(HasBuiltIn(native, spv::BuiltIn::PrimitiveId));
+}
+
+namespace {
+// What the emitted prologue does: every store before the first control barrier, with the constants,
+// payload accesses and selects they use. The prologue ends with that barrier.
+struct PrologueScan {
+    struct Store {
+        u32 pointer;
+        u32 value;
+    };
+    struct Select {
+        u32 condition;
+        u32 on_true;
+        u32 on_false;
+    };
+    std::unordered_map<u32, u32> constants;
+    std::unordered_map<u32, u32> chain_bases;
+    std::unordered_map<u32, std::pair<u32, u32>> less_than;
+    std::unordered_map<u32, std::pair<u32, u32>> umins;
+    std::unordered_map<u32, Select> selects;
+    std::vector<Store> stores;
+    bool barrier_seen{};
+};
+
+PrologueScan ScanPrologue(const std::vector<u32>& code) {
+    PrologueScan scan;
+    for (const Instruction& inst : Instructions(code)) {
+        if (scan.barrier_seen) {
+            break;
+        }
+        switch (inst.op) {
+        case spv::Op::OpControlBarrier:
+            scan.barrier_seen = true;
+            break;
+        case spv::Op::OpConstant:
+            scan.constants[inst.operands[1]] = inst.operands[2];
+            break;
+        case spv::Op::OpAccessChain:
+            if (inst.operands.size() == 4) {
+                scan.chain_bases[inst.operands[1]] = inst.operands[2];
+            }
+            break;
+        case spv::Op::OpULessThan:
+            scan.less_than[inst.operands[1]] = {inst.operands[2], inst.operands[3]};
+            break;
+        case spv::Op::OpExtInst:
+            if (inst.operands[3] == 38) { // GLSL.std.450 UMin
+                scan.umins[inst.operands[1]] = {inst.operands[4], inst.operands[5]};
+            }
+            break;
+        case spv::Op::OpSelect:
+            scan.selects[inst.operands[1]] = {inst.operands[2], inst.operands[3],
+                                              inst.operands[4]};
+            break;
+        case spv::Op::OpStore:
+            scan.stores.push_back({inst.operands[0], inst.operands[1]});
+            break;
+        default:
+            break;
+        }
+    }
+    return scan;
+}
+
+// The ids that OpName gives this debug name.
+std::vector<u32> IdsNamed(const std::vector<u32>& code, std::string_view name) {
+    std::vector<u32> ids;
+    for (const Instruction& inst : Instructions(code)) {
+        if (inst.op == spv::Op::OpName &&
+            std::string_view{reinterpret_cast<const char*>(inst.operands.data() + 1)} == name) {
+            ids.push_back(inst.operands[0]);
+        }
+    }
+    return ids;
+}
+
+bool IsConstant(const PrologueScan& scan, u32 id, u32 value) {
+    const auto it{scan.constants.find(id)};
+    return it != scan.constants.end() && it->second == value;
+}
+
+// Prologue stores whose pointer is an access chain into the named workgroup payload variable.
+std::vector<PrologueScan::Store> PayloadStores(const std::vector<u32>& code,
+                                               const PrologueScan& scan) {
+    const std::vector<u32> payload{IdsNamed(code, "task_payload")};
+    REQUIRE(payload.size() == 1);
+    std::vector<PrologueScan::Store> result;
+    for (const PrologueScan::Store& store : scan.stores) {
+        const auto chain{scan.chain_bases.find(store.pointer)};
+        if (chain != scan.chain_bases.end() && chain->second == payload[0]) {
+            result.push_back(store);
+        }
+    }
+    return result;
+}
+
+bool StoresZeroToPrimitiveCount(const std::vector<u32>& code) {
+    const PrologueScan scan{ScanPrologue(code)};
+    REQUIRE(scan.barrier_seen);
+    const std::vector<u32> count{IdsNamed(code, "isbe_primitive_count")};
+    REQUIRE(count.size() == 1);
+    return std::ranges::any_of(scan.stores, [&](const PrologueScan::Store& store) {
+        return store.pointer == count[0] && IsConstant(scan, store.value, 0);
+    });
+}
+} // Anonymous namespace
+
+TEST_CASE("Mesh programs zero the primitive count before the guest runs",
+          "[video_core][spirv][mesh_fallback]") {
+    // A mesh program that never writes its primitive count must read zero, not the previous
+    // workgroup's count.
+    for (const bool as_compute : {false, true}) {
+        const std::vector<u32> mesh{EmitProgram(Stage::Mesh, as_compute, false)};
+        Dump(mesh, as_compute ? "prologue-mesh-compute" : "prologue-mesh-native");
+        REQUIRE(StoresZeroToPrimitiveCount(mesh));
+    }
+    const std::vector<u32> after_task{EmitProgram(Stage::Mesh, true, true)};
+    Dump(after_task, "prologue-mesh-after-task");
+    REQUIRE(StoresZeroToPrimitiveCount(after_task));
+}
+
+TEST_CASE("Mesh emulation copies the task payload clamped to its stride and zero-fills past it",
+          "[video_core][spirv][mesh_fallback]") {
+    constexpr u32 stride{8};
+    const MeshInfo mesh{TriangleMesh()};
+    REQUIRE(mesh.payload_words > stride);
+    const std::vector<u32> code{
+        EmitProgram(Stage::Mesh, true, true, MakeProfile(), false, false, mesh, stride)};
+    Dump(code, "prologue-mesh-payload-copy");
+    const PrologueScan scan{ScanPrologue(code)};
+    REQUIRE(scan.barrier_seen);
+    const std::vector<PrologueScan::Store> stores{PayloadStores(code, scan)};
+    REQUIRE_FALSE(stores.empty());
+    for (const PrologueScan::Store& store : stores) {
+        // value = word < stride ? task payload word : 0
+        const auto select{scan.selects.find(store.value)};
+        REQUIRE(select != scan.selects.end());
+        REQUIRE(IsConstant(scan, select->second.on_false, 0));
+        const auto compare{scan.less_than.find(select->second.condition)};
+        REQUIRE(compare != scan.less_than.end());
+        REQUIRE(IsConstant(scan, compare->second.second, stride));
+    }
+    // The source word is clamped to the stride's last word, so the load never leaves the block.
+    const bool clamped_source{std::ranges::any_of(scan.umins, [&](const auto& umin) {
+        return IsConstant(scan, umin.second.second, stride - 1);
+    })};
+    REQUIRE(clamped_source);
+}
+
+TEST_CASE("Mesh fallback zeroes the payload region when no task fills it",
+          "[video_core][spirv][mesh_fallback]") {
+    // The task's own output, and a mesh program with no task, start from zeroed workgroup memory.
+    const std::vector<u32> task{EmitProgram(Stage::Task, true, true)};
+    const std::vector<u32> mesh{EmitProgram(Stage::Mesh, true, false)};
+    Dump(task, "prologue-task-compute-zero");
+    Dump(mesh, "prologue-mesh-compute-zero");
+    for (const std::vector<u32>* const code : {&task, &mesh}) {
+        const PrologueScan scan{ScanPrologue(*code)};
+        REQUIRE(scan.barrier_seen);
+        const std::vector<PrologueScan::Store> stores{PayloadStores(*code, scan)};
+        REQUIRE_FALSE(stores.empty());
+        for (const PrologueScan::Store& store : stores) {
+            REQUIRE(IsConstant(scan, store.value, 0));
+        }
+    }
 }

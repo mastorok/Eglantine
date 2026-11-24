@@ -140,7 +140,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             return width == 6 ? 4U : width == 5 ? 2U : 1U;
         }
         case 0x20c: case 0x80c: case 0x81c: case 0x387: case 0x388: case 0xb1d: case 0x348: case 0x918:
-        case 0x886: case 0x95b:
+        case 0x886: case 0x95b: case 0xf55: case 0xf56:
             return 0;
         default:
             return std::nullopt;
@@ -179,7 +179,8 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             }
         } else if ((opcode & 0x1ff) >= 0x140 && (opcode & 0x1ff) <= 0x15f &&
                    opcode != 0x941 && opcode != 0x942 && opcode != 0x948 &&
-                   opcode != 0x348 && opcode != 0x94d && opcode != 0x950 && opcode != 0x95b) {
+                   opcode != 0x348 && opcode != 0x94d && opcode != 0x950 && opcode != 0x95b &&
+                   opcode != 0xf55 && opcode != 0xf56) {
             bounded_control = false;
         }
     }
@@ -1258,7 +1259,8 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
         }
         case 0x822: { // FSWZADD: per lane 0 = a+b, 1 = a-b, 2 = b-a, 3 = b (nvdisasm PP/PN/NP/ZP).
             const u32 swizzle = insn.words[1];
-            if (swizzle > 0xff || insn.words[2] > 255)
+            // Bit 77 is .NDV, which Eden's Maxwell FSWZADD ignores: dropped.
+            if (swizzle > 0xff || (insn.words[2] & ~0x2000U) > 255)
                 return fail(index, "native swizzled add mode");
             // Maxwell's lane codes 1 and 2 are the other way round (1 = b-a, 2 = a-b).
             const u32 maxwell = ((swizzle & 0x55) << 1) | ((swizzle & 0xaa) >> 1);
@@ -2705,6 +2707,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                     const auto& definition = code[--cursor];
                     if (definition.Bits(12, 4) == 15) continue;
                     const u32 op = definition.Bits(0, 12), target = definition.Bits(16, 8);
+                    if (op == 0xf55 || op == 0xf56) continue;
                     u32 written_predicates = ~0U;
                     switch (op) {
                     case 0x802: case 0x805: case 0x819: case 0x823: case 0x91a:
@@ -2775,7 +2778,8 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                         }
                         if (op != 0x326 && op != 0x802 && op != 0x307 && op != 0x421 &&
                             op != 0xa20 && op != 0xb63 && op != 0x221 && op != 0x823 &&
-                            op != 0x423 && op != 0x223 && op != 0x308 && op != 0x220 && op != 0x820)
+                            op != 0x423 && op != 0x223 && op != 0x308 && op != 0x220 && op != 0x820 &&
+                            op != 0xf55 && op != 0xf56)
                             return fail(index, "native per-tap gather control-flow proof");
                     }
                     if (!terminal) return fail(index, "native per-tap gather terminal proof");
@@ -2873,6 +2877,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             const u32 dimension = insn.Bits(61, 3), lod = insn.Bits(87, 3);
             const u32 source_a = insn.Bits(24, 8), source_b = insn.Bits(32, 8);
             if (!bindless && dimension == 5 && depth_compare && lod == 0 && !split && mask == 1 &&
+                !insn.Bits(77, 1) &&
                 (result.required_texture_buffer == ~0U ||
                  result.required_texture_buffer == insn.Bits(54, 5))) {
                 if (!insn.Bits(60, 1) || insn.Bits(76, 2) || insn.Bits(81, 3) != 7 ||
@@ -2900,8 +2905,11 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 constexpr std::array<u32, 8> coordinate_count{1, 2, 3, 3, 2, 3, 0, 4};
                 constexpr std::array<u32, 8> maxwell_type{0, 2, 4, 6, 1, 3, 0, 7};
                 const bool offsets = insn.Bits(76, 1) != 0;
+                // Bit 77 is .NDV, Maxwell TEX's bit 35 (FoldImageSampleImplicitLod turns a 3D
+                // TEX.NDV on FSWZADD-built coordinates into a gradient sample).
+                const u32 ndv = insn.Bits(77, 1);
                 // Bit 59 is .B, set in 0x361's encoding.
-                if (dimension == 6 || insn.Bits(77, 1) || insn.Bits(81, 3) != 7 ||
+                if (dimension == 6 || insn.Bits(81, 3) != 7 ||
                     insn.Bits(59, 1) != (opcode == 0x361 ? 1U : 0U) ||
                     (!bindless && (insn.Bits(40, 14) > 0x1fff || insn.Bits(54, 5) >= 18)) ||
                     (lod > 3 && lod != 6 && lod != 7) || (depth_compare && mask != 1) || mask == 0)
@@ -2948,13 +2956,13 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 if (tex_b) {
                     // Maxwell TEX.B: AOFFI at 36 and the LOD mode at 37 instead of 54 and 55.
                     emit(0xde80000000000000ULL | predicate | 250 | (u64{250} << 8) | (u64{246} << 20) |
-                         (u64{maxwell_type[dimension]} << 28) | (u64{mask} << 31) | (u64{offsets} << 36) |
-                         (u64{lod} << 37) | (u64{insn.Bits(90, 1)} << 49) | (u64{depth_compare} << 50) |
-                         (u64{7} << 51));
+                         (u64{maxwell_type[dimension]} << 28) | (u64{mask} << 31) | (u64{ndv} << 35) |
+                         (u64{offsets} << 36) | (u64{lod} << 37) | (u64{insn.Bits(90, 1)} << 49) |
+                         (u64{depth_compare} << 50) | (u64{7} << 51));
                 } else {
                 emit(0xc000000000000000ULL | predicate | 250 | (u64{250} << 8) |
                      (u64{meta == 246 ? 255U : 246U} << 20) | (u64{maxwell_type[dimension]} << 28) |
-                     (u64{mask} << 31) | (u64{insn.Bits(40, 14)} << 36) |
+                     (u64{mask} << 31) | (u64{ndv} << 35) | (u64{insn.Bits(40, 14)} << 36) |
                      (u64{insn.Bits(90, 1)} << 49) | (u64{depth_compare} << 50) | (u64{7} << 51) |
                      (u64{offsets} << 54) | (u64{lod} << 55));
                 }
@@ -3184,7 +3192,27 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
         case 0x202: // MOV register
         case 0x802: // MOV immediate
         case 0xa02: { // MOV constant buffer
-            if (insn.Bits(72, 4) != 15 || (insn.Bits(76, 16) & ~(opcode == 0xc02 ? 0x8000U : 0U))) return fail(index, "native MOV modifiers");
+            // Bits 72-75 are the quad-lane write mask. Hyrule Warriors: AoI's gloom decal shader
+            // samples once per quad lane and keeps each result in its lane with masks 1, 2, 4, 8:
+            // P6 = (laneid & 3) == k AND the guest predicate, then @P6 MOV.
+            const u32 lane_mask = insn.Bits(72, 4);
+            if (opcode == 0x202 && std::popcount(lane_mask) == 1 && !insn.Bits(76, 16) &&
+                !insn.Bits(40, 24)) {
+                const u64 guest = (predicate >> 16) & 15;
+                save_predicate();
+                emit(0xf0c8000000070000ULL | 250);                                              // S2R R250, SR_LANEID
+                emit(0x0400000000070000ULL | 250 | (u64{250} << 8) | (u64{3} << 20));         // LOP32I.AND R250, R250, 3
+                emit(0x0100000000070000ULL | 251 | (u64{15} << 12) |
+                     (u64{static_cast<u32>(std::countr_zero(lane_mask))} << 20));              // MOV32I R251, k
+                emit(0x5b60000000070000ULL | 7 | (u64{6} << 3) | (u64{250} << 8) | (u64{251} << 20) |
+                     ((guest & 7) << 39) | ((guest >> 3) << 42) | (u64{2} << 49));             // ISETP.EQ.U32.AND P6
+                emit(0x5c98000000000000ULL | (u64{6} << 16) | dest | (u64{15} << 39) |
+                     (u64{insn.Bits(32, 8)} << 20));                                           // @P6 MOV Rd, Rb
+                restore_predicate();
+                break;
+            }
+            if (lane_mask != 15 || (insn.Bits(76, 16) & ~(opcode == 0xc02 ? 0x8000U : 0U)))
+                return fail(index, "native MOV modifiers");
             if (opcode == 0x802) {
                 result.instructions.push_back(base(0x0100000000000000ULL) | (u64{15} << 12) |
                     (u64{insn.words[1]} << 20));
@@ -3992,6 +4020,10 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             // threads and falls through, BREAK drops the thread from that wait. Eden runs threads
             // independently, so all three are no-ops (a SYNC would wrongly jump, and a branch
             // out of a lowered SSY region would leave its token on Eden's flow stack).
+            break;
+        case 0xf55: case 0xf56:
+            // Convergence-state save/set/restore around quad-shuffle blocks (Hyrule Warriors: AoI's
+            // gloom decal shader). Like BSSY/BSYNC they only manage reconvergence: no-ops.
             break;
         case 0x947: { // BRA
             // The offset's two low bits: .DIV (2) branches when the warp has diverged, .CONV (3)

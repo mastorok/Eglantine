@@ -35,6 +35,17 @@ TEST_CASE("NX2 FPS limit only lengthens a vblank it is below", "[core][nx2_prese
     REQUIRE(PacedInterval(TwoVblanks, 20) == 50'000'000ns);
 }
 
+TEST_CASE("NX2 holds an unpaced unlocked game to 240 fps", "[core][nx2_present_pacer]") {
+    using Service::UnpacedFpsCap;
+    REQUIRE(UnpacedFpsCap(true, false, 0) == 240);
+    // The speed limit or the vsync event's rate already paces it, or the user set an FPS limit.
+    REQUIRE(UnpacedFpsCap(true, true, 0) == 0);
+    REQUIRE(UnpacedFpsCap(true, false, 300) == 0);
+    REQUIRE(UnpacedFpsCap(true, false, 30) == 0);
+    // A locked game counts vsync events and is left as it was.
+    REQUIRE(UnpacedFpsCap(false, false, 0) == 0);
+}
+
 TEST_CASE("NX2 interval decreases apply to the current present", "[core][nx2_present_pacer]") {
     Pacer pacer;
     REQUIRE(pacer.Advance(Start, ThreeVblanks).reset);

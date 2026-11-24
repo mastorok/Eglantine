@@ -267,11 +267,11 @@ wind run fast (twice as fast at 120 fps). Four sites load the 1/60 constant befo
 `0x14632C` (`ldr s0`), `0x2AB804` (`fmov s0, w8`), `0x2C207A4` (`ldr s0`) and `0x2C2208C` (`ldr s2`).
 
 `FPS Unlock (built-in)` replaces each with `bl` to 48 bytes at `0x3C46B00` (result in `s0`) or
-`0x3C46B30` (in `s2`), which return `min(T+0x18, 1/60)` (`T+0x18` is step / 60), or 1/60 when the
-step is not positive. At 60 fps and below the value is the original constant bit for bit. The
-routines use only x16 and x17. Live in Kakariko, breakpoints hit `0x2C2208C` and `0x2AB804` several
-times a frame (the other two sites did not run there); at about 86 fps, restoring the original bytes
-made clothes and hair visibly sway faster, and the patch brought them back to the 60 fps pace.
+`0x3C46B30` (in `s2`), which return the game's step / 60 at `T+0x18`, capped at 4/60.
+At a step of 1 the result is the original constant bit for bit. Below 60 fps, cloth now advances
+with the rest of the game instead of lagging behind movement. This applies only with FPS Unlock;
+Dark's Dynamic FPS is unchanged. The routines use x16 and x17. The prior above-60-fps fix was
+checked in Kakariko by restoring the original bytes at about 86 fps, which sped up cloth again.
 The drifting dust fog (full-screen shader `3ddfb1d7a854c849`) needs no fix: its time, written at
 `0x478338`, already advances by wind speed / 120 times the frame step.
 

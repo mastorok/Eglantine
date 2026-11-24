@@ -502,6 +502,29 @@ TEST_CASE("Maxwell byte conversions emit with native and lowered float64",
     }
 }
 
+TEST_CASE("3D gradient recognition leaves an NDV sample with a constant shuffle input alone",
+          "[shader][maxwell][numeric]") {
+    Shader::ObjectPool<IR::Inst> pool;
+    IR::Block block{pool};
+    IR::IREmitter ir{block};
+    NumericEnvironment env;
+    IR::Program program;
+    program.blocks = {&block};
+    program.post_order_blocks = {&block};
+
+    const auto x = ir.GetAttribute(IR::Attribute::PositionX);
+    const auto inner = ir.FSwizzleAdd(ir.Imm32(1.0f), x, ir.Imm32(0U));
+    const auto outer = ir.FSwizzleAdd(inner, x, ir.Imm32(0U));
+    const auto coords = ir.CompositeConstruct(outer, x, x);
+    IR::TextureInstInfo info{};
+    info.type.Assign(Shader::TextureType::Color3D);
+    info.ndv_is_active.Assign(1);
+    const auto sample = ir.ImageSampleImplicitLod(ir.Imm32(0U), coords, {}, {}, {}, info);
+
+    Shader::Optimization::ConstantPropagationPass(env, program);
+    CHECK(sample.InstRecursive()->GetOpcode() == Opcode::BoundImageSampleImplicitLod);
+}
+
 TEST_CASE("Maxwell double byte conversions round before narrowing",
           "[shader][maxwell][numeric]") {
     const std::array<f64, 19> inputs{

@@ -7,12 +7,13 @@
 
 #include <algorithm>
 #include <functional>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <span>
-#include "video_core/page_filter.h"
-#include "common/container/unordered_map.h"
 #include <utility>
+#include "common/container/unordered_map.h"
+#include "video_core/page_filter.h"
 
 #include "common/assert.h"
 #include "common/bit_field.h"
@@ -129,6 +130,34 @@ public:
         return false;
     }
 
+    /// EDEN_NX2_RENDER_QUERY_FLUSH_E: a report whose value is still to land, from before it is
+    /// recorded until its operation wrote or discarded it.
+    void NotePendingReport(DAddr addr) {
+        std::scoped_lock lock{pending_reports_mutex};
+        ++pending_reports[addr];
+    }
+    /// False when no report was pending there (must not happen).
+    bool NoteReportLanded(DAddr addr) {
+        std::scoped_lock lock{pending_reports_mutex};
+        const auto it = pending_reports.find(addr);
+        if (it == pending_reports.end()) {
+            return false;
+        }
+        if (--it->second == 0) {
+            pending_reports.erase(it);
+        }
+        return true;
+    }
+    /// Any thread: whether a report whose value (and timestamp, 16 bytes) reaches into the range
+    /// is still to land.
+    [[nodiscard]] bool HasPendingReports(DAddr addr, u64 size) {
+        constexpr u64 report_size = 16;
+        const DAddr begin = addr >= report_size - 1 ? addr - (report_size - 1) : 0;
+        std::scoped_lock lock{pending_reports_mutex};
+        const auto it = pending_reports.lower_bound(begin);
+        return it != pending_reports.end() && it->first < addr + size;
+    }
+
     /// Return true when a CPU region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(VAddr addr, size_t size) {
         if (!page_filter.Any(addr, size)) {
@@ -148,12 +177,28 @@ public:
 
     void CounterClose(QueryType counter_type);
 
+    /// A report the back posted (EDEN_NX2_RENDER_POST_QUERY): the device address it translated
+    /// and its NoteReportPending result, both taken at the report's place in the stream.
+    /// by_value: the back synced the value to the host (EDEN_NX2_RENDER_POST_FENCE_REPORT).
+    struct PostedReport {
+        DAddr device;
+        bool noted;
+        bool by_value{};
+    };
     void CounterReport(GPUVAddr addr, QueryType counter_type, QueryPropertiesFlags flags,
-                       u32 payload, u32 subreport);
+                       u32 payload, u32 subreport, const PostedReport* posted = nullptr);
+    /// Any thread: a payload release with no fence flag below High accuracy, written now (on the
+    /// back with EDEN_NX2_RENDER_PAYLOAD_E). The caller syncs its value to the host.
+    void WriteImmediate(GPUVAddr addr, DAddr cpu_addr, u32 payload, bool has_timestamp,
+                        bool mirrored);
+    /// GPURender: the host sync of a value WriteImmediate wrote, at the next NotifyWFI.
+    void AddPayloadSync(DAddr address, u64 value, u64 size);
 
     void NotifyWFI();
 
     bool AccelerateHostConditionalRendering();
+    /// GPURender: what AccelerateHostConditionalRendering does for a static render enable.
+    void EndHostConditionalRendering();
 
     // Async downloads
     void CommitAsyncFlushes();
@@ -162,6 +207,8 @@ public:
 
     /// Whether a new fence has queries to flush or host writes to sync for this cache.
     bool HasPendingFenceWork() const;
+    /// Whether a streamer has values NotifyWFI would sync.
+    bool HasPendingSync() const;
 
     bool ShouldWaitAsyncFlushes();
 
@@ -276,6 +323,8 @@ protected:
 
     ::Common::unordered_map<u64, ::Common::unordered_map<u32, QueryLocation>> cached_queries;
     std::mutex cache_mutex;
+    std::mutex pending_reports_mutex;
+    std::map<DAddr, u32> pending_reports;
 
     struct QueryCacheBaseImpl;
     friend struct QueryCacheBaseImpl;

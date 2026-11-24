@@ -1,0 +1,30 @@
+name: Close obsolete issues
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  issues: write
+
+concurrency: obsolete-close
+
+jobs:
+  close:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/stale@v9
+        with:
+          stale-issue-label: obsolete
+          only-issue-labels: obsolete
+          days-before-issue-stale: -1
+          days-before-issue-close: 7
+          exempt-issue-labels: pinned,enhancement,accessibility,deferred,help-wanted,help wanted,investigating
+          exempt-all-issue-assignees: true
+          exempt-all-issue-milestones: true
+          remove-stale-when-updated: false
+          close-issue-reason: not_planned
+          days-before-pr-stale: -1
+          days-before-pr-close: -1
+          operations-per-run: 1400

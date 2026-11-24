@@ -148,7 +148,11 @@ void PhysicalCore::RunThread(KernelCore& kernel, Kernel::KThread* thread) {
         // Notify the debugger and go to sleep on data abort.
         if (data_abort) {
             if (system.DebuggerEnabled()) {
-                system.GetDebugger().NotifyThreadWatchpoint(thread, *interface->HaltedWatchpoint());
+                if (const auto* watchpoint = interface->HaltedWatchpoint()) {
+                    system.GetDebugger().NotifyThreadWatchpoint(thread, *watchpoint);
+                } else {
+                    system.GetDebugger().NotifyThreadStopped(thread);
+                }
             }
             thread->RequestSuspend(kernel, SuspendType::Debug);
             return;

@@ -89,7 +89,9 @@ Current macOS support is still experimental and very reliant on MoltenVK develop
 
 Users of macOS may wish to use [Asahi Linux](https://wiki.gentoo.org/wiki/Project:Asahi/Guide) for the rising KosmicKrisp support.
 
-As of writing, neither macOS nor Asahi has support for NCE; additionally Asahi has extraneous paging bugs with fastmem.
+On Apple Silicon, Lichii defaults to Dynarmic (JIT) and offers an experimental
+Hypervisor backend in the CPU settings. See [Architectures](Architectures.md) for its requirements.
+The Linux NCE backend requires 4 KiB host pages, so it is unavailable in a typical Asahi Linux setup.
 
 ### Allowing Eden to Run on MacOS
 

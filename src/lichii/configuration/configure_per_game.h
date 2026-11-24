@@ -17,6 +17,7 @@
 #include <QImage>
 #include <QList>
 #include <QPixmap>
+#include <QSet>
 #include "configuration/shared_widget.h"
 #include "core/file_sys/vfs/vfs_types.h"
 #include "frontend_common/config.h"
@@ -68,6 +69,7 @@ public:
     void ApplyConfiguration();
 
     void LoadFromFile(FileSys::VirtualFile file_);
+    void ReloadAddonsAfterModStore(const QSet<QString>& store_toggled);
 
     /// The name the library should show when the user renamed the game in this dialog: the custom
     /// name, or the game's own name after the field was cleared.
@@ -82,6 +84,8 @@ public:
     }
 
 signals:
+    void BrowseModsRequested();
+
     /// The custom artwork was saved or removed.
     void CustomArtworkChanged(u64 program_id);
 

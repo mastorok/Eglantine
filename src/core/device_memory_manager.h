@@ -166,6 +166,10 @@ public:
 
     void UpdatePagesCachedCount(DAddr addr, size_t size, s32 delta);
 
+    /// Whether every page of [addr, addr + size) is cached: guest CPU writes to it reach the
+    /// rasterizer (Core::Memory's write paths) instead of landing unseen.
+    [[nodiscard]] bool IsRangeCached(DAddr addr, size_t size) const;
+
     // New batch API to update multiple ranges with a single lock acquisition.
     void UpdatePagesCachedBatch(std::span<const std::pair<DAddr, size_t>> ranges, s32 delta);
 

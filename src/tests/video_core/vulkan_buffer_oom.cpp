@@ -203,6 +203,10 @@ TEST_CASE("Multi-range buffers retire after more than 60 unused frames",
     const auto get = [&](u64 key) {
         return cache.Get(*test.device, scheduler, allocator, key, std::span{&source, 1}, source.size);
     };
+    const auto tick_frame = [&] {
+        cache.TickFrame(scheduler, scheduler.CurrentTick(),
+                        scheduler.GetMasterSemaphore().KnownGpuTick());
+    };
     const auto idle = get(1);
     const auto boundary = get(2);
     const auto active = get(3);
@@ -212,11 +216,11 @@ TEST_CASE("Multi-range buffers retire after more than 60 unused frames",
     cache.MarkGathered(3);
     const u64 tick = scheduler.CurrentTick();
     for (u32 frame = 0; frame < 60; ++frame) {
-        cache.TickFrame(scheduler);
+        tick_frame();
         CHECK(get(3).handle == active.handle);
     }
     CHECK(get(2).handle == boundary.handle);
-    cache.TickFrame(scheduler);
+    tick_frame();
     const auto recreated = get(1);
     CHECK(recreated.handle != idle.handle);
     CHECK(recreated.needs_gather);
@@ -224,7 +228,7 @@ TEST_CASE("Multi-range buffers retire after more than 60 unused frames",
     CHECK(get(3).handle == active.handle);
     CHECK_FALSE(get(3).needs_gather);
     for (u32 frame = 0; frame < 60; ++frame) {
-        cache.TickFrame(scheduler);
+        tick_frame();
     }
     CHECK(get(1).handle == recreated.handle);
     CHECK(scheduler.CurrentTick() == tick);

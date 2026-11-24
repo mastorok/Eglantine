@@ -33,8 +33,10 @@
 #include "video_core/nx2_list_indirect.h"
 #include "video_core/nx2_list_indirect_stats.h"
 #include "video_core/nx2_list_macro_trace.h"
+#include "video_core/nx2_mme_capture.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/nx2_render_view.h"
 #include "video_core/query_cache/frame_trace.h"
 #include "video_core/query_dma.h"
 #include "video_core/rasterizer_interface.h"
@@ -748,6 +750,9 @@ void Maxwell3D::StoreStateRegisters(std::span<const u64, 4> flags, std::span<con
         if (tracked) {
             shadow_state.reg_array[method] = value;
         }
+        if (render_view_writes) [[unlikely]] {
+            render_view_writes->Note(method);
+        }
     }
     for (size_t word = 0; word < flags.size(); ++word) {
         for (u64 bits = flags[word]; bits != 0; bits &= bits - 1) {
@@ -1182,6 +1187,9 @@ void Maxwell3D::ProcessCBBind(size_t stage_index) {
     }
     buffer.address = regs.const_buffer.Address();
     buffer.size = regs.const_buffer.size;
+    if (render_view_writes) [[unlikely]] {
+        render_view_writes->NoteBind(stage_index, bind_data.shader_slot);
+    }
 
     const bool is_enabled = bind_data.valid.Value() != 0;
     if (!is_enabled) {
@@ -1253,8 +1261,17 @@ bool Maxwell3D::WriteBoundConstantBuffer(u32 offset, const void* data, u32 bytes
         return false;
     }
     const DAddr device = bound.device + offset;
-    FastDraw::NoteConstantData(begin, begin + bytes);
-    FastDraw::NoteDeviceData(device, device + bytes);
+    // Data memory already holds changes neither the texture handles nor the uniforms a delta draw
+    // keeps from the draw before (Donkey Kong Bananza writes most of its handles again unchanged).
+    // GPU-written pages can be newer than memory, and memory can be newer than what the last full
+    // resolve read (a guest CPU write, watch change or sync since, or a page CPU writes to don't
+    // notify): writes there count.
+    if (Tegra::Nx2MayBeGpuWritten(device, bytes) ||
+        !memory_manager.ConstantBufferDataMatches(device, data, bytes) ||
+        !FastDraw::HandleMemoryUnchanged() || !memory_manager.IsDeviceRangeCached(device, bytes)) {
+        FastDraw::NoteConstantData(begin, begin + bytes);
+        FastDraw::NoteDeviceData(device, device + bytes);
+    }
     memory_manager.WriteConstantBufferData(device, data, bytes);
     return true;
 }
@@ -1668,6 +1685,15 @@ void Maxwell3D::ReleaseFront() {
     LOG_INFO(HW_GPU, "GPU thread split stopped: 3D macros back on the engine");
 }
 
+void Maxwell3D::FrontCaptureMmeWrite(const FrontState& fs, u32 method, u32 value, bool from_macro) {
+    if (method - MAXWELL3D_REG_INDEX(load_mme.instruction_ptr) < 4) {
+        VideoCommon::MmeCapture::RecordWrite(
+            memory_manager.GetID(), this, from_macro ? "3d macro" : "3d dma", "3d", method, value,
+            GetNativeMacroEngine().native_write_offset,
+            fs.regs[MAXWELL3D_REG_INDEX(load_mme.start_address_ptr)]);
+    }
+}
+
 void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
                            u32 argument, bool is_last_call, bool from_macro) {
     namespace Profile = VideoCommon::Nx2Profile;
@@ -1695,6 +1721,9 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
             Profile::Add(Profile::Counter::SameValueWrites, 1);
         }
         return;
+    }
+    if (VideoCommon::MmeCapture::active) {
+        FrontCaptureMmeWrite(fs, method, value, from_macro);
     }
     if (!execution_mask[method]) {
         // Nothing would change on the back: CallMethod and ConsumeSinkImpl skip same-value state
@@ -1868,6 +1897,9 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
                 fs.shadow[method] = argument;
             } else if (fs.control == Regs::ShadowRamControl::Replay) {
                 value = fs.shadow[method];
+            }
+            if (VideoCommon::MmeCapture::active) {
+                FrontCaptureMmeWrite(fs, method, value, false);
             }
             fs.regs[method] = value;
             FrontTrackInstanceLoop(fs, method, value); // DrawBegin runs for every word

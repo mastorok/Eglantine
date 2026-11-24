@@ -432,6 +432,7 @@ void RasterizerOpenGL::DispatchCompute() {
     if (pipeline->UsesLocalMemory()) {
         program_manager.LocalMemoryWarmup();
     }
+    std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
     pipeline->SetEngine(kepler_compute, gpu_memory);
     pipeline->Configure();
     const auto& qmd{kepler_compute->launch_description};

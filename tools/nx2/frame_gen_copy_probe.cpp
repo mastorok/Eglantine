@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-#include "video_core/renderer_vulkan/present/fsr3_frame_gen.cpp"
+#include "video_core/renderer_vulkan/present/optical_flow_frame_gen.cpp"
 
-extern "C" __attribute__((visibility("default"))) void Fsr3CopyProbe(
+extern "C" __attribute__((visibility("default"))) void FrameGenCopyProbe(
     VkCommandBuffer command, PFN_vkCmdPipelineBarrier barrier, PFN_vkCmdCopyImage copy,
     VkImage source, VkImage history, VkImage current, uint32_t width, uint32_t height,
     bool initialize) {
@@ -18,7 +18,7 @@ extern "C" __attribute__((visibility("default"))) void Fsr3CopyProbe(
     }
 }
 
-extern "C" __attribute__((visibility("default"))) void Fsr3DiscardProbe(
+extern "C" __attribute__((visibility("default"))) void FrameGenDiscardProbe(
     VkCommandBuffer command, PFN_vkCmdPipelineBarrier barrier, VkImage image) {
     Vulkan::vk::DeviceDispatch dispatch{};
     dispatch.vkCmdPipelineBarrier = barrier;

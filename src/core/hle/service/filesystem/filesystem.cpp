@@ -98,12 +98,7 @@ Result VfsDirectoryServiceWrapper::DeleteFile(const std::string& path_) const {
     if (filename.empty() || dir == nullptr || dir->GetFile(filename) == nullptr) {
         return FileSys::ResultPathNotFound;
     }
-    if (!dir->DeleteFile(filename)) {
-        // TODO(DarkLordZach): Find a better error code for this
-        return ResultUnknown;
-    }
-
-    return ResultSuccess;
+    return dir->DeleteFileWithResult(filename);
 }
 
 Result VfsDirectoryServiceWrapper::CreateDirectory(const std::string& path_) const {
@@ -213,12 +208,7 @@ Result VfsDirectoryServiceWrapper::RenameFile(const std::string& src_path_,
     ASSERT_MSG(dest->WriteBytes(src->ReadAllBytes()) == src->GetSize(),
                "Could not write all of the bytes but everything else has succeeded.");
 
-    if (!src->GetContainingDirectory()->DeleteFile(Common::FS::GetFilename(src_path))) {
-        // TODO(DarkLordZach): Find a better error code for this
-        return ResultUnknown;
-    }
-
-    return ResultSuccess;
+    return src->GetContainingDirectory()->DeleteFileWithResult(Common::FS::GetFilename(src_path));
 }
 
 Result VfsDirectoryServiceWrapper::RenameDirectory(const std::string& src_path_,

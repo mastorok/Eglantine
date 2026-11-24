@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <span>
 #include <type_traits>
@@ -44,6 +45,11 @@ class MemoryManager;
 
 namespace VideoCommon {
 class GpuSplit;
+}
+
+namespace VideoCommon::Nx2RenderView {
+class Writes;
+void NoteWrite(Writes& writes, u32 index) noexcept;
 }
 
 namespace VideoCore {
@@ -3254,6 +3260,9 @@ public:
         Tables tables{};
     } dirty;
 
+    /// EDEN_NX2_RENDER_VIEW_VERIFY: the words and bindings the next draw sends GPURender's view.
+    std::unique_ptr<VideoCommon::Nx2RenderView::Writes> render_view_writes;
+
     DrawManager draw_manager;
 
     GPUVAddr GetMacroAddress(size_t index) const {
@@ -3349,6 +3358,9 @@ private:
         regs.reg_array[method] = argument;
         for (const auto& table : dirty.tables) {
             dirty.flags[table[method]] = true;
+        }
+        if (render_view_writes) [[unlikely]] {
+            VideoCommon::Nx2RenderView::NoteWrite(*render_view_writes, method);
         }
     }
 
@@ -3509,6 +3521,7 @@ private:
     void ReleaseFront();
     void FrontWrite(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument,
                     bool is_last_call, bool from_macro);
+    void FrontCaptureMmeWrite(const FrontState& state, u32 method, u32 value, bool from_macro);
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
     bool FrontRunOnBack(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state,
                         const MacroEngine& engine, u32 start);

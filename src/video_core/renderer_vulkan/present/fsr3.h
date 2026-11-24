@@ -78,13 +78,14 @@ private:
     vk::RenderPass m_renderpass;
     vk::Sampler m_sampler;
 
-    struct Images {
+    // One pair of intermediate images shared by every frame in flight, as in SMAA.
+    std::array<vk::Image, MaxStage> m_dynamic_images;
+    std::array<vk::ImageView, MaxStage> m_dynamic_image_views;
+    struct Frame {
         vk::DescriptorSets descriptor_sets;
-        std::array<vk::Image, MaxStage> images;
-        std::array<vk::ImageView, MaxStage> image_views;
         std::array<vk::Framebuffer, MaxStage> framebuffers;
     };
-    std::vector<Images> m_dynamic_images;
+    std::vector<Frame> m_frames;
 
     // Previous-frame history for temporal accumulation
     vk::Image m_prev_frame_image;

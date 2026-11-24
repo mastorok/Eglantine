@@ -29,6 +29,22 @@ namespace Service {
 }
 
 /**
+ * Returns the frame rate presents are held to when nothing else paces them: an unlocked game with
+ * neither the speed limit nor an FPS limit, which otherwise presents as fast as the host allows.
+ * Ocarina of Time's FPS Unlock is made for up to 240 fps (the frame rate limit slider's top), and
+ * its R1 menu ran at about 580 fps unpaced (ZOR-455).
+ *
+ * @param frame_rate_unlocked Whether a patch lets the game run faster than its console rate.
+ * @param paced               Whether the speed limit or the vsync event's own rate paces it.
+ * @param fps_limit           The explicit FPS limit, or 0 for none.
+ * @return 240, or 0 to leave the game unpaced as before.
+ */
+[[nodiscard]] constexpr std::uint32_t UnpacedFpsCap(bool frame_rate_unlocked, bool paced,
+                                                    std::uint32_t fps_limit) {
+    return frame_rate_unlocked && !paced && fps_limit == 0 ? 240 : 0;
+}
+
+/**
  * Display-driven vsync: when a frame reaching the host's display starts the game's next frame.
  * At once, but not before the previous start plus the interval of @p rate, so the game starts no
  * more frames than the pacer presents.

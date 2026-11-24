@@ -17,21 +17,22 @@
 
 #include "common/assert.h"
 #include "common/cityhash.h"
-#include "shader_recompiler/frontend/maxwell/control_flow.h"
 #include "shader_recompiler/exception.h"
 #include "shader_recompiler/frontend/ampere/trap_guards.h"
+#include "shader_recompiler/frontend/maxwell/control_flow.h"
 #include "shader_recompiler/object_pool.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/dirty_flags.h"
-#include "video_core/nx2_fast_draw.h"
 #include "video_core/dlss_contract.h"
-#include "video_core/fire_emblem_upscale.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/fire_emblem_upscale.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2_debug_control.h"
+#include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/oot_network.h"
 #include "video_core/shader_cache.h"
 #include "video_core/shader_cache_v2/cache.h"
 #include "video_core/shader_cache_v2/records.h"
@@ -377,6 +378,44 @@ const ShaderInfo* ShaderCache::ComputeShader() {
         throw FireEmblemUpscale::DispatchReplaced{};
     }
     return shader;
+}
+
+const ShaderInfo* ShaderCache::KnownComputeShader() const {
+    const auto& qmd{kepler_compute->launch_description};
+    const std::optional<VAddr> cpu_shader_addr{
+        gpu_memory->GpuToCpuAddress(kepler_compute->regs.code_loc.Address() + qmd.program_start)};
+    return cpu_shader_addr ? TryGet(*cpu_shader_addr) : nullptr;
+}
+
+bool ShaderCache::KnownComputeShaderChecks(const ShaderInfo* shader) {
+    if (!shader->lowered_native) {
+        return true;
+    }
+    const u64 key = shader->lowered_native->native_program_key;
+    if (kepler_compute->IsNativeMode()) {
+        using namespace OotNetwork;
+        const bool network_pass =
+            BypassEnabled(program_id) &&
+            (key == PrepassProgramKey || key == UnusedDispatchProgramKey ||
+             key == NetworkProgramKey || key == OutputProgramKey ||
+             std::ranges::find(BaseOutputPrograms, key, &BaseOutputProgram::key) !=
+                 BaseOutputPrograms.end());
+        if (network_pass || DlssContract::IsFastFusionCandidate(program_id, key) ||
+            FireEmblemUpscale::CapturedPasses(program_id)) {
+            return false;
+        }
+    }
+    if (!Shader::Ampere::VerifyTrapGuards(
+            shader->lowered_native->trap_prefix, [&](u32 bank, u32 offset) {
+                return ReadNativeGuardConstant(*kepler_compute, *gpu_memory, bank, offset);
+            })) {
+        throw Shader::Ampere::TrapGuardError{};
+    }
+    // Any other program: the bypass notes the first one after the network, nothing else.
+    if (kepler_compute->IsNativeMode() && kepler_compute->BypassOotNetwork(program_id, key)) {
+        throw FireEmblemUpscale::DispatchReplaced{};
+    }
+    return true;
 }
 
 void ShaderCache::RethrowIfRejected(VAddr addr) {

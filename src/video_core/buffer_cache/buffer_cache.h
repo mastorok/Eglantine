@@ -214,6 +214,7 @@ void BufferCache<P>::TickFrame() {
         RunGarbageCollector(total_used_memory >= critical_memory);
     }
     ++frame_tick;
+    VideoCommon::GpuSplit::Get().CheckBufferFree();
     delayed_destruction_ring.Tick();
 
     // Pages draws wrote: their early downloads, now that the frame's work is recorded.
@@ -294,27 +295,40 @@ void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu
     // guest CPU writes come through TryCacheInvalidation, which sends such pages to the GPU thread.
     const DAddr page_begin = Common::AlignDown(device_addr, DEVICE_PAGESIZE);
     const DAddr page_end = Common::AlignUp(device_addr + size, DEVICE_PAGESIZE);
-    if (keep_page_gpu_data &&
-        VideoCommon::GpuSplit::OwnsScheduler() &&
-        gpu_modified_ranges.Intersects(page_begin, page_end - page_begin)) {
+    if (keep_page_gpu_data && gpu_modified_ranges.Intersects(page_begin, page_end - page_begin)) {
+        const bool owner = VideoCommon::GpuSplit::OwnsScheduler();
+        // EDEN_NX2_RENDER_GATHER_E: the back uploads too, its commands collected for GPURender.
+        bool collects = false;
+        if constexpr (requires { runtime.CollectsCommands(); }) {
+            collects = runtime.CollectsCommands();
+        }
         // Switch 2 titles: upload the CPU's bytes into the buffer instead, as CachedWriteMemory
         // does, so the page stays GPU-owned and nothing waits for the host GPU.
-        static const int forced = [] {
-            const char* value = std::getenv("EDEN_NX2_INLINE_PAGE_WRITES");
-            return value == nullptr ? -1 : (value[0] == '0' ? 0 : 1);
-        }();
-        const bool inline_writes =
-            forced >= 0 ? forced == 1 : Tegra::g_nx2_ampere.load(std::memory_order_relaxed);
-        if (inline_writes && IsRegionRegistered(device_addr, size)) {
+        if ((owner || collects) && InlinesPageWrite(device_addr, size)) {
             tmp_buffer.resize_destructive(size);
             device_memory.ReadBlockUnsafe(device_addr, tmp_buffer.data(), size);
             InlineMemoryImplementation(device_addr, size, tmp_buffer);
             return;
         }
-        DownloadMemory(page_begin, page_end - page_begin);
+        if (owner) {
+            DownloadMemory(page_begin, page_end - page_begin);
+        } else if (VideoCommon::GpuSplit::OnBackThread()) {
+            VideoCommon::GpuSplit::Get().NoteGpuPageOffOwner();
+        }
     }
     memory_tracker.MarkRegionAsCpuModified(device_addr, size);
     MarkVertexBuffersStale(device_addr, size);
+}
+
+template <class P>
+bool BufferCache<P>::InlinesPageWrite(DAddr device_addr, u64 size) {
+    static const int forced = [] {
+        const char* value = std::getenv("EDEN_NX2_INLINE_PAGE_WRITES");
+        return value == nullptr ? -1 : (value[0] == '0' ? 0 : 1);
+    }();
+    const bool inline_writes =
+        forced >= 0 ? forced == 1 : Tegra::g_nx2_ampere.load(std::memory_order_relaxed);
+    return inline_writes && IsRegionRegistered(device_addr, size);
 }
 
 template <class P>
@@ -1605,6 +1619,7 @@ std::pair<typename P::Buffer*, u32> BufferCache<P>::ObtainCPUBuffer(
 template <class P>
 void BufferCache<P>::BindGraphicsUniformBuffer(size_t stage, u32 index, GPUVAddr gpu_addr,
                                                u32 size) {
+    VideoCommon::GpuSplit::BackOwned("BufferCache::BindGraphicsUniformBuffer");
     const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(gpu_addr);
     if (!device_addr) {
         channel_state->uniform_buffers[stage][index] = NULL_BINDING;
@@ -1630,6 +1645,7 @@ void BufferCache<P>::DisableGraphicsUniformBuffer(size_t stage, u32 index) {
 
 template <class P>
 void BufferCache<P>::UpdateGraphicsBuffers(bool is_indexed) {
+    VideoCommon::GpuSplit::BackOwned("BufferCache::UpdateGraphicsBuffers");
     do {
         channel_state->has_deleted_buffers = false;
         DoUpdateGraphicsBuffers(is_indexed);
@@ -1638,6 +1654,7 @@ void BufferCache<P>::UpdateGraphicsBuffers(bool is_indexed) {
 
 template <class P>
 void BufferCache<P>::UpdateComputeBuffers() {
+    VideoCommon::GpuSplit::BackOwned("BufferCache::UpdateComputeBuffers");
     do {
         channel_state->has_deleted_buffers = false;
         DoUpdateComputeBuffers();
@@ -1866,8 +1883,8 @@ bool BufferCache<P>::BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index, 
         }
     }
 
-    const auto& cbufs = maxwell3d->state.shader_stages[stage];
-    GPUVAddr ssbo_addr = cbufs.const_buffers[cbuf_index].address + cbuf_offset;
+    const auto& cbuf = maxwell3d->state.shader_stages[stage].const_buffers[cbuf_index];
+    GPUVAddr ssbo_addr = cbuf.address + cbuf_offset;
     GPUVAddr holder{};
     if (indirect_offset != ~0U) {
         // The pointer is an entry of a table the constant buffer points to.
@@ -1877,12 +1894,29 @@ bool BufferCache<P>::BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index, 
             return false;
         }
         ssbo_addr = holder + indirect_offset;
+        if constexpr (requires { runtime.Nx2Owes(DAddr{}, u64{}); }) {
+            // An unlent draw's back reads the entry itself: its constant buffers were checked.
+            if (VideoCommon::GpuSplit::Unlends()) {
+                const auto device = gpu_memory->GpuToCpuAddress(ssbo_addr);
+                if (device && runtime.Nx2Owes(*device, 2 * sizeof(u64))) {
+                    VideoCommon::GpuSplit::Get().NoteOwedTableRead();
+                }
+            }
+        }
     }
+    const bool native = maxwell3d->GetNativeMacroEngine().native_turing;
+    const bool indirect = indirect_offset != ~0U;
+    // NVN puts each stage's storage buffer descriptors in bank 0 from 0x110 + stage * 0x100, 16
+    // bytes each: an address and a size (Eglantine #871). Splatoon Raiders' and Mario Kart World's
+    // lighting reads run past the 8 MiB bare-pointer cap inside the size those slots declare.
+    const u32 nvn_slots = 0x110 + static_cast<u32>(stage) * 0x100;
+    const bool sized = native && !indirect && !is_written && cbuf_index == 0 &&
+                       cbuf_offset >= nvn_slots && cbuf_offset < nvn_slots + 0x100 &&
+                       (cbuf_offset - nvn_slots) % 0x10 == 0 && cbuf.enabled &&
+                       cbuf.size >= cbuf_offset + 2 * sizeof(u64);
     channel_state->storage_buffers[stage][ssbo_index] =
-        StorageBufferBinding(ssbo_addr, cbuf_index, is_written,
-                             maxwell3d->GetNativeMacroEngine().native_turing ||
-                                 indirect_offset != ~0U,
-                             indirect_offset != ~0U);
+        StorageBufferBinding(ssbo_addr, cbuf_index, is_written, native || indirect, indirect,
+                             false, sized);
     if (indirect_offset != ~0U) {
         TraceTablePointer(false, stage, ssbo_index, cbuf_index, cbuf_offset, indirect_offset, holder,
                           channel_state->storage_buffers[stage][ssbo_index]);
@@ -2480,7 +2514,7 @@ void BufferCache<P>::BindHostVertexBuffers() {
             enabled_mask &= (enabled_mask - 1);
             const Binding& binding = VertexBufferSlot(index);
             Buffer& buffer = slot_buffers[binding.buffer_id];
-            TouchBuffer(buffer, binding.buffer_id);
+            TouchBufferOnce(vertex_touches[index], buffer, binding.buffer_id);
             SynchronizeGeometryBuffer(index, binding.buffer_id, binding.device_addr, binding.size);
             if (!flags[Dirty::VertexBuffer0 + index]) {
                 flush_bindings();
@@ -2602,7 +2636,6 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
     const DAddr device_addr = binding.device_addr;
     const u32 size = (std::min)(binding.size, (*channel_state->uniform_buffer_sizes)[stage][index]);
     Buffer& buffer = slot_buffers[binding.buffer_id];
-    TouchBuffer(buffer, binding.buffer_id);
     const bool has_host_buffer = binding.buffer_id != NULL_BUFFER_ID;
     // Native programs keep tables next to their code in a 64 KiB bank read with indirect offsets
     // (Splatoon Raiders: the dialogue box corners in c1). Writes to that memory can go unnoticed by
@@ -2641,6 +2674,9 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
         }
         uniform_keep.clean[stage] &= ~(1u << index);
     }
+    // A kept range binds a stream allocation, not the buffer: the buffer is touched once it is
+    // read.
+    TouchBufferOnce(uniform_touches[stage][index], buffer, binding.buffer_id);
     const u32 offset = has_host_buffer ? buffer.Offset(device_addr) : 0;
     const bool needs_alignment_stream = [&]() {
         if constexpr (IS_OPENGL) {
@@ -2782,10 +2818,27 @@ void BufferCache<P>::ResolveMultiRangeStorage(Binding& binding, bool is_written,
         if (is_written && !runtime.PrefersSparseSources()) {
             return;
         }
+        // Ranges found in one segment, until a map changes: the query is a hash lookup, for
+        // every storage binding of every draw.
+        const u64 map_serial = gpu_memory->MapSerial();
+        SingleRangeMemo& memo = single_ranges[(binding.gpu_addr >> 8) % single_ranges.size()];
+        const bool memo_hit = memo.memory == gpu_memory && memo.map_serial == map_serial &&
+                              memo.gpu_addr == binding.gpu_addr && binding.size <= memo.size;
+        if (memo_hit && !Nx2Perf::Verify()) {
+            return;
+        }
         const VirtualSegments* found =
             virtual_ranges.Query(*gpu_memory, binding.gpu_addr, binding.size);
         if (!found || found->size() < 2) {
+            // No segments also means a gap: a shorter range at the address may still be split.
+            if (found && found->size() == 1) {
+                memo = {gpu_memory, map_serial, binding.gpu_addr, binding.size};
+            }
             return;
+        }
+        if (memo_hit) {
+            LOG_ERROR(HW_GPU, "Nx2Perf storage range: {:#x}+{:#x} remembered in one segment, has {}",
+                      binding.gpu_addr, binding.size, found->size());
         }
         const VirtualSegments segments = *found;
         const u32 first = static_cast<u32>(pool.size());
@@ -3169,6 +3222,15 @@ void BufferCache<P>::UpdateVertexBuffer(u32 index) {
         return;
     }
     const auto& array = maxwell3d->regs.vertex_streams[index];
+    if (array.enable == 0) {
+        // Nothing binds a disabled stream (BindHostVertexBuffers takes the enabled ones), so its
+        // flag stayed set and every later change of another stream resolved it again: Donkey
+        // Kong Bananza enables 10 of 32 and resolved ~13 streams a draw.
+        maxwell3d->dirty.flags[Dirty::VertexBuffer0 + index] = false;
+        channel_state->vertex_buffers[index] = NULL_BINDING;
+        UpdateVertexBufferSlot(index, NULL_BINDING);
+        return;
+    }
     const auto& limit = maxwell3d->regs.vertex_stream_limits[index];
     const GPUVAddr gpu_addr_begin = array.Address();
     const bool native = maxwell3d->GetNativeMacroEngine().native_turing;
@@ -3625,24 +3687,42 @@ BufferId BufferCache<P>::FindBuffer(DAddr device_addr, u32 size, bool sparse_com
     if (device_addr == 0 || page >= page_table.size()) {
         return NULL_BUFFER_ID;
     }
+    // A recent result for the page, found without touching the buffer (draws look up ~20 ranges
+    // each). Only a deletion takes a buffer off the page table: a bigger one joining it deletes it.
+    const bool should_sync = Settings::IsGPUFenceBehaviorAccurate();
+    FindMemo& memo = find_memos[page % find_memos.size()];
+    const bool memo_hit = !should_sync && memo.page == page &&
+                          memo.deletions == buffer_deletions && device_addr >= memo.begin &&
+                          device_addr + size <= memo.end &&
+                          (memo.sparse_compatible || !sparse_compatible);
+    if (memo_hit && !Nx2Perf::Verify()) {
+        return memo.buffer_id;
+    }
     const BufferId buffer_id = page_table[page];
     if (buffer_id) {
         Buffer& buffer = slot_buffers[buffer_id];
         if (buffer.IsInBounds(device_addr, size)) {
-            const bool should_sync = Settings::IsGPUFenceBehaviorAccurate();
             if (should_sync) {
                 SynchronizeBufferWrites(buffer);
             }
-            bool usable = true;
+            bool sparse = true;
             if constexpr (requires { buffer.IsSparseCompatible(); }) {
-                if (sparse_compatible && !buffer.IsSparseCompatible()) {
-                    usable = false;
-                }
+                sparse = buffer.IsSparseCompatible();
             }
-            if (usable) {
+            if (!sparse_compatible || sparse) {
+                if (memo_hit && memo.buffer_id != buffer_id) {
+                    LOG_ERROR(HW_GPU, "Nx2Perf find buffer: {:#x}+{:#x} remembered in {}, found in {}",
+                              device_addr, size, memo.buffer_id.index, buffer_id.index);
+                }
+                memo = {page, buffer_deletions, buffer.CpuAddr(),
+                        buffer.CpuAddr() + buffer.SizeBytes(), buffer_id, sparse};
                 return buffer_id;
             }
         }
+    }
+    if (memo_hit) {
+        LOG_ERROR(HW_GPU, "Nx2Perf find buffer: {:#x}+{:#x} remembered in {}, not in the page table",
+                  device_addr, size, memo.buffer_id.index);
     }
     return CreateBuffer(device_addr, size, sparse_compatible, caller);
 }
@@ -3878,6 +3958,16 @@ template <class P>
 void BufferCache<P>::TouchBuffer(Buffer& buffer, BufferId buffer_id) noexcept {
     if (buffer_id != NULL_BUFFER_ID) {
         lru_cache.Touch(buffer.getLRUID(), frame_tick);
+    }
+}
+
+template <class P>
+void BufferCache<P>::TouchBufferOnce(TouchMemo& memo, Buffer& buffer, BufferId buffer_id) noexcept {
+    // The collector goes by the frame of a buffer's last touch: one a frame is enough.
+    if (memo.frame != frame_tick || memo.buffer_id != buffer_id ||
+        memo.deletions != buffer_deletions) {
+        memo = {frame_tick, buffer_id, buffer_deletions};
+        TouchBuffer(buffer, buffer_id);
     }
 }
 
@@ -4265,9 +4355,6 @@ template <class P>
 void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
     const StutterTrace::SiteScope site{StutterTrace::Site::BufferDelete};
     ++buffer_deletions;
-    if constexpr (requires { runtime.OnBufferDeleted(slot_buffers[buffer_id]); }) {
-        runtime.OnBufferDeleted(slot_buffers[buffer_id]);
-    }
     read_trapped_ranges.Subtract(slot_buffers[buffer_id].CpuAddr(),
                                  slot_buffers[buffer_id].SizeBytes());
     cpu_read_ranges.Subtract(slot_buffers[buffer_id].CpuAddr(), slot_buffers[buffer_id].SizeBytes());
@@ -4337,6 +4424,12 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
         inline_buffer_id = NULL_BUFFER_ID;
     }
 
+    if constexpr (requires { runtime.RetireBufferIfSparseSource(slot_buffers[buffer_id]); }) {
+        if (runtime.RetireBufferIfSparseSource(slot_buffers[buffer_id])) {
+            slot_buffers.erase(buffer_id);
+            return;
+        }
+    }
 #ifdef LICHII_LEGACY
     if (!do_not_mark || !immediately_free)
 #endif
@@ -4391,7 +4484,7 @@ void BufferCache<P>::TraceTablePointer(bool compute, size_t stage, size_t ssbo_i
 template <class P>
 Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index, bool is_written,
                                              bool native_pointer, bool table_pointer,
-                                             bool compute) const {
+                                             bool compute, bool sized) const {
     const GPUVAddr gpu_addr = gpu_memory->Read<u64>(ssbo_addr);
 
     if (gpu_addr == 0) {
@@ -4399,7 +4492,7 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
     }
 
     const bool reads_size_word =
-        !(table_pointer && !is_written) && (!native_pointer || (compute && !is_written));
+        !(table_pointer && !is_written) && (!native_pointer || sized || (compute && !is_written));
     const u64 next_qword = reads_size_word ? gpu_memory->Read<u64>(ssbo_addr + 8) : 0;
     const u32 alignment = runtime.GetStorageBufferAlignment();
     struct CachedBinding {
@@ -4415,7 +4508,7 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
     thread_local std::array<std::array<CachedBinding, ways>, 512> binding_cache{};
     const u32 flags =
         (is_written ? 1U : 0U) | (native_pointer ? 2U : 0U) | (table_pointer ? 4U : 0U) |
-        (compute ? 8U : 0U);
+        (compute ? 8U : 0U) | (sized ? 16U : 0U);
     const size_t owner = gpu_memory->GetID() + 1;
     const u64 serial = gpu_memory->MapSerial();
     auto& set = binding_cache[((gpu_addr ^ next_qword ^ flags) * 0x9E3779B97F4A7C15ULL) >> 55];
@@ -4453,6 +4546,11 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
             // bound Fortune's Weave's DLSS input features to 266 bytes and dropped the rest.
             if (native_pointer) {
                 const u32 bare = (std::min)(memory_layout_size, static_cast<u32>(8_MiB));
+                // A declared size only extends the binding: a smaller one keeps the bare range, as
+                // the word after a bare pointer is not always a size.
+                if (sized && next_qword_is_size && packed_size > bare) {
+                    return (std::min)(packed_size, limit);
+                }
                 // Mario Kart World's lighting passes read past 8 MiB from theirs, inside the size
                 // word after the pointer (Eglantine #609 reads it): capped at 8 MiB those reads
                 // came back zero and lit land and characters too dark. A read-only compute binding
@@ -4473,37 +4571,41 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
             // a written one isn't split into separate ranges without sparse sources.
             const u32 wanted = size;
             size = static_cast<u32>(gpu_memory->MaxContinuousRange(gpu_addr, size));
-            if (native_pointer && compute) {
-                static std::atomic<u64> computed{}, past_cap{}, at_gap{}, logged{};
-                static std::atomic<u32> largest{};
-                static std::atomic<s64> next_log{};
-                const u64 total = computed.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (native_pointer && (compute || sized)) {
+                struct Counts {
+                    std::atomic<u64> computed, past_cap, at_gap, logged;
+                    std::atomic<u32> largest;
+                    std::atomic<s64> next_log;
+                };
+                static std::array<Counts, 2> counts{};
+                Counts& c = counts[compute ? 0 : 1];
+                const u64 total = c.computed.fetch_add(1, std::memory_order_relaxed) + 1;
                 if (size > 8_MiB) {
-                    past_cap.fetch_add(1, std::memory_order_relaxed);
-                    u32 seen = largest.load(std::memory_order_relaxed);
+                    c.past_cap.fetch_add(1, std::memory_order_relaxed);
+                    u32 seen = c.largest.load(std::memory_order_relaxed);
                     while (size > seen &&
-                           !largest.compare_exchange_weak(seen, size, std::memory_order_relaxed)) {
+                           !c.largest.compare_exchange_weak(seen, size, std::memory_order_relaxed)) {
                     }
                 }
                 if (size < wanted) {
-                    at_gap.fetch_add(1, std::memory_order_relaxed);
+                    c.at_gap.fetch_add(1, std::memory_order_relaxed);
                 }
                 const s64 now = std::chrono::duration_cast<std::chrono::seconds>(
                                     std::chrono::steady_clock::now().time_since_epoch())
                                     .count();
-                const u64 long_bindings = past_cap.load(std::memory_order_relaxed);
-                const u64 gap_bindings = at_gap.load(std::memory_order_relaxed);
-                s64 due = next_log.load(std::memory_order_relaxed);
-                if (now >= due && logged.load(std::memory_order_relaxed) !=
-                                      long_bindings + gap_bindings &&
-                    next_log.compare_exchange_strong(due, now + 10)) {
-                    logged.store(long_bindings + gap_bindings, std::memory_order_relaxed);
+                const u64 long_bindings = c.past_cap.load(std::memory_order_relaxed);
+                const u64 gap_bindings = c.at_gap.load(std::memory_order_relaxed);
+                s64 due = c.next_log.load(std::memory_order_relaxed);
+                if (now >= due &&
+                    c.logged.load(std::memory_order_relaxed) != long_bindings + gap_bindings &&
+                    c.next_log.compare_exchange_strong(due, now + 10)) {
+                    c.logged.store(long_bindings + gap_bindings, std::memory_order_relaxed);
                     LOG_INFO(HW_GPU,
-                             "Native compute storage bindings: {} reach past 8 MiB through their "
+                             "Native {} storage bindings: {} reach past 8 MiB through their "
                              "size word (largest {:#x} bytes), {} stop at a mapping gap, of {} "
                              "bound",
-                             long_bindings, largest.load(std::memory_order_relaxed), gap_bindings,
-                             total);
+                             compute ? "compute" : "graphics NVN slot", long_bindings,
+                             c.largest.load(std::memory_order_relaxed), gap_bindings, total);
                 }
             }
         }

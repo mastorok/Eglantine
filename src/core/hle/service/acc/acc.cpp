@@ -1774,8 +1774,8 @@ namespace {
 
 class ScratchSystemAccount final : public Module::Interface {
 public:
-    ScratchSystemAccount(Core::System& system_, std::shared_ptr<ProfileManager> profile_manager)
-        : Interface{std::make_shared<Module>(), std::move(profile_manager), system_, "acc:su"} {
+    ScratchSystemAccount(Core::System& system_, std::shared_ptr<ProfileManager> profile_manager_)
+        : Interface{std::make_shared<Module>(), std::move(profile_manager_), system_, "acc:su"} {
         static const FunctionInfo functions[] = {
             {0, &Interface::GetUserCount, "GetUserCount"},
             {1, &Interface::GetUserExistence, "GetUserExistence"},

@@ -39,6 +39,15 @@ struct StorageBufferAddr {
     u32 indirect{~0U};
 };
 
+/// True when the range holds the address. Compares through a predicate: MSVC 14.51's STL sends
+/// std::ranges::find on this 12-byte type to its vectorized search, which only takes elements of
+/// 1, 2, 4 or 8 bytes and fails a static assertion.
+template <typename Range>
+bool ContainsAddr(const Range& range, const StorageBufferAddr& addr) {
+    return std::ranges::any_of(range,
+                               [&addr](const StorageBufferAddr& other) { return other == addr; });
+}
+
 /// Block iterator to a global memory instruction and the storage buffer it uses
 struct StorageInst {
     StorageBufferAddr storage_buffer;
@@ -486,25 +495,29 @@ std::optional<StorageBufferAddr> Track(const IR::Value& value, const Bias* bias,
 std::optional<StorageBufferAddr> TrackAddend(const IR::Value& value) {
     std::optional<StorageBufferAddr> result;
     bool ambiguous{};
-    const auto visit{[&](const auto& self, const IR::Value& term) -> void {
-        if (term.IsImmediate() || ambiguous) {
-            return;
+    // Explicit stack, not recursion: a long IAdd32 chain would take one host frame per addition
+    // (the same overflow as CollectIteratorWords). Pushing Arg(1) first keeps Arg(0) first.
+    std::vector<IR::Value> pending{value};
+    while (!pending.empty() && !ambiguous) {
+        const IR::Value term{pending.back()};
+        pending.pop_back();
+        if (term.IsImmediate()) {
+            continue;
         }
         const IR::Inst* const inst{term.InstRecursive()};
         if (inst->GetOpcode() == IR::Opcode::IAdd32) {
-            self(self, inst->Arg(0));
-            self(self, inst->Arg(1));
-            return;
+            pending.push_back(inst->Arg(1));
+            pending.push_back(inst->Arg(0));
+            continue;
         }
         if (inst->GetOpcode() != IR::Opcode::GetCbufU32 || !inst->Arg(0).IsImmediate() ||
             !inst->Arg(1).IsImmediate() || !Common::IsAligned(inst->Arg(1).U32(), 8)) {
-            return;
+            continue;
         }
         const StorageBufferAddr found{.index = inst->Arg(0).U32(), .offset = inst->Arg(1).U32()};
         ambiguous = result.has_value();
         result = found;
-    }};
-    visit(visit, value);
+    }
     return ambiguous ? std::nullopt : result;
 }
 
@@ -1266,7 +1279,7 @@ NativeCandidates NativePointerCandidates(const IR::U32& low_addr, Environment& e
                         const StorageBufferAddr pointer{.index = index.U32(),
                                                         .offset = first + slot * stride};
                         if (Common::IsAligned(pointer.offset, 8) &&
-                            std::ranges::find(candidates, pointer) == candidates.end() &&
+                            !ContainsAddr(candidates, pointer) &&
                             env.IsCbufStorageBufferPointer(pointer.index, pointer.offset)) {
                             candidates.push_back(pointer);
                             dynamic = true;
@@ -1282,7 +1295,7 @@ NativeCandidates NativePointerCandidates(const IR::U32& low_addr, Environment& e
             const StorageBufferAddr pointer{.index = index.U32(), .offset = offset.U32()};
             const bool is_pointer{Common::IsAligned(pointer.offset, 8) &&
                                   env.IsCbufStorageBufferPointer(pointer.index, pointer.offset)};
-            if (is_pointer && std::ranges::find(candidates, pointer) == candidates.end()) {
+            if (is_pointer && !ContainsAddr(candidates, pointer)) {
                 candidates.push_back(pointer);
             }
             sources.emplace(inst, is_pointer);
@@ -1346,7 +1359,7 @@ NativeCandidates NativePointerCandidates(const IR::U32& low_addr, Environment& e
             // table per object type: every slot whose table entry is a pointer). Those are table
             // candidates, bound only in the bindings the other storage buffers leave free.
             const auto add = [&](const StorageBufferAddr& pointer, bool table) {
-                if (std::ranges::find(candidates, pointer) != candidates.end()) {
+                if (ContainsAddr(candidates, pointer)) {
                     return;
                 }
                 if (table && env.ShaderStage() != Stage::Compute) {
@@ -1361,8 +1374,7 @@ NativeCandidates NativePointerCandidates(const IR::U32& low_addr, Environment& e
                         table_complete = false;
                         return;
                     }
-                    if (std::ranges::find(info.table_candidates, pointer) ==
-                        info.table_candidates.end()) {
+                    if (!ContainsAddr(info.table_candidates, pointer)) {
                         info.table_candidates.push_back(pointer);
                     }
                 }
@@ -1604,8 +1616,7 @@ bool CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
                 }
             }
             for (const StorageBufferAddr& candidate : candidates) {
-                if (std::ranges::find(info.table_candidates, candidate) !=
-                    info.table_candidates.end()) {
+                if (ContainsAddr(info.table_candidates, candidate)) {
                     const StorageBufferAddr holder{.index = candidate.index,
                                                    .offset = candidate.offset};
                     const auto takes_binding = [&info](const StorageBufferAddr& buffer) {

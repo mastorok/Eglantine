@@ -49,6 +49,7 @@ enum class FrameGenState : u8 {
     UnsupportedSurface,
     MissingLosslessDll,
     NvidiaFrameGen,
+    MissingFlyHigh,
 };
 
 struct FrameGenStatus {

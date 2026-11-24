@@ -14,9 +14,16 @@ layout(push_constant) uniform PushConstants {
     float flow_scale;
 };
 
-// ΓöÇΓöÇ Optimized 3├ù3 motion vector median using textureGather ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
-// textureGather fetches a 2├ù2 quad per call, so we only need 4 calls
-// to cover a 3├ù3 neighbourhood (vs 9 individual texture() calls).
+// Mean absolute RGB difference under which a pixel counts as unchanged between the frames.
+const float STATIC_THRESHOLD = 0.012;
+
+float ColorDistance(vec4 a, vec4 b) {
+    return dot(abs(a.rgb - b.rgb), vec3(1.0 / 3.0));
+}
+
+// ── Optimized 3×3 motion vector median using textureGather ──────────
+// textureGather fetches a 2×2 quad per call, so we only need 4 calls
+// to cover a 3×3 neighbourhood (vs 9 individual texture() calls).
 // We extract the median of X and Y components independently.
 void insertionSort5(inout float a[5]) {
     for (int i = 1; i < 5; i++) {
@@ -33,8 +40,8 @@ void insertionSort5(inout float a[5]) {
 vec2 sampleMotionMedian(vec2 uv) {
     vec2 texel = 1.0 / vec2(textureSize(MotionVectors, 0));
 
-    // textureGather returns 2├ù2 quads: (x-0.5, y-0.5) to (x+0.5, y+0.5)
-    // We use 4 gathers offset to cover the 3├ù3 region
+    // textureGather returns 2×2 quads: (x-0.5, y-0.5) to (x+0.5, y+0.5)
+    // We use 4 gathers offset to cover the 3×3 region
     // Gather component 0 = R (motion X), component 1 = G (motion Y)
     vec4 gx0 = textureGather(MotionVectors, uv + vec2(-0.5, -0.5) * texel, 0); // TL quad
     vec4 gx1 = textureGather(MotionVectors, uv + vec2( 0.5, -0.5) * texel, 0); // TR quad
@@ -46,9 +53,9 @@ vec2 sampleMotionMedian(vec2 uv) {
     vec4 gy2 = textureGather(MotionVectors, uv + vec2(-0.5,  0.5) * texel, 1);
     vec4 gy3 = textureGather(MotionVectors, uv + vec2( 0.5,  0.5) * texel, 1);
 
-    // Extract 9 unique samples from overlapping 2├ù2 quads
+    // Extract 9 unique samples from overlapping 2×2 quads
     // gatherN.w=TL, .z=TR, .x=BL, .y=BR of each quad
-    // 3├ù3 grid: row0=[gx0.w, gx0.z/gx1.w, gx1.z]
+    // 3×3 grid: row0=[gx0.w, gx0.z/gx1.w, gx1.z]
     //           row1=[gx0.x/gx2.w, center, gx1.y/gx3.z]
     //           row2=[gx2.x, gx2.y/gx3.x, gx3.y]
     float xs[9] = float[](gx0.w, gx1.w, gx1.z, gx0.x, texture(MotionVectors, uv).x, gx1.y, gx2.x, gx3.x, gx3.y);
@@ -81,26 +88,47 @@ void main() {
     // Median-filtered motion vector (reduces outlier jitter)
     vec2 motion = sampleMotionMedian(uv) / vec2(textureSize(MotionVectors, 0));
 
-    // Forward and backward warped coordinates
-    vec2 forward_uv  = clamp(uv + motion * blend_factor,         0.0, 1.0);
-    vec2 backward_uv = clamp(uv - motion * (1.0 - blend_factor), 0.0, 1.0);
+    // Pixels that didn't change (the HUD, or what the camera follows) stay in place instead of
+    // warping with the motion around them.
+    const vec4 previous_here = texture(PreviousFrame, uv);
+    const vec4 current_here = texture(CurrentFrame, uv);
+    if (ColorDistance(previous_here, current_here) < STATIC_THRESHOLD) {
+        imageStore(OutGeneratedFrame, pixel_coord, mix(previous_here, current_here, blend_factor));
+        return;
+    }
 
-    vec4 forward_color  = texture(PreviousFrame, forward_uv);
-    vec4 backward_color = texture(CurrentFrame,  backward_uv);
+    const vec2 forward_unclamped = uv + motion * blend_factor;
+    const vec2 backward_unclamped = uv - motion * (1.0 - blend_factor);
+    const vec2 forward_uv = clamp(forward_unclamped, 0.0, 1.0);
+    const vec2 backward_uv = clamp(backward_unclamped, 0.0, 1.0);
+    const vec4 forward_color = texture(PreviousFrame, forward_uv);
+    const vec4 backward_color = texture(CurrentFrame, backward_uv);
 
-    // Colour-difference occlusion
-    vec3 color_diff = abs(forward_color.rgb - backward_color.rgb);
-    float occlusion = clamp(dot(color_diff, vec3(0.333)) * 2.0, 0.0, 1.0);
+    // A sample is unusable off screen (content entering or leaving exists in one frame only) or,
+    // for a moving pixel, on static content seen through the motion. Use the other one then.
+    bool forward_valid = forward_unclamped == forward_uv;
+    bool backward_valid = backward_unclamped == backward_uv;
+    if (length(motion * render_size) > 1.0) {
+        forward_valid = forward_valid &&
+                        ColorDistance(forward_color, texture(CurrentFrame, forward_uv)) >=
+                            STATIC_THRESHOLD;
+        backward_valid = backward_valid &&
+                         ColorDistance(texture(PreviousFrame, backward_uv), backward_color) >=
+                             STATIC_THRESHOLD;
+    }
 
-    // Smooth bilateral interpolation ΓÇö bias toward centre on occlusion
-    float alpha = mix(blend_factor, 0.5, occlusion * 0.4);
-    vec4 interpolated = mix(forward_color, backward_color, alpha);
-
-    // ΓöÇΓöÇ Anti-flicker: blend with un-warped centre pixel ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
-    float motion_magnitude = length(motion * render_size);
-    float direct_weight = exp(-motion_magnitude * 0.5);
-    vec4 center_color = mix(texture(PreviousFrame, uv), texture(CurrentFrame, uv), blend_factor);
-    interpolated = mix(interpolated, center_color, direct_weight * 0.3);
+    vec4 interpolated;
+    if (forward_valid != backward_valid) {
+        interpolated = forward_valid ? forward_color : backward_color;
+    } else {
+        // Where the two warped samples disagree, the motion doesn't describe this pixel (an
+        // animation frame changed, or something was uncovered). Blending them ghosts both
+        // versions, so show the nearer real frame there instead.
+        interpolated = mix(forward_color, backward_color, blend_factor);
+        const vec4 nearest = blend_factor < 0.5 ? previous_here : current_here;
+        interpolated = mix(interpolated, nearest,
+                           smoothstep(0.04, 0.12, ColorDistance(forward_color, backward_color)));
+    }
 
     imageStore(OutGeneratedFrame, pixel_coord, interpolated);
 }

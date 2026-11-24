@@ -204,11 +204,27 @@ std::optional<std::vector<AddrInfo>> Resolve(std::string_view host,
 
 SockAddrIn ConnectTarget(const SockAddrIn& address) {
     const auto config = Get();
-    if (!config->server || address.ip != IPv4Address{127, 0, 0, 1} || address.portno != 443) {
+    static constexpr IPv6Address mapped_loopback{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff,
+                                                 127, 0, 0, 1};
+    // An INET6 socket (dual stack since IPv6 sockets landed) reaches the resolved 127.0.0.1 as
+    // ::ffff:127.0.0.1, and keeps `ip` zero. ::1 is never resolved here, so it is left alone.
+    const bool inet6 = address.family == Domain::INET6;
+    const bool to_loopback = inet6 ? address.ip6 == mapped_loopback
+                                   : address.ip == IPv4Address{127, 0, 0, 1};
+    if (!config->server || !to_loopback || address.portno != 443) {
         return address;
     }
-    LOG_DEBUG(Network, "Host redirect: 127.0.0.1:443 -> {}", SockAddrToString(*config->server));
-    return *config->server;
+    SockAddrIn target = *config->server;
+    if (inet6 && target.family == Domain::INET) {
+        // The socket stays INET6, so it connects to the server's v4-mapped address.
+        target.family = Domain::INET6;
+        target.ip6 = mapped_loopback;
+        std::copy(target.ip.begin(), target.ip.end(), target.ip6.begin() + 12);
+        target.ip = {};
+    }
+    LOG_DEBUG(Network, "Host redirect: {} -> {}", SockAddrToString(address),
+              SockAddrToString(target));
+    return target;
 }
 
 bool Allowed(const SockAddrIn& address) {

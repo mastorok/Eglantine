@@ -15,6 +15,7 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 // TODO: find out which don't require stable iters
@@ -51,6 +52,7 @@
 #include "video_core/texture_cache/sampled_views.h"
 #include "video_core/texture_cache/stale_pages.h"
 #include "video_core/texture_cache/types.h"
+#include "video_core/texture_cache/util.h"
 #include "video_core/texture_cache/writeback_ranges.h"
 #include "video_core/textures/texture.h"
 #include "video_core/textures/unswizzle_worker.h"
@@ -72,6 +74,15 @@ struct ImageViewInOut {
     u32 index{};
     bool blacklist{};
     ImageViewId id{};
+};
+
+/// A compute dispatch's texture and sampler pools, as its engine held them.
+struct ComputePools {
+    GPUVAddr tic{};
+    u32 tic_limit{};
+    GPUVAddr tsc{};
+    u32 tsc_limit{};
+    bool linked_tsc{};
 };
 
 /// A texture handle word a draw read, and where.
@@ -141,6 +152,8 @@ public:
 
 template <class P>
 class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelInfo> {
+    friend struct TextureCacheTestAccess;
+
     /// Address shift for caching images into a hash table
     static constexpr u64 LICHII_PAGEBITS = 20;
 
@@ -401,6 +414,8 @@ public:
 
     /// Refresh the state for graphics/compute image view and sampler descriptors
     void SynchronizeDescriptors(bool compute);
+    /// The compute half from pools given by value (GPURender playing an unlent dispatch).
+    void SynchronizeComputeDescriptors(const ComputePools& pools);
 
     /// Updates the Render Targets if they can be rescaled
     /// @retval True if the Render Targets have been rescaled.
@@ -493,6 +508,8 @@ public:
     /// Whether CommitAsyncFlushes would commit anything (downloads or their buffers).
     [[nodiscard]] bool HasAsyncFlushWork() const noexcept;
 
+    [[nodiscard]] bool RenderTargetsDirty() const noexcept;
+
     /// Return true when the caller should wait for async downloads
     [[nodiscard]] bool ShouldWaitAsyncFlushes() const noexcept;
 
@@ -566,8 +583,8 @@ private:
 
     void OnGPUASRegister(size_t map_id) final override;
 
-    /// Runs the Garbage Collector.
-    void RunGarbageCollector(bool out_of_memory);
+    /// Runs the Garbage Collector; at_critical collects as if usage were at the critical threshold.
+    void RunGarbageCollector(bool out_of_memory, bool at_critical);
 
     /// Find or create an image view in the guest descriptor table
     ImageViewId VisitImageView(u32 index, bool compute);
@@ -579,21 +596,23 @@ private:
     [[nodiscard]] bool IsDownloadable(const ImageBase& image) const noexcept;
 
     void RefreshContents(Image& image, ImageId image_id);
+    void NoteHostOutOfMemory(std::string_view operation, const ImageBase& image);
 
     /// Upload data from guest to an image
     template <typename StagingBuffer>
     void UploadImageContents(Image& image, StagingBuffer& staging_buffer);
 
     /// Create a new image view from a guest descriptor
-    [[nodiscard]] ImageViewId CreateImageView(const TICEntry& config);
+    [[nodiscard]] ImageViewId CreateImageView(const TICEntry& config, bool& retry);
 
     /// Find or create an image from the given parameters
     [[nodiscard]] ImageId FindOrInsertImage(const ImageInfo& info, GPUVAddr gpu_addr,
-                                            RelaxedOptions options = RelaxedOptions{});
+                                            RelaxedOptions options = RelaxedOptions{},
+                                            bool* retry = nullptr);
 
     /// Find an image from the given parameters
     [[nodiscard]] ImageId FindImage(const ImageInfo& info, GPUVAddr gpu_addr,
-                                    RelaxedOptions options);
+                                    RelaxedOptions options, bool* retry = nullptr);
 
     /// Create an image from the given parameters
     [[nodiscard]] ImageId InsertImage(const ImageInfo& info, GPUVAddr gpu_addr,
@@ -618,6 +637,9 @@ private:
 
     /// Find or create an image view for the depth buffer
     [[nodiscard]] ImageViewId FindDepthBuffer();
+
+    [[nodiscard]] bool UsePaddedTargetWidths() const;
+    void ClipPaddedTarget(ImageInfo& info) const;
 
     /// Find or create a view for a render target with the given image parameters
     [[nodiscard]] ImageViewId FindRenderTargetView(const ImageInfo& info, GPUVAddr gpu_addr);
@@ -659,6 +681,7 @@ private:
 
     /// Remove image views references from the cache
     void RemoveImageViewReferences(std::span<const ImageViewId> removed_views);
+    void InvalidateXc2LutViews(ImageBase& image);
 
     /// Per image view, the (channel, descriptor) entries of the channels' image_views maps that
     /// point to it. Deleting an image erased them by scanning every map (title 1: ~5,000 entries,
@@ -814,6 +837,7 @@ private:
     [[nodiscard]] static bool OverlapWritebacksEnabled();
     u64 join_writeback_reuses{};
     void WriteBackBadOverlaps(ImageId new_image_id);
+    [[nodiscard]] bool GobViewBytesReady(DAddr cpu_addr, size_t size);
     /// Collector write-backs waiting for the GPU: written to guest
     /// memory once their command buffer is done, except bytes the guest writes first; dropped if
     /// the memory is unmapped first. Their pages stay write-tracked meanwhile.
@@ -834,6 +858,7 @@ private:
         u64 tick{};
         /// The image's address space: gpu_addr is in it, whichever channel is bound on landing.
         size_t address_space{};
+        bool gob_view{};
     };
     std::deque<AsyncOverlapDownload> async_overlap_downloads;
     /// The GPU memory of an address space the cache has seen, or null.
@@ -910,6 +935,7 @@ private:
     bool is_rescaling = false;
     /// The bound depth target is wider than tall by padding only (see FindDepthBuffer).
     bool depth_target_padded = false;
+    RenderTargetClip render_target_clip;
     u64 total_used_memory = 0;
     u64 minimum_memory;
     u64 expected_memory;
@@ -969,6 +995,21 @@ private:
     std::deque<GpuSentencedImage> gpu_sentenced_images;
     u64 gpu_sentenced_bytes{};
 
+    /// Queued downloads can land before later GPU work using the image completes.
+    struct RetainedImageKeeper {
+        u64 tick;
+        std::shared_ptr<Image> image;
+    };
+    std::deque<RetainedImageKeeper> retained_image_keepers;
+    struct FreeGuardStats {
+        u64 retained_held{};
+        u64 landed_early{};
+        u64 freed_early{};
+        u64 unswizzle_dropped{};
+        u64 logged_total{};
+    };
+    FreeGuardStats free_guard{};
+
     /// Bytes of images per device memory block, for the collector (refreshed every 60 frames).
     std::unordered_map<u64, u64> block_image_bytes;
     u64 block_image_bytes_frame{~0ULL};
@@ -979,6 +1020,9 @@ private:
 
     Common::ScratchBuffer<u8> swizzle_data_buffer;
     Common::ScratchBuffer<u8> unswizzle_data_buffer;
+    u64 host_oom_retry_frame{};
+    u64 host_oom_failures{};
+    std::chrono::steady_clock::time_point host_oom_log_time{};
     /// What the last CPU upload spent touching, reading and untiling guest memory, for
     /// EDEN_NX2_TC_TRACE.
     struct {
@@ -998,7 +1042,7 @@ private:
     std::vector<std::pair<DAddr, u64>> uploaded_ranges;
 
     std::deque<PendingUnswizzle> unswizzle_queue;
-    u8 current_unswizzle_frame;
+    u8 current_unswizzle_frame{};
     std::vector<std::unique_ptr<AsyncVolumeJob>> async_volume_jobs;
 
     // Join caching

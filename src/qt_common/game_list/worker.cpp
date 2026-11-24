@@ -31,6 +31,7 @@
 #include "core/file_sys/registered_cache.h"
 #include "core/file_sys/submission_package.h"
 #include "core/loader/loader.h"
+#include "core/loader/nca.h"
 #include "core/loader/nx.h"
 
 #include "qt_common/config/uisettings.h"
@@ -296,19 +297,15 @@ QList<QStandardItem*> MakeGameListEntry(const std::string& path, const std::stri
             return FormatPatchNameVersions(patch, loader, loader.IsRomFSUpdatable());
         });
 
-    FileSys::NACP nacp{};
+    std::string version;
     // An NX tree snapshot, like a NUP, is already the updated game: no patch manager update.
     if ((file_type == Loader::FileType::NUP ||
          (file_type == Loader::FileType::NX && !loader.IsRomFSUpdatable())) &&
-        loader.ReadControlData(nacp) == Loader::ResultStatus::Success) {
-        const std::string version_string = nacp.GetVersionString();
-        if (!version_string.empty()) {
-            if (!patch_versions.isEmpty()) {
-                patch_versions += QLatin1Char('\n');
-            }
-            patch_versions += QStringLiteral("Update (%1)").arg(
-                QString::fromStdString(version_string));
+        loader.ReadDisplayVersion(version) == Loader::ResultStatus::Success && !version.empty()) {
+        if (!patch_versions.isEmpty()) {
+            patch_versions += QLatin1Char('\n');
         }
+        patch_versions += QStringLiteral("Update (%1)").arg(QString::fromStdString(version));
     }
 
     u64 play_time = play_time_manager.GetPlayTime(program_id);
@@ -527,7 +524,14 @@ void GameListWorker::ScanFileSystem(ScanTarget target, const std::vector<std::fi
             std::vector<u64> program_ids;
             loader->ReadProgramIds(program_ids);
 
-            const auto addEntry = [this, physical_name,
+            const bool title_container =
+                file_type == Loader::FileType::XCI || file_type == Loader::FileType::XCZ ||
+                file_type == Loader::FileType::NSP || file_type == Loader::FileType::NSZ;
+            const bool can_forward =
+                (!title_container || !program_ids.empty()) &&
+                (file_type != Loader::FileType::NCA ||
+                 Loader::AppLoader_NCA::IdentifyType(file) == Loader::FileType::NCA);
+            const auto addEntry = [this, physical_name, can_forward,
                                    parent_dir](std::unique_ptr<Loader::AppLoader>& app_loader,
                                                const u64 id) {
                 std::vector<u8> icon;
@@ -572,19 +576,19 @@ void GameListWorker::ScanFileSystem(ScanTarget target, const std::vector<std::fi
                 RecordEvent([=](GameListModel* model) {
                     model->AddEntry(pending->Release(), parent_dir);
                 });
+                if (can_forward && id != 0) {
+                    application_paths.try_emplace(id, physical_name);
+                }
             };
 
-            if (res2 == Loader::ResultStatus::Success && program_ids.size() > 1 &&
-                (file_type == Loader::FileType::XCI || file_type == Loader::FileType::XCZ ||
-                 file_type == Loader::FileType::NSP || file_type == Loader::FileType::NSZ)) {
+            if (title_container && !program_ids.empty() &&
+                (program_ids.size() > 1 || res2 != Loader::ResultStatus::Success ||
+                 program_ids.front() != program_id)) {
                 for (const auto id : program_ids) {
-                    // dravee suggested this, only viable way to
-                    // not show sub-games in qlaunch for now.
-                    if ((id & 0xFFF) != 0) {
-                        continue;
-                    }
                     loader = Loader::GetLoader(system, file, id);
-                    if (!loader) {
+                    u64 resolved{};
+                    if (!loader || loader->ReadProgramId(resolved) != Loader::ResultStatus::Success ||
+                        resolved != id) {
                         continue;
                     }
 
@@ -675,7 +679,14 @@ void GameListWorker::run() {
              std::chrono::duration_cast<std::chrono::milliseconds>(
                  std::chrono::steady_clock::now() - started).count(),
              watch_list.size(), stop_requested.load());
-    RecordEvent([this](GameListModel* model) { model->DonePopulating(watch_list); });
+    if (!stop_requested) {
+        RecordEvent([this, paths = std::move(application_paths)](GameListModel* model) mutable {
+            if (!stop_requested) {
+                provider->ReplaceApplicationPaths(std::move(paths));
+                model->DonePopulating(watch_list);
+            }
+        });
+    }
 
     // Loose dump folders are sized once the list is shown: walking their RomFS during discovery
     // made the list slow to appear. A reload stops this through stop_requested.

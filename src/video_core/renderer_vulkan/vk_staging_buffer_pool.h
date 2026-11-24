@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "common/common_types.h"
+#include "video_core/buffer_cache/command_arena.h"
 
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -33,8 +34,12 @@ class StagingBufferPool {
 public:
     static constexpr size_t NUM_SYNCS = 16;
 
+    /// clock: the buffer side's pool (EDEN_NX2_BUFFER_ARENA) tags its memory with the arena's
+    /// stamps instead of scheduler ticks. Two pools share one stream buffer's size (divisor 2).
     explicit StagingBufferPool(const Device& device, MemoryAllocator& memory_allocator,
-                               Scheduler& scheduler);
+                               Scheduler& scheduler,
+                               const VideoCommon::ArenaClock* clock = nullptr,
+                               u32 stream_divisor = 1);
     ~StagingBufferPool();
 
     StagingBufferRef Request(size_t size, MemoryUsage usage, bool deferred = false);
@@ -113,6 +118,9 @@ private:
     void ReleaseIdleBuffers();
 
     void ReleaseLevel(StagingBuffersCache& cache, size_t log2);
+    [[nodiscard]] u64 Now() const noexcept;
+    [[nodiscard]] bool IsFree(u64 tick) const noexcept;
+
     size_t Region(size_t iter) const noexcept {
         return iter / region_size;
     }
@@ -120,6 +128,7 @@ private:
     const Device& device;
     MemoryAllocator& memory_allocator;
     Scheduler& scheduler;
+    const VideoCommon::ArenaClock* clock;
 
     vk::Buffer stream_buffer;
     VkDeviceAddress stream_buffer_address{};

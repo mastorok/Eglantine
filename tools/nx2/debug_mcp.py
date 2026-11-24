@@ -270,6 +270,13 @@ TOOLS = [
         "inputSchema": {"type": "object", "properties": {"stats": {"type": "boolean"}}},
     },
     {
+        "name": "render_follower",
+        "description": "With EDEN_NX2_RENDER_FOLLOWER=1, stops (on: false) or resumes (on: true) "
+                       "posting draws to GPURender, to time one scene both ways. Returns the "
+                       "previous and current state.",
+        "inputSchema": {"type": "object", "properties": {"on": {"type": "boolean"}}},
+    },
+    {
         "name": "trace_record",
         "description": "Records a GPU trace (docs/nx2/gpu-trace.md): from the next GPU command "
                        "boundary, a snapshot then every submit, CPU memory write, map and present "

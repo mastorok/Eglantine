@@ -50,6 +50,27 @@ TEST_CASE("NPDM reads its kernel capabilities", "[core][file_sys]") {
     REQUIRE(npdm.GetKernelCapabilities() == std::vector<u32>{0x41414141, 0x41414141});
 }
 
+TEST_CASE("Reloading NPDM uses the selected executable's platform and keeps its title ID",
+          "[core][file_sys][npdm-identity]") {
+    auto bytes = MakeNpdm(8)->ReadAllBytes();
+    bytes.insert(bytes.begin() + 0x300, 0x100, u8{0});
+    Put32(bytes, 0x70, 0x500);
+    Put32(bytes, 0x7C, 0x340);
+    Put32(bytes, 0x420, 0x340);
+    constexpr u64 ProgramId = 0x0400ABCD00010001ULL;
+    std::memcpy(bytes.data() + 0x510, &ProgramId, sizeof(ProgramId));
+    const auto native = std::make_shared<VectorVfsFile>(std::move(bytes), "main.npdm");
+
+    ProgramMetadata npdm;
+    REQUIRE(npdm.Load(native) == Loader::ResultStatus::Success);
+    REQUIRE(npdm.IsSwitch2());
+    REQUIRE(npdm.Reload(MakeNpdm(8)) == Loader::ResultStatus::Success);
+    CHECK_FALSE(npdm.IsSwitch2());
+    CHECK(npdm.GetTitleID() == ProgramId);
+    REQUIRE(npdm.Reload(native) == Loader::ResultStatus::Success);
+    CHECK(npdm.IsSwitch2());
+}
+
 TEST_CASE("NPDM reads only whole kernel capability words", "[core][file_sys]") {
     // Five bytes used to be read into a one-word vector, one byte past its end.
     ProgramMetadata npdm;

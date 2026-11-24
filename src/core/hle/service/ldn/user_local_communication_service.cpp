@@ -108,10 +108,13 @@ Result IUserLocalCommunicationService::GetIpv4Address(Out<Ipv4Address> out_curre
     *out_current_address = {Network::TranslateIPv4(network_interface->ip_address)};
     *out_subnet_mask = {Network::TranslateIPv4(network_interface->subnet_mask)};
 
-    // When LDN goes through a joined room, spoof the hosts IP address
+    // When LDN goes through a joined room, spoof the hosts IP address. The mask must match the
+    // room's /24 too: the room relays only x.x.x.255 as a broadcast, and a VPN adapter's /32 mask
+    // would point the game's broadcasts at its own address.
     if (auto room_member = Network::GetRoomMember().lock();
         room_member && room_member->IsConnected() && !lan_discovery.IsDirectLan()) {
         *out_current_address = room_member->GetFakeIpAddress();
+        *out_subnet_mask = {255, 255, 255, 0};
     }
 
     std::reverse(std::begin(*out_current_address), std::end(*out_current_address)); // ntohl

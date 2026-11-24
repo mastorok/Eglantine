@@ -752,9 +752,10 @@ float2 SMAAColorEdgeDetectionPS(float2 texcoord,
     // We do the usual threshold:
     float2 edges = step(threshold, delta.xy);
 
-    // Then discard if there is no edge:
+    // Then write no edge if there is none (upstream SMAA discards here, for a target cleared
+    // every frame; the Vulkan renderer loads its edges image instead):
     if (dot(edges, float2(1.0, 1.0)) == 0.0)
-        discard;
+        return float2(0.0, 0.0);
 
     // Calculate right and bottom deltas:
     float3 Cright = SMAASamplePoint(colorTex, offset[1].xy).rgb;

@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2026 Lichii contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
+#include <array>
 #include <cstring>
 #include <memory>
 #include <optional>
@@ -26,6 +28,8 @@
 #include "core/hle/kernel/kernel.h"
 #include "core/hle/service/am/am_types.h"
 #include "core/hle/service/am/process_creation.h"
+#include "core/hle/service/ns/application_manager_interface.h"
+#include "core/hle/service/ns/game_list_applications.h"
 #include "core/hle/service/os/process.h"
 #include "core/loader/deconstructed_rom_directory.h"
 #include "tests/core/system_test_context.h"
@@ -199,6 +203,65 @@ TEST_CASE("An installed Switch 2 update is detected without its base RomFS",
     system.RegisterContentProvider(FileSys::ContentProviderUnionSlot::FrontendManual, &installed);
 
     CHECK(Service::AM::IsSwitch2Application(system, Title) == switch2_update);
+}
+
+TEST_CASE("The HOME Menu lists game list applications next to installed ones",
+          "[core][ns][home_menu]") {
+    ScopedSystemTestContext environment;
+    Core::System system;
+    REQUIRE(system.Initialize());
+    std::optional<Kernel::KThread> thread;
+    thread.emplace(system.Kernel());
+    REQUIRE(Kernel::KThread::InitializeDummyThread(system, &*thread, nullptr).IsSuccess());
+    system.Kernel().SetCurrentEmuThread(&*thread);
+    system.Kernel().Initialize();
+
+    constexpr u64 Installed = 0x0100152000022000ULL;
+    constexpr u64 InstalledSubProgram = 0x0100152000022001ULL;
+    constexpr u64 Switch2Game = 0x0400C3F00006E000ULL;
+    constexpr u64 Switch2Edition = 0x04004D300C5AE001ULL;
+
+    FileSys::ManualContentProvider provider;
+    const auto file = std::make_shared<FileSys::VectorVfsFile>();
+    provider.AddEntry(FileSys::TitleType::Application, FileSys::ContentRecordType::Program,
+                      Installed, file);
+    provider.AddEntry(FileSys::TitleType::Application, FileSys::ContentRecordType::Program,
+                      InstalledSubProgram, file);
+    provider.ReplaceApplicationPaths({{Installed, "installed.nsp"},
+                                      {Switch2Game, "first.nup"},
+                                      {Switch2Edition, "edition.nx"}});
+    system.SetContentProvider(std::make_unique<FileSys::ContentProviderUnion>());
+    system.RegisterContentProvider(FileSys::ContentProviderUnionSlot::FrontendManual, &provider);
+
+    CHECK(Service::NS::GetGameListApplicationPath(system, Switch2Game) == "first.nup");
+    CHECK_FALSE(Service::NS::GetGameListApplicationPath(system, 0x0400000000000000ULL));
+
+    std::vector<u64> listed;
+    {
+        Service::NS::IApplicationManagerInterface ns{system};
+        std::array<Service::NS::ApplicationRecord, 8> records{};
+        s32 count{};
+        REQUIRE(ns.ListApplicationRecord(std::span<Service::NS::ApplicationRecord>{records}, &count, 0).IsSuccess());
+        for (s32 i = 0; i < count; ++i) {
+            listed.push_back(records[i].application_id);
+        }
+    }
+    std::ranges::sort(listed);
+    CHECK(listed == std::vector<u64>{Installed, Switch2Edition, Switch2Game});
+
+    FileSys::GameListApplicationPaths next_scan{{Switch2Edition, "moved.nx"}};
+    provider.ClearAllEntries();
+    CHECK(Service::NS::GetGameListApplicationPath(system, Switch2Game) == "first.nup");
+    CHECK(Service::NS::GetGameListApplicationPath(system, Switch2Edition) == "edition.nx");
+    provider.ReplaceApplicationPaths(std::move(next_scan));
+    CHECK_FALSE(Service::NS::GetGameListApplicationPath(system, Switch2Game));
+    CHECK(Service::NS::GetGameListApplicationPath(system, Switch2Edition) == "moved.nx");
+
+    system.CoreTiming().ClearPendingEvents();
+    system.ShutdownMainProcess();
+    system.Kernel().SetCurrentEmuThread(nullptr);
+    system.Kernel().UnregisterKernelObject(&*thread);
+    thread.reset();
 }
 
 TEST_CASE("The native HOME executable ignores a conflicting shared update",

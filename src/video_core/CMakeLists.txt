@@ -15,6 +15,7 @@ endif()
 add_library(video_core STATIC
     buffer_cache/buffer_base.h
     buffer_cache/buffer_cache_base.h
+    buffer_cache/command_arena.h
     buffer_cache/buffer_cache.cpp
     buffer_cache/buffer_cache.h
     buffer_cache/compute_write_grid.h
@@ -139,6 +140,8 @@ add_library(video_core STATIC
     nx2_back_idle_trace.h
     nx2_list_macro_trace.cpp
     nx2_list_macro_trace.h
+    nx2_mme_capture.cpp
+    nx2_mme_capture.h
     nx2_cmdpage_diag.h
     nx2_debug_control.cpp
     nx2_debug_control.h
@@ -148,6 +151,8 @@ add_library(video_core STATIC
     nx2_list_indirect_stats.h
     nx2_owed_words.h
     nx2_profile.h
+    nx2_render_view.cpp
+    nx2_render_view.h
     nx2_stutter_trace.cpp
     nx2_stutter_trace.h
     nx2_perf.h
@@ -225,8 +230,11 @@ add_library(video_core STATIC
     renderer_vulkan/vk_blit_screen.cpp
     renderer_vulkan/vk_blit_screen.h
     renderer_vulkan/vk_buffer_cache_base.cpp
+    renderer_vulkan/vk_buffer_arena.cpp
+    renderer_vulkan/vk_buffer_arena.h
     renderer_vulkan/vk_buffer_cache.cpp
     renderer_vulkan/vk_buffer_cache.h
+    renderer_vulkan/vk_texel_buffer_range.h
     renderer_vulkan/vk_command_pool.cpp
     renderer_vulkan/vk_command_pool.h
     renderer_vulkan/vk_compute_pass.cpp
@@ -236,6 +244,7 @@ add_library(video_core STATIC
     renderer_vulkan/vk_fsr4_upscaler.cpp
     renderer_vulkan/vk_fsr4_upscaler.h
     vulkan_common/descriptor_limits.h
+    vulkan_common/device_buffer_pool.h
     vulkan_common/ffx_files.h
     vulkan_common/ffx_runtime.cpp
     vulkan_common/ffx_runtime.h
@@ -279,6 +288,8 @@ add_library(video_core STATIC
     renderer_vulkan/upload_batch.h
     renderer_vulkan/vk_render_pass_cache.cpp
     renderer_vulkan/vk_render_pass_cache.h
+    renderer_vulkan/vk_render_view.cpp
+    renderer_vulkan/vk_render_view.h
     renderer_vulkan/vk_resource_pool.cpp
     renderer_vulkan/vk_resource_pool.h
     renderer_vulkan/frame_pacer.h
@@ -419,8 +430,8 @@ if (ENABLE_LSFG)
         frame_gen/lsfg_translate.h
         renderer_vulkan/present/frame_gen.cpp
         renderer_vulkan/present/frame_gen.h
-        renderer_vulkan/present/fsr3_frame_gen.cpp
-        renderer_vulkan/present/fsr3_frame_gen.h
+        renderer_vulkan/present/optical_flow_frame_gen.cpp
+        renderer_vulkan/present/optical_flow_frame_gen.h
         renderer_vulkan/present/frame_gen_pacer.cpp
         renderer_vulkan/present/frame_gen_pacer.h
         renderer_vulkan/present/lsfg_alpha.cpp
@@ -717,6 +728,35 @@ if (ENABLE_NVIDIA_DLSS)
     target_link_libraries(video_core PRIVATE version wintrust crypt32)
     target_compile_definitions(video_core PUBLIC EGLANTINE_STREAMLINE)
     message(STATUS "NVIDIA DLSS through Streamline: ${STREAMLINE_INCLUDE_DIR}")
+endif()
+
+# FlyHigh frame generation (renderer_vulkan/present/flyhigh_frame_gen.cpp): a neural network in its
+# own Apache-2.0 library, flyhigh.dll, loaded at run time from beside the
+# executable. Only its C header is compiled in; the model (CC BY-NC 4.0) is not shipped.
+cmake_dependent_option(ENABLE_FLYHIGH "Enable FlyHigh frame generation" ON
+                       "ENABLE_LSFG;ARCHITECTURE_x86_64;WIN32" OFF)
+set(LICHII_FLYHIGH_SDK "" CACHE PATH
+    "FlyHigh engine release directory with include/, lib/, LICENSE and NOTICE (empty: download the release)")
+if (ENABLE_FLYHIGH)
+    if (LICHII_FLYHIGH_SDK)
+        set(FLYHIGH_DIR "${LICHII_FLYHIGH_SDK}")
+        cpmutil_register_package(flyhigh "https://github.com/getflyhigh/flyhigh-engine"
+                                 "local (${LICHII_FLYHIGH_SDK})")
+    else()
+        AddJsonPackage(NAME flyhigh-windows DOWNLOAD_ONLY)
+        set(FLYHIGH_DIR "${flyhigh-windows_SOURCE_DIR}")
+    endif()
+    set_property(TARGET video_core PROPERTY FLYHIGH_RUNTIME_DIR "${FLYHIGH_DIR}")
+    target_sources(video_core PRIVATE
+        frame_gen/flyhigh_library.cpp
+        frame_gen/flyhigh_library.h
+        frame_gen/flyhigh_model.h
+        renderer_vulkan/present/flyhigh_frame_gen.cpp
+        renderer_vulkan/present/flyhigh_frame_gen.h
+    )
+    target_include_directories(video_core PRIVATE "${FLYHIGH_DIR}/include")
+    target_compile_definitions(video_core PUBLIC HAS_FLYHIGH)
+    message(STATUS "FlyHigh frame generation: ${FLYHIGH_DIR}/lib/flyhigh.dll")
 endif()
 
 create_target_directory_groups(video_core)

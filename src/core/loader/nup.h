@@ -53,8 +53,12 @@ public:
     ResultStatus ReadIcon(std::vector<u8>& buffer) override;
     ResultStatus ReadTitle(std::string& title) override;
     ResultStatus ReadControlData(FileSys::NACP& control) override;
+    ResultStatus ReadDeveloper(std::string& developer) override;
+    ResultStatus ReadDisplayVersion(std::string& version) override;
     ResultStatus ReadNSOModules(Modules& modules) override;
     ResultStatus ReadMainBuildId(Core::System& system, std::array<u8, 0x20>& build_id) override;
+
+    std::optional<std::string> ReadContainerUpdateVersion() const;
 
 private:
     std::unique_ptr<FileSys::NupContainer> nup;
@@ -62,8 +66,11 @@ private:
 
     std::unique_ptr<FileSys::NACP> nacp_file;
     FileSys::VirtualFile icon_file;
+    std::optional<std::size_t> embedded_program_package;
     u64 base_title_id{};
+    u64 upgrade_program_id{};
     std::string display_title;
+    std::string display_publisher;
     std::string display_version;
     bool has_program{};
 };

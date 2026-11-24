@@ -23,6 +23,10 @@ The window is a `VK_EXT_headless_surface` surface (`WindowSystemType::Headless`)
 
 `eden-cli --gpu-trace-sample <trace>` writes a synthetic trace that needs no game: one Switch 2 channel whose four frames are two CPU-written images and two sets of 3D engine clears (whole and scissored). The unit tests read it back (`[gpu_trace]`).
 
+`eden-cli --gpu-trace-sample-draws <trace>` writes one that exercises the 3D draw path: four frames of 300 overlapping quads each (a third of them indexed) drawn by a minimal Switch 2 vertex and pixel program pair, with a constant buffer update before every draw, scissor, blend, color mask and viewport changes, and clears between them.
+
+`eden-cli --gpu-trace-sample-uploads <trace>` writes the same draws with new vertex and index data written before every eighth of a frame, so the buffer cache uploads between draws.
+
 ## Recording
 
 A recording starts at the GPU thread's next command boundary where no channel waits on a semaphore, and ends after a number of presents (180 by default: 3 s at 60 fps). Start it with:

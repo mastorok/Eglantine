@@ -36,6 +36,9 @@
 #include "lichii/configuration/configuration_shared.h"
 #include "lichii/configuration/configure_graphics.h"
 #include "lichii/configuration/amd_fsr4_panel.h"
+#ifdef HAS_FLYHIGH
+#include "lichii/configuration/flyhigh_panel.h"
+#endif
 #include "lichii/configuration/nvidia_dlss_panel.h"
 #include "lichii/configuration/shared_widget.h"
 
@@ -397,7 +400,25 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
             hold_graphics.emplace(setting->Id(), widget);
         } else if (setting->Id() == Settings::values.frame_gen_type.Id()) {
             frame_gen_type_combobox = widget->combobox;
+#ifdef HAS_FLYHIGH
+            // FlyHigh's library and model status, with a download button, under the type.
+            QWidget* group = new QWidget(this);
+            QVBoxLayout* group_layout = new QVBoxLayout(group);
+            group_layout->setContentsMargins(0, 0, 0, 0);
+            group_layout->setSpacing(2);
+            group_layout->addWidget(widget);
+            FlyHighPanel* panel = new FlyHighPanel(group);
+            group_layout->addWidget(panel);
+            const auto update_panel = [panel, combobox = widget->combobox] {
+                panel->setVisible(combobox->currentData().toUInt() ==
+                                  static_cast<u32>(Settings::FrameGenType::FlyHigh));
+            };
+            update_panel();
+            connect(widget->combobox, &QComboBox::currentIndexChanged, panel, update_panel);
+            hold_graphics.emplace(setting->Id(), group);
+#else
             hold_graphics.emplace(setting->Id(), widget);
+#endif
         } else {
             hold_graphics.emplace(setting->Id(), widget);
         }
@@ -409,18 +430,40 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
 
     // Hide rather than disable, a disabled widget would read as using the global value
     if (frame_gen_checkbox != nullptr) {
-        for (const u32 id : {Settings::values.frame_gen_type.Id(),
-                             Settings::values.frame_gen_multiplier.Id(),
-                             Settings::values.frame_gen_target_rate.Id(),
-                             Settings::values.frame_gen_flow_scale_auto.Id(),
-                             Settings::values.frame_gen_flow_scale.Id(),
-                             Settings::values.frame_gen_queue_target.Id()}) {
-            if (const auto it = hold_graphics.find(id); it != hold_graphics.end()) {
-                it->second->setVisible(frame_gen_checkbox->isChecked());
-                connect(frame_gen_checkbox, &QCheckBox::toggled, it->second, &QWidget::setVisible);
+        const auto chosen = [=](Settings::FrameGenType type) {
+            return frame_gen_type_combobox != nullptr &&
+                   frame_gen_type_combobox->currentData().toUInt() == static_cast<u32>(type);
+        };
+        const auto update_visible = [=] {
+            const bool on = frame_gen_checkbox->isChecked();
+            const bool flyhigh = chosen(Settings::FrameGenType::FlyHigh);
+            const std::array<std::pair<u32, bool>, 7> shown{{
+                {Settings::values.frame_gen_type.Id(), on},
+                {Settings::values.frame_gen_multiplier.Id(), on},
+                {Settings::values.frame_gen_target_rate.Id(), on},
+                {Settings::values.frame_gen_flow_scale_auto.Id(), on && !flyhigh},
+                {Settings::values.frame_gen_flow_scale.Id(), on && !flyhigh},
+                {Settings::values.frame_gen_queue_target.Id(), on},
+                {Settings::values.frame_gen_flyhigh_protect_hud.Id(), on && flyhigh},
+            }};
+            for (const auto& [id, visible] : shown) {
+                if (const auto it = hold_graphics.find(id); it != hold_graphics.end()) {
+                    it->second->setVisible(visible);
+                }
             }
+        };
+        update_visible();
+        connect(frame_gen_checkbox, &QCheckBox::toggled, this, update_visible);
+        if (frame_gen_type_combobox != nullptr) {
+            connect(frame_gen_type_combobox, &QComboBox::currentIndexChanged, this, update_visible);
         }
     }
+#ifndef HAS_FLYHIGH
+    if (frame_gen_type_combobox != nullptr) {
+        frame_gen_type_combobox->removeItem(frame_gen_type_combobox->findData(
+            static_cast<u32>(Settings::FrameGenType::FlyHigh)));
+    }
+#endif
 
 #ifdef EGLANTINE_STREAMLINE
     // The panel lists DLSS Frame Generation's files too while that frame generation type is

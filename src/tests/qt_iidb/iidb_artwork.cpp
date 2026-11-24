@@ -10,6 +10,7 @@
 #include <QBuffer>
 #include <QComboBox>
 #include <QDateTime>
+#include <QFile>
 #include <QImage>
 #include <QImageReader>
 #include <QImageWriter>
@@ -24,6 +25,7 @@
 #include <QNetworkReply>
 #include <QPointer>
 #include <QPushButton>
+#include <QScopeGuard>
 #include <QTabBar>
 #include <QTemporaryDir>
 #include <QTest>
@@ -213,6 +215,7 @@ private slots:
     void PickerStagesOnly();
     void LazyGalleryAndPageLimit();
 #ifdef IIDB_TEST_ARTWORK_FILES
+    void HomeMenuArtworkUsesExactIdAndRefreshes();
     void InstallWritesOnlyExactLocalId();
 #endif
 };
@@ -682,6 +685,59 @@ void ArtworkTest::InstallWritesOnlyExactLocalId() {
     QVERIFY(QtCommon::Game::ReadCustomArtwork(static_cast<u64>(RemoteParent)).empty());
     QVERIFY(!QtCommon::Game::SaveCustomArtwork(chosen_id, {}));
     QVERIFY(QtCommon::Game::ReadCustomArtwork(chosen_id) == saved);
+}
+
+void ArtworkTest::HomeMenuArtworkUsesExactIdAndRefreshes() {
+    using namespace QtCommon::Game;
+    const QTemporaryDir user;
+    QVERIFY(user.isValid());
+    const std::filesystem::path root(user.path().toStdU16String());
+    const auto previous = Common::FS::GetEdenPath(Common::FS::EdenPath::EdenDir);
+    const auto cleanup = qScopeGuard([&] {
+        ClearHomeMenuArtworkCache();
+        Common::FS::SetEdenPath(Common::FS::EdenPath::EdenDir, previous);
+    });
+    Common::FS::SetEdenPath(Common::FS::EdenPath::EdenDir, root);
+    QVERIFY(Common::FS::GetEdenPath(Common::FS::EdenPath::EdenDir) == root);
+    constexpr u64 edition_id = 0x04004D300C5AE001;
+    QImage artwork(48, 24, QImage::Format_RGB32);
+    artwork.fill(Qt::red);
+    QVERIFY(SaveCustomArtwork(edition_id, artwork));
+    const auto first = ReadHomeMenuArtwork(edition_id);
+    QVERIFY(!first.empty());
+    QVERIFY(first.size() <= 0x20000);
+    const auto decode = [](const std::vector<u8>& jpeg) {
+        return QImage::fromData(jpeg.data(), static_cast<int>(jpeg.size()), "JPEG");
+    };
+    const auto red = decode(first);
+    QCOMPARE(red.size(), QSize(256, 256));
+    QVERIFY(red.pixelColor(128, 128).red() > 240);
+    QVERIFY(ReadHomeMenuArtwork(edition_id) == first);
+    QVERIFY(ReadHomeMenuArtwork(edition_id - 1).empty());
+
+    artwork.fill(Qt::blue);
+    QVERIFY(SaveCustomArtwork(edition_id, artwork));
+    const auto second = ReadHomeMenuArtwork(edition_id);
+    const auto blue = decode(second);
+    QCOMPARE(blue.size(), QSize(256, 256));
+    QVERIFY(blue.pixelColor(128, 128).blue() > 240);
+
+    const auto path = CustomArtworkPath(edition_id);
+    const auto stamp = std::filesystem::last_write_time(path);
+    const auto file_size = std::filesystem::file_size(path);
+    QFile corrupt(QString::fromStdString(Common::FS::PathToUTF8String(path)));
+    QVERIFY(corrupt.open(QIODevice::WriteOnly | QIODevice::Truncate));
+    QVERIFY(corrupt.resize(static_cast<qint64>(file_size)));
+    corrupt.close();
+    std::filesystem::last_write_time(path, stamp);
+    QVERIFY(ReadHomeMenuArtwork(edition_id) == second);
+    ClearHomeMenuArtworkCache();
+    QVERIFY(ReadHomeMenuArtwork(edition_id).empty());
+
+    QVERIFY(SaveCustomArtwork(edition_id, artwork));
+    QVERIFY(!ReadHomeMenuArtwork(edition_id).empty());
+    QVERIFY(RemoveCustomArtwork(edition_id));
+    QVERIFY(ReadHomeMenuArtwork(edition_id).empty());
 }
 #endif
 

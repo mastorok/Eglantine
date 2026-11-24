@@ -179,7 +179,8 @@ u64 XCI::GetProgramTitleID() const {
 }
 
 std::vector<u64> XCI::GetProgramTitleIDs() const {
-    return secure_partition->GetProgramTitleIDs();
+    return secure_partition != nullptr ? secure_partition->GetApplicationProgramTitleIDs()
+                                       : std::vector<u64>{};
 }
 
 u32 XCI::GetSystemUpdateVersion() {

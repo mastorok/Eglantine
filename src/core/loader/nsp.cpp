@@ -203,8 +203,7 @@ ResultStatus AppLoader_NSP::ReadUpdateRaw(FileSys::VirtualFile& out_file) {
         return ResultStatus::ErrorNoPackedUpdate;
     }
 
-    const auto read = nsp->GetNCAFile(FileSys::GetUpdateTitleID(nsp->GetProgramTitleID()),
-                                      FileSys::ContentRecordType::Program);
+    const auto read = nsp->GetPackedUpdateFile(nsp->GetProgramTitleID());
 
     if (read == nullptr) {
         return ResultStatus::ErrorNoPackedUpdate;
@@ -228,7 +227,7 @@ ResultStatus AppLoader_NSP::ReadProgramId(u64& out_program_id) {
 }
 
 ResultStatus AppLoader_NSP::ReadProgramIds(std::vector<u64>& out_program_ids) {
-    out_program_ids = nsp->GetProgramTitleIDs();
+    out_program_ids = nsp->GetApplicationProgramTitleIDs();
     return ResultStatus::Success;
 }
 

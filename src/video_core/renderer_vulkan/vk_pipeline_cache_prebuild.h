@@ -174,6 +174,22 @@ public:
         return std::move(entry->pipeline);
     }
 
+    /// Returns nullopt while the job is pending, leaving it registered for a later lookup.
+    /// An engaged null pointer means the key is absent or its build did not succeed.
+    [[nodiscard]] std::optional<std::unique_ptr<Pipeline>> TryTakeReady(const Key& key) {
+        std::scoped_lock lock{mutex};
+        const auto it = entries.find(key);
+        if (it == entries.end()) {
+            return std::unique_ptr<Pipeline>{};
+        }
+        if (!it->second->job.Ready()) {
+            return std::nullopt;
+        }
+        auto pipeline = std::move(it->second->pipeline);
+        entries.erase(it);
+        return pipeline;
+    }
+
     /// Calls `done` once every build added so far was translated, on the thread that translated
     /// the last one, or now when none is left. Never once Stop() returned.
     void AfterTranslations(Common::UniqueFunction<void> done) {

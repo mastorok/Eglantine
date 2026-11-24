@@ -3,7 +3,6 @@
 
 #include <filesystem>
 #include <fstream>
-#include <random>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -12,8 +11,10 @@
 
 #include "common/fs/path_util.h"
 #include "common/hex_util.h"
+#include "common/scope_exit.h"
 #include "core/crypto/key_manager.h"
 #include "tests/common/restore_eden_path.h"
+#include "tests/common/temp_dir.h"
 
 namespace {
 
@@ -50,14 +51,7 @@ TEST_CASE("A console keyblob with a valid MAC is decrypted", "[core][crypto]") {
         SKIP("Keys are installed");
     }
 
-    // A folder this run creates itself (create_directory fails on one that exists), so another
-    // tests process never shares or removes it.
-    std::filesystem::path directory;
-    std::random_device random;
-    do {
-        directory = std::filesystem::temp_directory_path() /
-                    ("lichii-keyblob-mac-test-" + std::to_string(random()));
-    } while (!std::filesystem::create_directory(directory));
+    const Tests::TempDir directory{"lichii-keyblob-mac-test"};
     {
         std::ofstream file{directory / "prod.keys"};
         const auto line = [&file](std::string_view name, char digit) {
@@ -74,11 +68,15 @@ TEST_CASE("A console keyblob with a valid MAC is decrypted", "[core][crypto]") {
     }
 
     const auto previous = Common::FS::GetEdenPath(Common::FS::EdenPath::KeysDir);
-    Common::FS::SetEdenPath(Common::FS::EdenPath::KeysDir, directory);
-    keys.ReloadKeys();
-    keys.DeriveBase();
-    Tests::RestoreEdenPath(Common::FS::EdenPath::KeysDir, previous);
-    std::filesystem::remove_all(directory);
+    {
+        // KeysDir is back before the folder is removed, even if the reload throws.
+        SCOPE_EXIT {
+            Tests::RestoreEdenPath(Common::FS::EdenPath::KeysDir, previous);
+        };
+        Common::FS::SetEdenPath(Common::FS::EdenPath::KeysDir, directory.Path());
+        keys.ReloadKeys();
+        keys.DeriveBase();
+    }
 
     REQUIRE(keys.HasKey(S128KeyType::Package1, 0));
     CHECK(keys.GetKey(S128KeyType::Package1, 0) ==

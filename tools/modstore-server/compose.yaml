@@ -1,0 +1,32 @@
+services:
+  modstore:
+    build: .
+    image: lichii-modstore:local
+    ports:
+      - "127.0.0.1:8767:8767"
+    env_file:
+      - path: ${MODSTORE_ENV_FILE:-./.env.pi}
+        format: raw
+    volumes:
+      - type: bind
+        source: ${MODSTORE_HOST_DATA_DIR:-./data}
+        target: /data
+        bind:
+          create_host_path: false
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 192m
+    restart: unless-stopped
+    healthcheck:
+      test: [CMD, /modstore, health]
+      interval: 30s
+      timeout: 5s
+      start_period: 5s
+      retries: 3
+    logging:
+      options:
+        max-size: "1m"
+        max-file: "3"

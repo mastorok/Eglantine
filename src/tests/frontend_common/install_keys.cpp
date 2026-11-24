@@ -9,7 +9,7 @@
 #include "common/fs/path_util.h"
 #include "core/crypto/key_manager.h"
 #include "frontend_common/firmware_manager.h"
-#include "tests/common/restore_eden_path.h"
+#include "tests/common/restore_keys.h"
 
 namespace {
 
@@ -26,7 +26,8 @@ public:
     }
 
     ~KeysDirectory() {
-        Tests::RestoreEdenPath(Common::FS::EdenPath::KeysDir, original);
+        // The tests read keys from this folder into the KeyManager; forget them as well.
+        Tests::RestoreKeys(original);
         std::error_code error;
         std::filesystem::remove_all(root, error);
     }
@@ -108,4 +109,22 @@ TEST_CASE("A keys file line with a short value does not replace the key read bef
     // Stored as the rights ID's two halves; the line with half a rights ID is skipped too.
     CHECK(keys.GetKey(S128KeyType::Titlekey, 0, 0x0000000000000001ULL) == expected_title);
     CHECK_FALSE(keys.HasKey(S128KeyType::Titlekey, 0, 0));
+}
+
+TEST_CASE("A keys test leaves the key manager as it found it", "[frontend_common][install_keys]") {
+    using namespace Core::Crypto;
+    KeyManager& keys = KeyManager::Instance();
+    const bool had_header = keys.HasKey(S256KeyType::Header);
+    const Key256 header_before = keys.GetKey(S256KeyType::Header);
+    {
+        const KeysDirectory directory;
+        WriteFile(directory.keys / "prod.keys", fmt::format("header_key = {}\n",
+                                                            std::string(64, '3')).c_str());
+        keys.ReloadKeys();
+        Key256 loaded;
+        loaded.fill(0x33);
+        REQUIRE(keys.GetKey(S256KeyType::Header) == loaded);
+    }
+    CHECK(keys.HasKey(S256KeyType::Header) == had_header);
+    CHECK(keys.GetKey(S256KeyType::Header) == header_before);
 }

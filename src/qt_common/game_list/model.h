@@ -53,7 +53,7 @@ public:
 
     void PopulateAsync(QVector<UISettings::GameDir>& game_dirs);
     void WorkerEvent();
-    void SetScanEnabled(bool enabled);
+    void SetScanEnabled(bool enabled, bool stop_worker = true);
 
     bool IsEmpty() const;
 

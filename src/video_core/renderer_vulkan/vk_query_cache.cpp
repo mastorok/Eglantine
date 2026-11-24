@@ -1810,21 +1810,45 @@ void QueryCacheRuntime::SyncValues(std::span<SyncValuesType> values, VkBuffer ba
     }
 
     // Vulkan part.
-    std::scoped_lock lk(impl->buffer_cache.mutex);
-    impl->buffer_cache.BufferOperations([&] {
+    if (VideoCommon::GpuSplit::PlayingUnlent() && VideoCommon::GpuSplit::QuerySyncEnabled()) {
+        // EDEN_NX2_RENDER_QUERY_SYNC_E: outside a lent call, into the buffers the back obtained
+        // for this op (and outdated the read downloads of); the back's cache is not entered.
         impl->buffers_to_upload_to.clear();
-        for (auto& pair : impl->little_cache) {
-            static constexpr auto sync_info = VideoCommon::ObtainBufferSynchronize::FullSynchronize;
-            const auto post_op = VideoCommon::ObtainBufferOperation::DoNothing;
-            const auto [buffer, offset] = impl->buffer_cache.ObtainCPUBuffer(
-                pair.first, static_cast<u32>(pair.second - pair.first), sync_info, post_op);
-            impl->buffers_to_upload_to.emplace_back(buffer->Handle(), offset);
+        for (const auto& [begin, end] : impl->little_cache) {
+            const QuerySyncTarget* target = nullptr;
+            if (t_query_sync_targets != nullptr) {
+                for (const QuerySyncTarget& candidate : *t_query_sync_targets) {
+                    if (candidate.begin <= begin && end <= candidate.begin + candidate.bytes) {
+                        target = &candidate;
+                        break;
+                    }
+                }
+            }
+            if (target == nullptr) [[unlikely]] {
+                VideoCommon::GpuSplit::Get().NoteQuerySyncMissing();
+                return;
+            }
+            impl->buffers_to_upload_to.emplace_back(target->buffer,
+                                                    target->offset + (begin - target->begin));
         }
-    });
-    // The copies below are GPU writes the buffer cache doesn't record: reads taken before them
-    // must not keep the bytes they downloaded as the newest.
-    for (const auto& value : values) {
-        impl->buffer_cache.OutdateReadDownloads(value.address, value.size);
+    } else {
+        std::scoped_lock lk(impl->buffer_cache.mutex);
+        impl->buffer_cache.BufferOperations([&] {
+            impl->buffers_to_upload_to.clear();
+            for (auto& pair : impl->little_cache) {
+                static constexpr auto sync_info =
+                    VideoCommon::ObtainBufferSynchronize::FullSynchronize;
+                const auto post_op = VideoCommon::ObtainBufferOperation::DoNothing;
+                const auto [buffer, offset] = impl->buffer_cache.ObtainCPUBuffer(
+                    pair.first, static_cast<u32>(pair.second - pair.first), sync_info, post_op);
+                impl->buffers_to_upload_to.emplace_back(buffer->Handle(), offset);
+            }
+        });
+        // The copies below are GPU writes the buffer cache doesn't record: reads taken before
+        // them must not keep the bytes they downloaded as the newest.
+        for (const auto& value : values) {
+            impl->buffer_cache.OutdateReadDownloads(value.address, value.size);
+        }
     }
 
     VkBuffer src_buffer;

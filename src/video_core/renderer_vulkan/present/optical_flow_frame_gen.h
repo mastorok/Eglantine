@@ -17,22 +17,14 @@ namespace Vulkan {
 class Device;
 class Scheduler;
 
-/// AMD FidelityFX Super Resolution 3 (FSR 3) Frame Generation pipeline.
-/// Uses compute-based optical flow and bilateral frame interpolation
-/// to synthesize intermediate frames without requiring engine motion vectors.
-///
-/// Optimizations:
-///  - Quarter-resolution optical flow (16├ù fewer compute invocations)
-///  - Shared-memory tile caching in both shaders
-///  - Early-out for static pixels (skip diamond search)
-///  - Duplicate-frame detection (skip optical flow entirely)
-///  - Precise pipeline barriers instead of full-pipeline TransitionImageLayout
-///  - Descriptor-write caching (only update when image views change)
-class Fsr3FrameGen {
+/// Frame generation without engine motion vectors: coarse-to-fine block matching on a luma
+/// pyramid finds per-pixel motion between the last two frames (at half resolution, tracking camera
+/// pans up to 192 pixels per frame), and bilateral interpolation warps both frames along it.
+class OpticalFlowFrameGen {
 public:
-    explicit Fsr3FrameGen(const Device& device, MemoryAllocator& memory_allocator,
-                          VkExtent2D extent, VkFormat format);
-    ~Fsr3FrameGen();
+    explicit OpticalFlowFrameGen(const Device& device, MemoryAllocator& memory_allocator,
+                                 VkExtent2D extent, VkFormat format);
+    ~OpticalFlowFrameGen();
 
     void Process(const Device& device, Scheduler& scheduler, VkImage current_frame,
                  VkImageView current_view, u64 frame_count);
@@ -48,35 +40,54 @@ private:
     void CreateResources(const Device& device);
     void CreateShaders(const Device& device);
     void CreatePipelines(const Device& device);
+    void WriteFlowDescriptors(const Device& device);
+    void RecordFlow(vk::CommandBuffer cmdbuf, u32 parity, bool search) const;
+
+    static constexpr size_t FLOW_LEVELS = 5;
+
+    /// One pyramid level: luma of the two most recent frames (indexed by parity) and the motion
+    /// found at this level, in this level's pixels.
+    struct FlowLevel {
+        VkExtent2D extent{};
+        std::array<vk::Image, 2> luma;
+        std::array<vk::ImageView, 2> luma_view;
+        vk::Image motion;
+        vk::ImageView motion_view;
+    };
 
     MemoryAllocator& m_allocator;
     VkExtent2D m_extent;
-    VkExtent2D m_flow_extent;   // half-res for optical flow
     VkFormat m_format;
 
     vk::Sampler m_linear_sampler;
-    vk::ShaderModule m_flow_shader;
+    vk::ShaderModule m_downsample_shader;
+    vk::ShaderModule m_search_shader;
     vk::ShaderModule m_interp_shader;
 
-    vk::DescriptorSetLayout m_flow_desc_layout;
-    vk::PipelineLayout m_flow_pipe_layout;
-    vk::Pipeline m_flow_pipeline;
+    vk::DescriptorSetLayout m_downsample_desc_layout;
+    vk::PipelineLayout m_downsample_pipe_layout;
+    vk::Pipeline m_downsample_pipeline;
+
+    vk::DescriptorSetLayout m_search_desc_layout;
+    vk::PipelineLayout m_search_pipe_layout;
+    vk::Pipeline m_search_pipeline;
 
     vk::DescriptorSetLayout m_interp_desc_layout;
     vk::PipelineLayout m_interp_pipe_layout;
     vk::Pipeline m_interp_pipeline;
 
     vk::DescriptorPool m_desc_pool;
-    vk::DescriptorSets m_flow_desc_sets;
+    /// Indexed by parity * FLOW_LEVELS + level.
+    vk::DescriptorSets m_downsample_desc_sets;
+    vk::DescriptorSets m_search_desc_sets;
+    std::array<FlowLevel, FLOW_LEVELS> m_levels;
+    u32 m_parity{};
     std::optional<DescriptorPool> m_interp_pool;
     DescriptorAllocator m_interp_allocator;
 
     // History and motion vector images
     vk::Image m_history_image;
     vk::ImageView m_history_view;
-
-    vk::Image m_motion_image;
-    vk::ImageView m_motion_view;
 
     // Store the last current-frame view for descriptor caching
     vk::Image m_current_image;
@@ -88,8 +99,6 @@ private:
     // Duplicate-frame detection: skip optical flow when the frame hasn't changed
     u64 m_last_frame_count{};
     bool m_flow_valid{};
-
-    bool m_flow_descriptors_initialized{};
 };
 
 } // namespace Vulkan

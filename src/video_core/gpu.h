@@ -183,6 +183,8 @@ public:
 
     /// Tick pending requests within the GPU.
     void TickWork();
+    /// Whether TickWork has requests to run.
+    [[nodiscard]] bool HasSyncRequests();
 
     /// Gets a mutable reference to the Host1x interface
     [[nodiscard]] Host1x::Host1x& Host1x();
@@ -234,8 +236,10 @@ public:
 
     void RendererFrameEndNotify();
 
+    /// `on_composited` runs on the GPU thread once the renderer has composited these layers.
     void RequestComposite(std::vector<Tegra::FramebufferConfig>&& layers,
-                          std::vector<Service::Nvidia::NvFence>&& fences);
+                          std::vector<Service::Nvidia::NvFence>&& fences,
+                          std::function<void()> on_composited = {});
 
     void WaitForComposite();
 

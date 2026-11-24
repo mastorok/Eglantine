@@ -101,6 +101,7 @@ constexpr u64 READ_PROPERTIES_KEY{MakeCbufKey(~0U, 0)};
 // an empty descriptor now (a 2D texture). Records without it can hold a 1D type for the null
 // texture at handle 0 (issue #846).
 constexpr u64 NULL_TEXTURE_2D_KEY{MakeCbufKey(~0U, 1)};
+constexpr u64 HEADER_BYTE_OFFSET_RULE_KEY{MakeCbufKey(~0U, 2)};
 
 // The most values of a kind an environment of a record holds. Translation reads a few hundred at
 // most; a damaged count can't make a load allocate more than a few MB for them.
@@ -343,9 +344,9 @@ size_t GenericEnvironment::ReadSizeBytes() const noexcept {
 }
 
 bool GenericEnvironment::CanBeSerialized() const noexcept {
-    // The read properties and the null texture marker are two more constant buffer values.
+    // The read properties and the texture markers are three more constant buffer values.
     return !has_unbound_instructions &&
-           std::max({texture_types.size(), texture_pixel_formats.size(), cbuf_values.size() + 2,
+           std::max({texture_types.size(), texture_pixel_formats.size(), cbuf_values.size() + 3,
                      storage_pointer_types.size(), cbuf_replacements.size()}) <=
                MAX_RECORDED_VALUES;
 }
@@ -373,7 +374,7 @@ void GenericEnvironment::Serialize(std::ostream& file, u32 read_properties) cons
     const u64 code_size{static_cast<u64>(CachedSizeBytes())};
     const u64 num_texture_types{static_cast<u64>(texture_types.size())};
     const u64 num_texture_pixel_formats{static_cast<u64>(texture_pixel_formats.size())};
-    const u64 num_cbuf_values{static_cast<u64>(cbuf_values.size()) + 2};
+    const u64 num_cbuf_values{static_cast<u64>(cbuf_values.size()) + 3};
     const u64 num_storage_pointer_types{static_cast<u64>(storage_pointer_types.size())};
     const u64 num_cbuf_replacement_values{static_cast<u64>(cbuf_replacements.size())};
 
@@ -407,11 +408,14 @@ void GenericEnvironment::Serialize(std::ostream& file, u32 read_properties) cons
         file.write(reinterpret_cast<const char*>(&key), sizeof(key))
             .write(reinterpret_cast<const char*>(&type), sizeof(type));
     }
-    constexpr u32 null_texture_2d{1};
+    constexpr u32 marker_present{1};
     file.write(reinterpret_cast<const char*>(&READ_PROPERTIES_KEY), sizeof(READ_PROPERTIES_KEY))
         .write(reinterpret_cast<const char*>(&read_properties), sizeof(read_properties))
         .write(reinterpret_cast<const char*>(&NULL_TEXTURE_2D_KEY), sizeof(NULL_TEXTURE_2D_KEY))
-        .write(reinterpret_cast<const char*>(&null_texture_2d), sizeof(null_texture_2d));
+        .write(reinterpret_cast<const char*>(&marker_present), sizeof(marker_present))
+        .write(reinterpret_cast<const char*>(&HEADER_BYTE_OFFSET_RULE_KEY),
+               sizeof(HEADER_BYTE_OFFSET_RULE_KEY))
+        .write(reinterpret_cast<const char*>(&marker_present), sizeof(marker_present));
     for (const auto& [key, type] : storage_pointer_types) {
         file.write(reinterpret_cast<const char*>(&key), sizeof(key))
             .write(reinterpret_cast<const char*>(&type), sizeof(type));
@@ -473,8 +477,10 @@ std::optional<u64> GenericEnvironment::TryFindSize() {
 Tegra::Texture::TICEntry GenericEnvironment::ReadTextureInfo(GPUVAddr tic_addr, u32 tic_limit,
                                                              bool via_header_index, u32 raw) {
     const auto handle{Tegra::Texture::TexturePair(raw, via_header_index)};
-    const u32 index{Tegra::Texture::TextureHeaderIndex(handle.first, tic_limit,
-                                                       gpu_memory->UsesNativeTiling())};
+    const u32 index{Tegra::Texture::TextureHeaderIndex(
+        handle.first, tic_limit,
+        Tegra::Texture::UsesHeaderByteOffsetHandles(gpu_memory->UsesNativeTiling(),
+                                                   Settings::GetCurrentProgramID()))};
     Tegra::Texture::TICEntry entry;
     const auto null_2d_texture = [&entry] {
         entry.raw.fill(0);
@@ -1149,8 +1155,10 @@ Shader::TexturePixelFormat ComputeEnvironment::ReadTexturePixelFormat(u32 handle
     if (inserted && result == Shader::TexturePixelFormat::R16_FLOAT &&
         kepler_compute->IsNativeMode() && std::getenv("EDEN_NATIVE_DRAW_DIAGNOSTICS")) {
         const auto pair{Tegra::Texture::TexturePair(handle, qmd.linked_tsc != 0)};
-        const u32 index{Tegra::Texture::TextureHeaderIndex(pair.first, regs.tic.limit,
-                                                        gpu_memory->UsesNativeTiling())};
+        const u32 index{Tegra::Texture::TextureHeaderIndex(
+            pair.first, regs.tic.limit,
+            Tegra::Texture::UsesHeaderByteOffsetHandles(gpu_memory->UsesNativeTiling(),
+                                                       Settings::GetCurrentProgramID()))};
         const GPUVAddr tic_gpu{regs.tic.Address() + index * sizeof(entry)};
         const auto tic_device{gpu_memory->GpuToCpuAddress(tic_gpu)};
         const auto image_device{gpu_memory->GpuToCpuAddress(entry.Address())};
@@ -1287,6 +1295,20 @@ void FileEnvironment::Deserialize(std::istream& file, std::streampos end) {
             }
         }
     }
+    if (const auto it{cbuf_values.find(HEADER_BYTE_OFFSET_RULE_KEY)}; it != cbuf_values.end()) {
+        cbuf_values.erase(it);
+    } else if (HasNativeInstructions() && !Tegra::Texture::UsesHeaderByteOffsetHandles(
+                                            true, Settings::GetCurrentProgramID())) {
+        const auto ambiguous = [this](const auto& entry) {
+            if (entry.first == 0 || entry.first % 32 != 0) {
+                return false;
+            }
+            dropped_texture_handles.push_back(entry.first);
+            return true;
+        };
+        erase_if(texture_types, ambiguous);
+        erase_if(texture_pixel_formats, ambiguous);
+    }
     for (size_t i = 0; i < num_storage_pointer_types; ++i) {
         u64 key;
         u8 value;
@@ -1410,6 +1432,8 @@ Shader::TextureType FileEnvironment::ReadTextureType(u32 handle) {
             return guess->texture_type;
         }
         lacks_recorded_value = true;
+        lacks_dropped_value |= std::ranges::find(dropped_texture_handles, handle) !=
+                               dropped_texture_handles.end();
         throw Shader::LogicError("Uncached read texture type");
     }
     return it->second;
@@ -1424,6 +1448,8 @@ Shader::TexturePixelFormat FileEnvironment::ReadTexturePixelFormat(u32 handle) {
             return guess->pixel_format;
         }
         lacks_recorded_value = true;
+        lacks_dropped_value |= std::ranges::find(dropped_texture_handles, handle) !=
+                               dropped_texture_handles.end();
         throw Shader::LogicError("Uncached read texture pixel format");
     }
     return it->second;

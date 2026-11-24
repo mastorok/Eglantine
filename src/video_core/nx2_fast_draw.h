@@ -130,6 +130,51 @@ inline void NoteSync() {
     return g_sync_serial.load(std::memory_order_acquire);
 }
 
+/// Raised when memory may have changed without a delta record since a full resolve read the
+/// texture handles a delta draw keeps (NoteHandlesRead clears it): a guest CPU write to memory the
+/// GPU caches watch, or pages starting or ending being watched (writes to unwatched pages tell no
+/// one). Constant buffer data equal to memory stays out of the delta only while neither it nor the
+/// sync serial changed and no change is landing: memory could hold bytes that resolve never read
+/// (a CPU write A -> B followed by an upload of B) otherwise.
+alignas(64) inline std::atomic<bool> g_memory_changed{};
+/// Changes begun and not yet flagged: a write stores its bytes after BeginMemoryChange, and a
+/// clear between the two must not lose it.
+inline std::atomic<u32> g_changes_landing{};
+inline u64 g_handles_sync_serial{}; ///< SyncSerial at NoteHandlesRead (the thread that draws)
+
+/// Any thread, before a change EndMemoryChange flags (guest CPU writes, watched page changes).
+inline void BeginMemoryChange() {
+    g_changes_landing.fetch_add(1, std::memory_order_relaxed);
+    // Visible before the bytes: a comparison that finds them finds the change landing too.
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+}
+
+/// Once the change landed. `changed` false ends a BeginMemoryChange that changed nothing.
+inline void EndMemoryChange(bool changed = true) {
+    if (changed && !g_memory_changed.load(std::memory_order_relaxed)) {
+        g_memory_changed.store(true, std::memory_order_relaxed);
+    }
+    g_changes_landing.fetch_sub(1, std::memory_order_release);
+}
+
+/// The thread that draws, before a full resolve reads the pipeline's texture handles.
+inline void NoteHandlesRead() {
+    g_memory_changed.store(false, std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    g_handles_sync_serial = SyncSerial();
+}
+
+/// The thread that draws, after comparing data with memory: whether memory still holds what the
+/// last full resolve read, apart from writes the delta recorded, wherever writes notify (the
+/// caller checks that the pages are watched, after this). After a sync the guest may have
+/// written pages the caches don't watch.
+[[nodiscard]] inline bool HandleMemoryUnchanged() {
+    std::atomic_thread_fence(std::memory_order_acquire);
+    return g_changes_landing.load(std::memory_order_acquire) == 0 &&
+           !g_memory_changed.load(std::memory_order_relaxed) &&
+           g_sync_serial.load(std::memory_order_relaxed) == g_handles_sync_serial;
+}
+
 inline void Break(Reason reason, u32 method = 0) {
     // 3D methods that let the CPU synchronise (reports, syncpoints) note it where they reach the
     // rasterizer. Invalidations end image and shader lifetimes, not guest memory writes.

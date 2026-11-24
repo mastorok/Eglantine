@@ -242,6 +242,9 @@ public:
      * @returns True if the emulated system is powered on, otherwise false.
      */
     [[nodiscard]] bool IsPoweredOn() const;
+#ifdef HAS_HYPERVISOR
+    [[nodiscard]] bool IsHypervisorAllowedForLoad() const;
+#endif
 
     /// Prepare the core emulation for a reschedule
     void PrepareReschedule(u32 core_index);

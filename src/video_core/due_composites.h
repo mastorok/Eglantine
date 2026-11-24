@@ -4,7 +4,9 @@
 #pragma once
 
 #include <deque>
+#include <functional>
 #include <mutex>
+#include <utility>
 #include <vector>
 
 #include "video_core/framebuffer_config.h"
@@ -21,12 +23,13 @@ public:
 
     /// On the thread that reached the present's last fence. The owner composites what is due at
     /// once; another thread queues it and calls `hand_off`, which must have the owner call Run
-    /// without waiting for it.
+    /// without waiting for it. `done` runs on the owner once the present was composited.
     template <typename Composite, typename HandOff>
-    void Reached(const Layers& layers, bool owner, Composite&& composite, HandOff&& hand_off) {
+    void Reached(const Layers& layers, bool owner, Composite&& composite, HandOff&& hand_off,
+                 std::function<void()> done = {}) {
         {
             std::scoped_lock lk{mutex};
-            due.push_back(layers);
+            due.push_back({layers, std::move(done)});
         }
         if (owner) {
             Run(composite);
@@ -40,17 +43,25 @@ public:
     void Run(Composite&& composite) {
         std::unique_lock lk{mutex};
         while (!due.empty()) {
-            const Layers layers = std::move(due.front());
+            const Present present = std::move(due.front());
             due.pop_front();
             lk.unlock();
-            composite(layers);
+            composite(present.layers);
+            if (present.done) {
+                present.done();
+            }
             lk.lock();
         }
     }
 
 private:
+    struct Present {
+        Layers layers;
+        std::function<void()> done;
+    };
+
     std::mutex mutex;
-    std::deque<Layers> due;
+    std::deque<Present> due;
 };
 
 } // namespace VideoCommon

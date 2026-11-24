@@ -22,6 +22,7 @@
 #include "core/frontend/graphics_context.h"
 #include "video_core/capture.h"
 #include "video_core/gpu.h"
+#include "video_core/gpu_split.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/present.h"
 #include "video_core/render_trace.h"
@@ -276,10 +277,17 @@ try
 
 RendererVulkan::~RendererVulkan() {
     scheduler.RegisterOnSubmit([] {});
+#ifdef HAS_FLYHIGH
+    frame_gen.DrainFlyHighSubmissions();
+#endif
     void(device.GetLogical().WaitIdle());
 }
 
 void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebuffers) {
+    if (VideoCommon::GpuSplit::LendsToRender()) [[unlikely]] {
+        VideoCommon::GpuSplit::Get().LendRender([&] { Composite(framebuffers); });
+        return;
+    }
     const bool trace = Common::DkbFrameTrace::Enabled();
     const auto entered = trace ? std::chrono::steady_clock::now()
                                : std::chrono::steady_clock::time_point{};
@@ -532,6 +540,11 @@ void RendererVulkan::RenderScreenshot(std::span<const Tegra::FramebufferConfig> 
 }
 
 std::vector<u8> RendererVulkan::GetAppletCaptureBuffer() {
+    if (VideoCommon::GpuSplit::LendsToRender()) [[unlikely]] {
+        std::vector<u8> lent;
+        VideoCommon::GpuSplit::Get().LendRender([&] { lent = GetAppletCaptureBuffer(); });
+        return lent;
+    }
     using namespace VideoCore::Capture;
 
     std::vector<u8> out(VideoCore::Capture::TiledSize);

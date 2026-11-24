@@ -288,6 +288,9 @@ public:
                          std::array<f32, 2> motion_scale);
     std::unique_ptr<Fsr3Upscaler> fsr3_upscaler;
     bool fsr3_unsupported{};
+    /// The backend that last drew a DLSS replacement and why, so each change is logged once.
+    std::string_view last_upscale_backend;
+    std::string_view last_upscale_reason;
 
     /// The LOD bias Ocarina's FSR adds to mipmapped samplers this session (0 for other games or
     /// upscalers), resolved on first use.
@@ -839,13 +842,18 @@ private:
     const Device* device = nullptr;
     const SlotVector<Image>* slot_images = nullptr;
 
+    struct NullImages {
+        vk::Image one_dimensional;
+        vk::Image two_dimensional;
+    };
+    std::unique_ptr<NullImages> null_images;
     std::array<vk::ImageView, Shader::NUM_TEXTURE_TYPES> image_views;
     std::optional<StorageViews> storage_views;
     vk::ImageView typeless_storage_view;
     vk::ImageView depth_view;
     vk::ImageView stencil_view;
     vk::ImageView color_view;
-    vk::Image null_image;
+    std::optional<VideoCommon::SubresourceRange> compact_view_range;
     VkImage image_handle = VK_NULL_HANDLE;
     VkImageView render_target = VK_NULL_HANDLE;
     VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;

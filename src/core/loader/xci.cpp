@@ -136,8 +136,7 @@ ResultStatus AppLoader_XCI::ReadUpdateRaw(FileSys::VirtualFile& out_file) {
         return ResultStatus::ErrorXCIMissingProgramNCA;
     }
 
-    const auto read = xci->GetSecurePartitionNSP()->GetNCAFile(
-        FileSys::GetUpdateTitleID(program_id), FileSys::ContentRecordType::Program);
+    const auto read = xci->GetSecurePartitionNSP()->GetPackedUpdateFile(program_id);
     if (read == nullptr) {
         return ResultStatus::ErrorNoPackedUpdate;
     }

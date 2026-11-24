@@ -77,6 +77,8 @@ void ConfigureWeb::SetConfiguration() {
     VerifyLogin();
 
     ui->toggle_discordrpc->setChecked(UISettings::values.enable_discord_presence.GetValue());
+    ui->edit_mod_store_api_url->setText(
+        QString::fromStdString(UISettings::values.mod_store_api_url.GetValue()));
 }
 
 void ConfigureWeb::GenerateToken() {
@@ -94,6 +96,9 @@ void ConfigureWeb::GenerateToken() {
 
 void ConfigureWeb::ApplyConfiguration() {
     UISettings::values.enable_discord_presence = ui->toggle_discordrpc->isChecked();
+    auto& mod_store_api_url = UISettings::values.mod_store_api_url;
+    const auto url = ui->edit_mod_store_api_url->text().trimmed();
+    mod_store_api_url = url.isEmpty() ? mod_store_api_url.GetDefault() : url.toStdString();
     Settings::values.eden_username = ui->edit_username->text().toStdString();
     Settings::values.eden_token = ui->edit_token->text().toStdString();
 }

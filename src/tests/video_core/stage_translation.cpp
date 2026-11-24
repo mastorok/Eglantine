@@ -492,7 +492,7 @@ TEST_CASE("A texture descriptor pool's last byte is found without wrapping",
     CHECK(TexturePoolLastAddress(space_end - (u64{2} << 20), two_mib_limit) == space_end - 1);
 
     // One descriptor at address 0 ends at byte 31
-    CHECK(TexturePoolLastAddress(0, 0) == 31);
+    CHECK(TexturePoolLastAddress(0, 0) == 31U);
 
     // The last byte of the 64-bit range is reachable, one past it wraps
     CHECK(TexturePoolLastAddress(~u64{0} - 31, 0) == ~u64{0});

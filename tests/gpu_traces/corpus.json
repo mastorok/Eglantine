@@ -14,6 +14,143 @@
           "25534de13047d44ee06567c1d33ab1a0"
         ]
       }
+    },
+    {
+      "id": "draws",
+      "source": "generated",
+      "generator": "--gpu-trace-sample-draws",
+      "description": "eden-cli --gpu-trace-sample-draws: 300 direct draws a frame with constant buffer updates, blending, scissors, colour masks, viewports and clears between them",
+      "expected": {
+        "lavapipe": [
+          "469b24e54713a0d4fd14cce985dd58a0",
+          "7f9381d13e5a66125a504cd061155bef",
+          "c2ad0e067b62ebe6fceffac8444c32f3",
+          "ee2f3d785bab823201f8486fc967af61"
+        ]
+      }
+    },
+    {
+      "id": "draws-render-follower",
+      "source": "generated",
+      "generator": "--gpu-trace-sample-draws",
+      "environment": {
+        "EDEN_NX2_RENDER_FOLLOWER": "1"
+      },
+      "description": "The draws trace with the GPU render follower recording warm direct draws (EDEN_NX2_RENDER_FOLLOWER=1): the same frames as without it",
+      "expected": {
+        "lavapipe": [
+          "469b24e54713a0d4fd14cce985dd58a0",
+          "7f9381d13e5a66125a504cd061155bef",
+          "c2ad0e067b62ebe6fceffac8444c32f3",
+          "ee2f3d785bab823201f8486fc967af61"
+        ]
+      }
+    },
+    {
+      "id": "draws-buffer-arena",
+      "source": "generated",
+      "generator": "--gpu-trace-sample-draws",
+      "environment": {
+        "EDEN_NX2_BUFFER_ARENA": "1"
+      },
+      "description": "The draws trace with the buffer side's commands queued in the arena and played at the scheduler's next use (EDEN_NX2_BUFFER_ARENA=1): the same frames as without it",
+      "expected": {
+        "lavapipe": [
+          "469b24e54713a0d4fd14cce985dd58a0",
+          "7f9381d13e5a66125a504cd061155bef",
+          "c2ad0e067b62ebe6fceffac8444c32f3",
+          "ee2f3d785bab823201f8486fc967af61"
+        ]
+      }
+    },
+    {
+      "id": "uploads",
+      "source": "generated",
+      "generator": "--gpu-trace-sample-uploads",
+      "description": "eden-cli --gpu-trace-sample-uploads: the draws trace with new vertex and index data written before every eighth of a frame, so the buffer cache uploads between draws",
+      "expected": {
+        "lavapipe": [
+          "dd42c28cbf8b3c528a996bd19ff168bb",
+          "9b7159366a2c2327d893ef5eded50cc8",
+          "e5ccb3347abbdf23e1368538c0678c12",
+          "68c6c9baa2b53f9146b06cb6eaad8a5d"
+        ]
+      }
+    },
+    {
+      "id": "uploads-buffer-arena",
+      "source": "generated",
+      "generator": "--gpu-trace-sample-uploads",
+      "environment": {
+        "EDEN_NX2_BUFFER_ARENA": "1"
+      },
+      "description": "The uploads trace with the buffer arena (EDEN_NX2_BUFFER_ARENA=1): the same frames as without it",
+      "expected": {
+        "lavapipe": [
+          "dd42c28cbf8b3c528a996bd19ff168bb",
+          "9b7159366a2c2327d893ef5eded50cc8",
+          "e5ccb3347abbdf23e1368538c0678c12",
+          "68c6c9baa2b53f9146b06cb6eaad8a5d"
+        ]
+      }
+    },
+    {
+      "id": "uploads-buffer-arena-render-follower",
+      "source": "generated",
+      "generator": "--gpu-trace-sample-uploads",
+      "environment": {
+        "EDEN_NX2_BUFFER_ARENA": "1",
+        "EDEN_NX2_RENDER_FOLLOWER": "1"
+      },
+      "description": "The uploads trace with the buffer arena and the GPU render follower: the same frames as without either",
+      "expected": {
+        "lavapipe": [
+          "dd42c28cbf8b3c528a996bd19ff168bb",
+          "9b7159366a2c2327d893ef5eded50cc8",
+          "e5ccb3347abbdf23e1368538c0678c12",
+          "68c6c9baa2b53f9146b06cb6eaad8a5d"
+        ]
+      }
+    },
+    {
+      "id": "uploads-render-owns",
+      "source": "generated",
+      "generator": "--gpu-trace-sample-uploads",
+      "environment": {
+        "EDEN_NX2_RENDER_FOLLOWER": "1",
+        "EDEN_NX2_RENDER_OWNS": "1"
+      },
+      "description": "The uploads trace with GPURender owning the scheduler, texture, descriptor and query caches and the back lending it every call (EDEN_NX2_RENDER_OWNS=1): the same frames as without it",
+      "expected": {
+        "lavapipe": [
+          "dd42c28cbf8b3c528a996bd19ff168bb",
+          "9b7159366a2c2327d893ef5eded50cc8",
+          "e5ccb3347abbdf23e1368538c0678c12",
+          "68c6c9baa2b53f9146b06cb6eaad8a5d"
+        ]
+      }
+    },
+    {
+      "id": "draws-render-unlend",
+      "source": "generated",
+      "generator": "--gpu-trace-sample-draws",
+      "environment": {
+        "EDEN_NX2_RENDER_FOLLOWER": "1",
+        "EDEN_NX2_RENDER_RING": "1",
+        "EDEN_NX2_RENDER_PLAYED": "1",
+        "EDEN_NX2_BUFFER_ARENA": "1",
+        "EDEN_NX2_RENDER_OWNS": "1",
+        "EDEN_NX2_RENDER_UNLEND": "1"
+      },
+      "description": "The draws trace with GPURender recording warm direct draws from its register view while the back goes on (EDEN_NX2_RENDER_UNLEND=1): the same frames as without it",
+      "expected": {
+        "lavapipe": [
+          "469b24e54713a0d4fd14cce985dd58a0",
+          "7f9381d13e5a66125a504cd061155bef",
+          "c2ad0e067b62ebe6fceffac8444c32f3",
+          "ee2f3d785bab823201f8486fc967af61"
+        ]
+      }
     }
   ]
 }

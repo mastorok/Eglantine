@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <charconv>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -318,10 +319,27 @@ size_t FirstSampledLevel(std::span<const size_t> level_bytes, size_t limit) {
     return 0;
 }
 
+std::optional<u32> ParseFrameDumpFirstPass(std::string_view value) {
+    if (value.empty()) {
+        return std::nullopt;
+    }
+    u32 pass{};
+    const auto end = value.data() + value.size();
+    const auto [ptr, ec] = std::from_chars(value.data(), end, pass);
+    return ec == std::errc{} && ptr == end ? std::optional{pass} : std::nullopt;
+}
+
 FrameDump::FrameDump(const Device& device_, MemoryAllocator& memory_allocator_,
                      Scheduler& scheduler_)
     : device{device_}, memory_allocator{memory_allocator_}, scheduler{scheduler_},
       size_cap{SIZE_CAP} {
+    if (const char* const value = std::getenv("EDEN_NX2_FRAME_DUMP_FIRST_PASS")) {
+        if (const auto pass = ParseFrameDumpFirstPass(value)) {
+            first_pass = *pass;
+        } else {
+            LOG_WARNING(Render_Vulkan, "Ignoring invalid EDEN_NX2_FRAME_DUMP_FIRST_PASS");
+        }
+    }
     const char* const dir = std::getenv("EDEN_NX2_FRAME_DUMP");
     if (!dir || *dir == '\0') {
         return;
@@ -524,6 +542,12 @@ bool FrameDump::RecordSampled(const Sampled& texture, u32 index, std::string nam
                               std::string tags) {
     tags += SamplerJson(texture.sampler);
     const Image& image = *texture.view->BackingImage();
+    if (texture.tic_raw) {
+        const auto& raw = *texture.tic_raw;
+        tags += fmt::format(
+            R"(,"tic_raw":["{:016x}","{:016x}","{:016x}","{:016x}"],"guest_format":"{}","native_tiling":{})",
+            raw[0], raw[1], raw[2], raw[3], image.info.format, image.info.native_tiling);
+    }
     const auto skip = [&](std::string_view reason) {
         const auto& info = image.info;
         Enqueue({.tags = fmt::format(
@@ -675,6 +699,10 @@ bool FrameDump::EndPass() {
         return false;
     }
     pass_framebuffer = nullptr;
+    if (!IncludesGraphicsPass()) {
+        ++pass_index;
+        return false;
+    }
     std::string shaders;
     for (const u64 hash : pass_hashes) {
         shaders += fmt::format("{}\"{:016x}\"", shaders.empty() ? "" : ",", hash);
@@ -695,6 +723,9 @@ bool FrameDump::EndPass() {
 
 void FrameDump::CaptureDispatch(u64 shader_hash, std::span<ImageView* const> written) {
     const u32 dispatch = dispatches++;
+    if (Focused()) {
+        return;
+    }
     for (u32 slot = 0; slot < written.size(); ++slot) {
         const auto target = written[slot] ? MakeTarget(*written[slot], slot) : std::nullopt;
         if (!target) {
@@ -1161,7 +1192,9 @@ void FrameDump::TickFrame() {
         shader_manifest.open(directory / "shaders" / "shaders.jsonl", std::ios::trunc);
     }
     const u64 frame = schedule.Frame();
-    manifest << fmt::format(R"({{"kind":"frame","frame":{},"seconds":{:.3f}}})", frame, elapsed)
+    manifest << fmt::format(R"({{"kind":"frame","frame":{},"seconds":{:.3f}{}}})", frame,
+                            elapsed, Focused() ? fmt::format(",\"first_graphics_pass\":{}", first_pass)
+                                               : std::string{})
              << '\n';
     writer = std::thread{[this] { WriterLoop(); }};
     LOG_INFO(Render_Vulkan, "Frame dump: capturing frame {} ({:.1f} s after boot){} into {}", frame,

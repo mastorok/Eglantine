@@ -81,6 +81,38 @@ public:
                                             std::optional<ByteAddressedShadow>& shadow,
                                             BindCommand* deferred_bind = nullptr);
 
+    /// EDEN_NX2_RENDER_UNLEND_DISPATCH: the back's half of an unlent dispatch, by value.
+    struct BackHalf {
+        /// Not value-initialized: the small vectors' inline storage stays untouched.
+        BackHalf() {}
+
+        /// Texture and image handles as read from memory, in descriptor order.
+        boost::container::small_vector<u32, 16> handles;
+        /// Buffer descriptor entries.
+        boost::container::small_vector<DescriptorUpdateEntry, 16> entries;
+        /// The buffer commands, played on GPURender as the dispatch's stamp.
+        VideoCommon::CommandArena commands;
+        u64 stamp{};
+    };
+    /// Whether the pipeline's dispatches can go unlent: built and bound, no texture or image
+    /// buffers, no byte-addressed images.
+    [[nodiscard]] bool CanUnlend() const noexcept {
+        return unlend_ok && IsBuilt() && IsBound();
+    }
+    /// The constant buffers the back reads handles and storage buffer descriptors from (all of
+    /// them where a handle is computed at dispatch time).
+    [[nodiscard]] u32 HandleConstBuffers() const noexcept {
+        return handle_cbufs;
+    }
+    /// The back: the buffer bindings and the handle values.
+    void ConfigureBack(Tegra::Engines::KeplerCompute& kepler_compute,
+                       Tegra::MemoryManager& gpu_memory, BufferCache& buffer_cache, BackHalf& half,
+                       GuestDescriptorQueue& capture);
+    /// GPURender: the images, the descriptors and the binding, from `pools`.
+    bool ConfigureRender(const BackHalf& half, const VideoCommon::ComputePools& pools,
+                         Scheduler& scheduler, TextureCache& texture_cache,
+                         BufferCacheRuntime& buffer_runtime, BindCommand* deferred_bind);
+
     /// Whether the bindings fit an Ocarina upscale pass: one written image, no other writes.
     [[nodiscard]] bool CanReplaceOcarinaUpscale() const;
 
@@ -145,6 +177,14 @@ private:
     /// Builds the pipeline once, on whichever thread gets here first.
     void RunBuild();
 
+    /// Configure's tail, once the buffer entries are queued: image descriptors, descriptor
+    /// memory and the binding.
+    ConfigureResult FinishConfigure(Scheduler& scheduler, TextureCache& texture_cache,
+                                    std::span<const VideoCommon::ImageViewInOut> views,
+                                    std::span<const VideoCommon::SamplerId> samplers,
+                                    const std::optional<ByteAddressedShadow>& shadow,
+                                    std::optional<size_t> shadow_index, BindCommand* deferred_bind);
+
     const Device& device;
     vk::PipelineCache& pipeline_cache;
     PipelineBinaries* const binaries;
@@ -154,6 +194,8 @@ private:
     Shader::Info info;
     u64 shader_hash{};
     u32 num_descriptor_entries{};
+    bool unlend_ok{};
+    u32 handle_cbufs{};
     boost::container::small_vector<VideoCommon::ImageViewId, 8> written_images;
     bool wait_logged{};
     std::vector<SampledImage> sampled_images;
@@ -173,6 +215,11 @@ private:
 
     std::function<void()> build_task;
     std::atomic_bool build_claimed{false};
+    /// Counts the build as done in the "Building: N shader(s)" status, once: when it ran, or
+    /// when the pipeline went with its build still queued (cancelled, never run).
+    void NotifyBuilt() noexcept;
+    VideoCore::ShaderNotify* build_notify{};
+    std::atomic_bool build_notified{false};
     std::condition_variable build_condvar;
     std::mutex build_mutex;
     std::atomic_bool is_built{false};

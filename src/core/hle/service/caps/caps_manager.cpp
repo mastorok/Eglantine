@@ -404,6 +404,7 @@ Result AlbumManager::LoadImage(std::span<u8> out_image, const std::filesystem::p
 
     stbir_resize_uint8_srgb(dbi_image, original_width, original_height, 0, out_image.data(), width,
                             height, 0, STBI_rgb_alpha, 3, filter_flag);
+    stbi_image_free(dbi_image);
 
     return ResultSuccess;
 }

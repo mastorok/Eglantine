@@ -488,17 +488,27 @@ static bool BuildWarm(Core::System& system, int argc, char** argv) {
 }
 
 /// GPU trace replay (docs/nx2/gpu-trace.md):
-///   eden-cli --replay <trace> --out <dir> [--frames N] [--device N]
+///   eden-cli --replay <trace> --out <dir> [--frames N] [--device N] [--gpu-accuracy low|high]
+///                     [--render-thread on|off]
 ///                     [--record <trace> --record-from <present> --record-presents N]
 ///   eden-cli --gpu-trace-sample <trace>: writes the synthetic trace.
+///   eden-cli --gpu-trace-sample-draws <trace>: writes the synthetic trace of 3D draws.
+///   eden-cli --gpu-trace-sample-uploads <trace>: the draws with buffer uploads between them.
 static bool ReplayGpuTrace(Core::System& system, int argc, char** argv) {
     namespace GpuTrace = VideoCommon::GpuTrace;
-    if (std::string_view{argv[1]} == "--gpu-trace-sample") {
+    const std::string_view command{argv[1]};
+    if (command == "--gpu-trace-sample" || command == "--gpu-trace-sample-draws" ||
+        command == "--gpu-trace-sample-uploads") {
         if (argc < 3) {
-            fmt::print(stderr, "usage: --gpu-trace-sample <trace>\n");
+            fmt::print(stderr, "usage: {} <trace>\n", command);
             return false;
         }
-        return GpuTrace::WriteSampleTrace(Common::FS::ToU8String(argv[2]));
+        const auto path = Common::FS::ToU8String(argv[2]);
+        if (command == "--gpu-trace-sample") {
+            return GpuTrace::WriteSampleTrace(path);
+        }
+        return command == "--gpu-trace-sample-draws" ? GpuTrace::WriteDrawSampleTrace(path)
+                                                     : GpuTrace::WriteUploadSampleTrace(path);
     }
     GpuTrace::ReplayOptions options;
     for (int i = 2; i < argc; ++i) {
@@ -516,6 +526,12 @@ static bool ReplayGpuTrace(Core::System& system, int argc, char** argv) {
             options.record_presents = static_cast<u32>(std::strtoul(argv[++i], nullptr, 10));
         } else if (argument == "--device" && has_value) {
             Settings::values.vulkan_device.SetValue(std::atoi(argv[++i]));
+        } else if (argument == "--gpu-accuracy" && has_value) {
+            Settings::values.gpu_accuracy.SetValue(std::string_view{argv[++i]} == "low"
+                                                       ? Settings::GpuAccuracy::Low
+                                                       : Settings::GpuAccuracy::High);
+        } else if (argument == "--render-thread" && has_value) {
+            Settings::values.render_thread.SetValue(std::string_view{argv[++i]} != "off");
         } else if (options.trace.empty()) {
             options.trace = Common::FS::ToU8String(argv[i]);
         } else {
@@ -524,7 +540,8 @@ static bool ReplayGpuTrace(Core::System& system, int argc, char** argv) {
         }
     }
     if (options.trace.empty() || options.out.empty()) {
-        fmt::print(stderr, "usage: --replay <trace> --out <dir> [--frames N] [--device N]\n");
+        fmt::print(stderr, "usage: --replay <trace> --out <dir> [--frames N] [--device N] "
+                           "[--gpu-accuracy low|high] [--render-thread on|off]\n");
         return false;
     }
     std::string error;
@@ -581,7 +598,9 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
         return BuildWarm(state->system, argc, argv) ? SDL_APP_SUCCESS : SDL_APP_FAILURE;
     }
     if (argc > 1 && (std::string_view{argv[1]} == "--replay" ||
-                     std::string_view{argv[1]} == "--gpu-trace-sample")) {
+                     std::string_view{argv[1]} == "--gpu-trace-sample" ||
+                     std::string_view{argv[1]} == "--gpu-trace-sample-draws" ||
+                     std::string_view{argv[1]} == "--gpu-trace-sample-uploads")) {
         return ReplayGpuTrace(state->system, argc, argv) ? SDL_APP_SUCCESS : SDL_APP_FAILURE;
     }
 

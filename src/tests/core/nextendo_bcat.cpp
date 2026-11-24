@@ -71,6 +71,9 @@ Fetch Serve(std::optional<Response> response) {
     return [response](u64) { return response; };
 }
 
+// A new package each call, stamped with the time (to 2 s) the zip writer puts in each entry: two
+// made a moment apart can differ, and Update takes that for a new delivery. A test that expects
+// Unchanged serves one package for every check.
 Response Ok(const Files& files) {
     return {200, Package(files)};
 }
@@ -173,8 +176,9 @@ TEST_CASE("Nextendo BCAT requires every Splatoon 3 region", "[core][bcat]") {
 TEST_CASE("Nextendo BCAT installs, keeps and replaces a title's cache", "[core][bcat]") {
     const TempDir temp;
     const auto target = temp.Target();
+    const auto schedule = Ok(Schedule);
 
-    REQUIRE(Update(Splatoon2, target, Serve(Ok(Schedule))) == Outcome::Installed);
+    REQUIRE(Update(Splatoon2, target, Serve(schedule)) == Outcome::Installed);
     REQUIRE(ReadText(target / "vsdata" / "VSSetting_0.byaml") == std::string(2048, 'v'));
     REQUIRE(ReadText(target / "coopdata" / "CoopSetting.byaml") == "coop");
     REQUIRE(ReadText(target / HashFileName).size() == 64);
@@ -187,14 +191,14 @@ TEST_CASE("Nextendo BCAT installs, keeps and replaces a title's cache", "[core][
     REQUIRE(root->GetSubdirectory("vsdata")->GetFiles().size() == 2);
     REQUIRE(root->GetSubdirectory("coopdata")->GetFile("CoopSetting.byaml")->GetSize() == 4);
 
-    REQUIRE(Update(Splatoon2, target, Serve(Ok(Schedule))) == Outcome::Unchanged);
+    REQUIRE(Update(Splatoon2, target, Serve(schedule)) == Outcome::Unchanged);
 
     // A stale hash makes the next check install again.
     {
         std::ofstream out{target / HashFileName, std::ios::trunc};
         out << "stale";
     }
-    REQUIRE(Update(Splatoon2, target, Serve(Ok(Schedule))) == Outcome::Installed);
+    REQUIRE(Update(Splatoon2, target, Serve(schedule)) == Outcome::Installed);
 
     REQUIRE(Update(Splatoon2, target, Serve(Response{204, {}})) == Outcome::NotPublished);
     REQUIRE(Update(Splatoon2, target, Serve(std::nullopt)) == Outcome::Failed);
@@ -215,20 +219,21 @@ TEST_CASE("Nextendo BCAT installs, keeps and replaces a title's cache", "[core][
 TEST_CASE("Nextendo BCAT reinstalls over a hash marker it can't read", "[core][bcat]") {
     const TempDir temp;
     const auto target = temp.Target();
-    REQUIRE(Update(Splatoon2, target, Serve(Ok(Schedule))) == Outcome::Installed);
+    const auto schedule = Ok(Schedule);
+    REQUIRE(Update(Splatoon2, target, Serve(schedule)) == Outcome::Installed);
     const auto hash = ReadText(target / HashFileName);
 
     fs::remove(target / HashFileName);
     fs::create_directory(target / HashFileName);
-    REQUIRE(Update(Splatoon2, target, Serve(Ok(Schedule))) == Outcome::Installed);
+    REQUIRE(Update(Splatoon2, target, Serve(schedule)) == Outcome::Installed);
     REQUIRE(ReadText(target / HashFileName) == hash);
 
     {
         std::ofstream out{target / HashFileName, std::ios::app};
         out << "x";
     }
-    REQUIRE(Update(Splatoon2, target, Serve(Ok(Schedule))) == Outcome::Installed);
-    REQUIRE(Update(Splatoon2, target, Serve(Ok(Schedule))) == Outcome::Unchanged);
+    REQUIRE(Update(Splatoon2, target, Serve(schedule)) == Outcome::Installed);
+    REQUIRE(Update(Splatoon2, target, Serve(schedule)) == Outcome::Unchanged);
 }
 
 TEST_CASE("Nextendo BCAT installs Violet's event for Scarlet", "[core][bcat]") {

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Run the production FSR3 shaders on Vulkan, including lavapipe.
+"""Run the production Lichii Optical Flow Frame Generation shaders on Vulkan, including lavapipe.
 
 Requires glslangValidator, spirv-val, the Vulkan validation layer, and Python
 packages vulkan==1.3.275.1, numpy and pillow. Run with --out <evidence directory>.
 Add --build <configured CMake directory> to test production image-copy commands.
-The build must have compile_commands.json and the two generated FSR3 shader headers.
+The build must have compile_commands.json and the two generated frame generation shader headers.
 """
 
 import argparse
@@ -216,7 +216,7 @@ class VulkanTest:
 
 def build_copy_probe(build, out, sanitize):
     commands = json.loads((build / "compile_commands.json").read_text())
-    entry = next(c for c in commands if c["file"].endswith("present/fsr3_frame_gen.cpp"))
+    entry = next(c for c in commands if c["file"].endswith("present/optical_flow_frame_gen.cpp"))
     command = shlex.split(entry["command"])
     index = command.index("-o")
     del command[index:index + 2]
@@ -226,7 +226,7 @@ def build_copy_probe(build, out, sanitize):
     library = out.resolve() / "copy-probe.so"
     command += ["-fPIC", "-fvisibility=hidden", "-fvisibility-inlines-hidden",
                 "-ffunction-sections", "-fdata-sections", "-shared",
-                "-Wl,--gc-sections,--no-undefined", str(Path(__file__).with_name("fsr3_copy_probe.cpp").resolve()),
+                "-Wl,--gc-sections,--no-undefined", str(Path(__file__).with_name("frame_gen_copy_probe.cpp").resolve()),
                 "-o", str(library)]
     if sanitize:
         command += ["-fsanitize=address,undefined", "-shared-libsan", "-fno-sanitize-recover=all"]
@@ -235,14 +235,14 @@ def build_copy_probe(build, out, sanitize):
 
 
 def check_copies(vk, probe):
-    copy = probe.Fsr3CopyProbe
+    copy = probe.FrameGenCopyProbe
     copy.argtypes = [ctypes.c_void_p] * 6 + [ctypes.c_uint32, ctypes.c_uint32, ctypes.c_bool]
     native = ctypes.CDLL("libvulkan.so.1")
 
     def address(handle):
         return int(ffi.cast("uintptr_t", handle))
 
-    discard = probe.Fsr3DiscardProbe
+    discard = probe.FrameGenDiscardProbe
     discard.argtypes = [ctypes.c_void_p] * 3
     vk.discard = lambda cmd, image: discard(
         address(cmd), ctypes.cast(native.vkCmdPipelineBarrier, ctypes.c_void_p), address(image))
@@ -274,7 +274,7 @@ def check_copies(vk, probe):
 def run(out, build, shaders, sanitize):
     out.mkdir(parents=True, exist_ok=True)
     compiled = []
-    for name in ("fsr3_optical_flow", "fsr3_frame_interpolation"):
+    for name in ("frame_gen_optical_flow", "frame_gen_interpolation"):
         binary = out / (name + ".spv")
         subprocess.run(["glslangValidator", "-V", str(shaders / (name + ".comp")), "-o", str(binary)], check=True)
         subprocess.run(["spirv-val", str(binary)], check=True)

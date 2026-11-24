@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <deque>
 #include <limits>
 
 #include <boost/container/small_vector.hpp>
@@ -13,7 +14,9 @@
 #include "video_core/buffer_cache/memory_tracker_base.h"
 #include "video_core/buffer_cache/usage_tracker.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/gpu_split.h"
 #include "video_core/renderer_vulkan/nx2_list_slots.h"
+#include "video_core/renderer_vulkan/vk_buffer_arena.h"
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/renderer_vulkan/vk_multi_range_buffer.h"
@@ -38,7 +41,7 @@ public:
     explicit Buffer(BufferCacheRuntime& runtime, VAddr cpu_addr_, u64 size_bytes_,
                     bool sparse_compatible_);
 
-    [[nodiscard]] VkBufferView View(u32 offset, u32 size, VideoCore::Surface::PixelFormat format);
+    [[nodiscard]] VkBufferView View(VkDeviceSize offset, VkDeviceSize size, VkFormat format);
 
     [[nodiscard]] VkBuffer Handle() const noexcept {
         return *buffer;
@@ -85,14 +88,14 @@ public:
 
 private:
     struct BufferView {
-        u32 offset;
-        u32 size;
-        VideoCore::Surface::PixelFormat format;
+        VkDeviceSize offset;
+        VkDeviceSize size;
+        VkFormat format;
         vk::BufferView handle;
     };
 
     const Device* device{};
-    Scheduler* scheduler{};
+    const BufferArena* arena{};
     vk::Buffer buffer;
     std::vector<BufferView> views;
     VideoCommon::UsageTracker tracker;
@@ -129,6 +132,21 @@ public:
 
     bool AnyVertexRepacked() const {
         return vertex_repack_mask != 0;
+    }
+
+    /// EDEN_NX2_RENDER_UNLEND: where buffer bindings go, the back's capture queue while it runs an
+    /// unlent draw's buffer half.
+    GuestDescriptorQueue* SwapDescriptorQueue(GuestDescriptorQueue* queue) noexcept {
+        return std::exchange(guest_descriptor_queue, queue);
+    }
+
+    [[nodiscard]] BufferArena& Arena() noexcept {
+        return arena;
+    }
+
+    /// The back collects buffer commands for GPURender to play (EDEN_NX2_RENDER_UNLEND).
+    [[nodiscard]] static bool CollectsCommands() noexcept {
+        return BufferArena::Collecting();
     }
 
     /// Scheduler::CurrentTick, inline: the stream uniform reuse asks for it on every small
@@ -226,7 +244,7 @@ public:
     std::span<u8> BindMappedUniformBuffer([[maybe_unused]] size_t stage,
                                           [[maybe_unused]] u32 binding_index,
                                           u32 size) {
-        const StagingBufferRef ref = staging_pool.Request(size, MemoryUsage::Upload);
+        const StagingBufferRef ref = UploadPool().Request(size, MemoryUsage::Upload);
         last_stream_uniform = StreamUniformRef{
             .buffer = ref.buffer,
             .device_address = ref.device_address,
@@ -247,8 +265,30 @@ public:
     template <typename Read>
     bool Nx2PatchOwed(DAddr device_addr, u32 size, VkBuffer buffer, u64 offset, Read&& read,
                       Tegra::Nx2ListIndirect::OwedReader reader) {
-        return nx2_list_slots.HasOwed() &&
-               nx2_list_slots.Patch(device_addr, size, buffer, offset, read, reader);
+        if (!nx2_list_slots.HasOwed()) {
+            return false;
+        }
+        if (BufferArena::Collecting()) {
+            // An unlent draw's buffer half: the copies go in its packet, after its uploads. The
+            // slot stays pinned until a landing, which runs with the back parked, after GPURender
+            // played the packet.
+            const bool patched = nx2_list_slots.Patch(
+                device_addr, size, buffer, offset, read, reader,
+                [this](VkBuffer src, VkBuffer dst, std::span<const VkBufferCopy> copies) {
+                    arena.OutsideRenderPass();
+                    arena.Copy(src, dst, copies, BufferArena::CopyMode::Plain, true);
+                });
+            if (patched) {
+                VideoCommon::GpuSplit::Get().NoteUnlentPatch();
+            }
+            return patched;
+        }
+        const BufferArena::ImmediateScope immediate{arena};
+        return nx2_list_slots.Patch(
+            device_addr, size, buffer, offset, read, reader,
+            [this](VkBuffer src, VkBuffer dst, std::span<const VkBufferCopy> copies) {
+                nx2_list_slots.RecordCopies(src, dst, copies);
+            });
     }
 
     /// Whether [device_addr, +size) holds owed list words (Nx2ListIndirect).
@@ -269,6 +309,7 @@ public:
     void Nx2LandOwed(DAddr device_addr, u64 size, Tegra::Nx2ListIndirect::OwedReader reader,
                      Land&& land) {
         if (nx2_list_slots.HasOwed()) {
+            const BufferArena::ImmediateScope immediate{arena};
             nx2_list_slots.LandRange(device_addr, size, reader, land);
         }
     }
@@ -289,7 +330,7 @@ public:
     /// live: made on the scheduler tick that is current now, so the staging pool has not recycled
     /// it and the GPU has not even started on it.
     void RebindStreamUniform(const StreamUniformRef& ref, u32 size) {
-        guest_descriptor_queue.AddBuffer(ref.buffer, ref.device_address, ref.offset, size);
+        guest_descriptor_queue->AddBuffer(ref.buffer, ref.device_address, ref.offset, size);
     }
 
     [[nodiscard]] VkDeviceSize SparseAlignmentFor(bool sparse_compatible) const noexcept {
@@ -328,8 +369,11 @@ public:
         multi_range_buffers.Invalidate(key);
     }
 
-    void OnBufferDeleted(const Buffer& buffer) {
-        multi_range_buffers.DropOwner(scheduler, buffer.Handle());
+    [[nodiscard]] bool RetireBufferIfSparseSource(Buffer& buffer);
+
+    /// Call after GPU work finishes, before the live buffer cache destroys its sources.
+    void ClearMultiRangeBuffers() {
+        multi_range_buffers.Clear();
     }
 
     void BindUniformBuffer(const Buffer& buffer, u32 offset, u32 size) {
@@ -342,15 +386,7 @@ public:
     }
 
     void BindTextureBuffer(Buffer& buffer, u32 offset, u32 size,
-                           VideoCore::Surface::PixelFormat format) {
-        // An unmapped texture buffer has no format; its view is the null buffer's anyway.
-        if (format == VideoCore::Surface::PixelFormat::Invalid) {
-            format = VideoCore::Surface::PixelFormat::R8_UNORM;
-        }
-        guest_descriptor_queue.AddTexelBuffer(buffer.View(offset, size, format),
-                                              buffer.DeviceAddress(), offset, size,
-                                              TexelBufferFormat(format));
-    }
+                           VideoCore::Surface::PixelFormat format);
 
     bool ShouldLimitDynamicStorageBuffers() const {
         return limit_dynamic_storage_buffers;
@@ -364,15 +400,18 @@ private:
     void BindBuffer(const Buffer& buffer, u32 offset, u32 size) {
         const VkBuffer handle = buffer.Handle();
         if (handle == VK_NULL_HANDLE) {
-            guest_descriptor_queue.AddBuffer(handle, 0, 0, VK_WHOLE_SIZE);
+            guest_descriptor_queue->AddBuffer(handle, 0, 0, VK_WHOLE_SIZE);
         } else {
             // A descriptor range of 0 is invalid; an unmapped binding covers the null buffer.
             const VkDeviceSize range = buffer.IsNull() && size == 0 ? NullBufferSize() : size;
-            guest_descriptor_queue.AddBuffer(handle, buffer.DeviceAddress(), offset, range);
+            guest_descriptor_queue->AddBuffer(handle, buffer.DeviceAddress(), offset, range);
         }
     }
 
-    VkFormat TexelBufferFormat(VideoCore::Surface::PixelFormat format) const;
+    /// Buffer uploads and the uniform stream: the buffer side's own pool with the arena on.
+    [[nodiscard]] StagingBufferPool& UploadPool() noexcept {
+        return upload_pool ? *upload_pool : staging_pool;
+    }
 
     void ReserveNullBuffer();
     vk::Buffer CreateNullBuffer();
@@ -383,7 +422,9 @@ private:
     Scheduler& scheduler;
     const MasterSemaphore& master_semaphore; ///< The scheduler's, for CurrentTick
     StagingBufferPool& staging_pool;
-    GuestDescriptorQueue& guest_descriptor_queue;
+    GuestDescriptorQueue* guest_descriptor_queue;
+    BufferArena arena;
+    std::unique_ptr<StagingBufferPool> upload_pool;
 
     std::shared_ptr<QuadArrayIndexBuffer> quad_array_index_buffer;
     std::shared_ptr<QuadStripIndexBuffer> quad_strip_index_buffer;
@@ -396,6 +437,11 @@ private:
     bool static_vertex_repack{};
     QuadIndexedPass quad_index_pass;
 
+    struct RetiredSparseSource {
+        Buffer buffer;
+        std::optional<u64> tick{};
+    };
+    std::deque<RetiredSparseSource> retired_sparse_sources;
     MultiRangeBufferCache multi_range_buffers;
     boost::container::small_vector<MultiRangeSource, 16> multi_range_sources;
     VkDeviceSize multi_range_total{};
@@ -405,14 +451,7 @@ private:
     bool limit_dynamic_storage_buffers = false;
     u32 max_dynamic_storage_buffers = (std::numeric_limits<u32>::max)();
 
-    /// The index buffer BindIndexBuffer recorded last, at scheduler recording epoch bound_index_epoch.
-    VkBuffer bound_index_buffer = VK_NULL_HANDLE;
-    VkDeviceSize bound_index_offset = 0;
-    VkIndexType bound_index_type = VK_INDEX_TYPE_UINT32;
-    u64 bound_index_epoch = 0;
-    bool bound_index_valid = false;
-
-    Nx2ListSlots nx2_list_slots{memory_allocator, scheduler};
+    Nx2ListSlots nx2_list_slots{memory_allocator, scheduler, arena};
 };
 
 struct BufferCacheParams {

@@ -856,6 +856,8 @@ add_library(core STATIC
     hle/service/ns/ecommerce_interface.h
     hle/service/ns/factory_reset_interface.cpp
     hle/service/ns/factory_reset_interface.h
+    hle/service/ns/game_list_applications.cpp
+    hle/service/ns/game_list_applications.h
     hle/service/ns/language.cpp
     hle/service/ns/language.h
     hle/service/ns/ns.cpp
@@ -1085,6 +1087,7 @@ add_library(core STATIC
     hle/service/nx2_video_input_queue.h
     hle/service/nx2_image_layout.h
     hle/service/nx2_present_pacer.h
+    hle/service/nx2_present_queue.h
     hle/service/nx2_video_ready.h
     hle/service/services.cpp
     hle/service/services.h
@@ -1316,6 +1319,16 @@ if (HAS_NCE)
         arm/nce/patcher.h
         arm/nce/visitor_base.h)
     target_link_libraries(core PRIVATE merry::oaknut)
+endif()
+
+if (HAS_HYPERVISOR)
+    find_library(HYPERVISOR_FRAMEWORK Hypervisor REQUIRED)
+    target_sources(core PRIVATE
+        arm/hypervisor/arm_hypervisor.cpp
+        arm/hypervisor/arm_hypervisor.h
+        arm/hypervisor/hv_vm.cpp
+        arm/hypervisor/hv_vm.h)
+    target_link_libraries(core PRIVATE "${HYPERVISOR_FRAMEWORK}")
 endif()
 
 if (ARCHITECTURE_x86_64 OR ARCHITECTURE_arm64 OR ARCHITECTURE_riscv64 OR ARCHITECTURE_loongarch64)

@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <optional>
 #include <span>
+#include <string_view>
 #include <vector>
 #include <boost/container/small_vector.hpp>
 #include <deque>
@@ -145,6 +146,8 @@ struct CommandWordsAllocator {
 struct CommandList final {
     CommandList() = default;
     explicit CommandList(std::size_t size) : command_lists(size) {}
+    CommandList(std::size_t size, boost::container::default_init_t)
+        : command_lists(size, boost::container::default_init) {}
     explicit CommandList(boost::container::small_vector<CommandHeader, 512>&& prefetch_command_list_)
         : prefetch_command_list{std::move(prefetch_command_list_)} {}
 
@@ -236,13 +239,17 @@ private:
     bool Step();
     /// Returns how many words were processed: fewer than given when a semaphore acquire
     /// suspended the channel.
-    size_t ProcessCommands(std::span<const CommandHeader> commands, size_t word_offset = 0);
+    size_t ProcessCommands(std::span<const CommandHeader> commands, size_t word_offset = 0,
+                           std::string_view source = {}, const CommandHeader* snapshot = nullptr);
     size_t command_resume_offset{}; ///< Words of the current entry done before a suspension
 
     void SetState(const CommandHeader& command_header);
 
     void CallMethod(u32 argument);
     void CallMultiMethod(const u32* base_start, u32 num_methods);
+    void CaptureMmeWords(std::span<const u32> words, size_t word_offset,
+                         std::string_view source, const CommandHeader* snapshot,
+                         u32 inline_header = 0) const;
     [[nodiscard]] bool WantsSegment() const;
     void ReportUnboundSubchannel();
     void WatchArgument(u32 method, u32 argument) const;
@@ -337,7 +344,8 @@ public:
         bool increment_once;
         GPUVAddr resume_address; ///< Where the entry that continues the method starts
     };
-    void ResolveSplitMethod(GPUVAddr entry_address);
+    void ResolveSplitMethod(GPUVAddr entry_address, bool park);
+    bool SplitResumesLater(const CommandList& list, size_t from) const;
     static constexpr size_t MaxParkedMethods = 16;
 
     // Read per channel, not at static initialization, which runs before the frontend loads
@@ -360,7 +368,7 @@ public:
     std::array<ParsedEntry, 64> parsed_entries{};
     size_t parsed_entry_count{};
     std::vector<ParkedMethod> parked_methods;
-    GPUVAddr split_method_end{}; ///< End of the last entry that ended inside a method
+    GPUVAddr split_method_end{}; ///< Expected contiguous address for the unfinished method
 
     std::array<Engines::EngineInterface*, max_subchannels> subchannels{};
     std::array<Engines::EngineTypes, max_subchannels> subchannel_type;

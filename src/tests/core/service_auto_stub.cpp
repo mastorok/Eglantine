@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <array>
+#include <chrono>
 #include <cstring>
+#include <future>
 #include <optional>
 #include <thread>
 
@@ -11,8 +13,10 @@
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "core/hle/ipc.h"
+#include "core/hle/kernel/k_server_port.h"
 #include "core/hle/service/server_manager.h"
 #include "core/hle/service/service.h"
+#include "core/hle/service/sm/sm.h"
 #include "tests/audio_core/sysmix_test_context.h"
 
 namespace {
@@ -73,4 +77,32 @@ TEST_CASE("An auto-stubbed unknown command is answered with debug asserts on",
     // The auto-stub reply: "SFCO" and a success result.
     REQUIRE(request.CommandBuffer()[4] == 0x4f434653);
     CHECK(request.CommandBuffer()[6] == ResultSuccess.raw);
+}
+
+TEST_CASE("Host service waits finish on registration or close", "[core][service]") {
+    SysmixTests::Context context;
+    auto& kernel = context.system.Kernel();
+    Service::SM::ServiceManager services{kernel};
+    std::promise<bool> registered;
+    std::promise<bool> missing;
+    auto registered_result = registered.get_future();
+    auto missing_result = missing.get_future();
+    std::jthread registration_waiter;
+    std::jthread close_waiter;
+    SCOPE_EXIT { services.Close(); };
+    registration_waiter = kernel.RunOnHostCoreProcess(
+        "sm-registration", [&] { registered.set_value(services.WaitForService("test:sm")); });
+    close_waiter = kernel.RunOnHostCoreProcess(
+        "sm-close", [&] { missing.set_value(services.WaitForService("missing")); });
+
+    Kernel::KServerPort* port{};
+    REQUIRE(services.RegisterService(&port, "test:sm", 1, {}).IsSuccess());
+    SCOPE_EXIT { port->Close(kernel); };
+    REQUIRE(registered_result.wait_for(std::chrono::seconds{2}) == std::future_status::ready);
+    CHECK(registered_result.get());
+    CHECK(missing_result.wait_for(std::chrono::seconds{0}) == std::future_status::timeout);
+
+    services.Close();
+    REQUIRE(missing_result.wait_for(std::chrono::seconds{2}) == std::future_status::ready);
+    CHECK_FALSE(missing_result.get());
 }

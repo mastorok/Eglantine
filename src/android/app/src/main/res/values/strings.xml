@@ -1203,7 +1203,7 @@
 
     <!-- CPU Backend -->
     <string name="cpu_backend_dynarmic" translatable="false">Dynarmic (JIT)</string>
-    <string name="cpu_backend_nce" translatable="false">NCE</string>
+    <string name="cpu_backend_nce" translatable="false">Native (NCE)</string>
 
     <!-- CPU Accuracy -->
     <string name="cpu_accuracy_accurate">Accurate</string>

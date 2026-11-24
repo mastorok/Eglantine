@@ -3,6 +3,8 @@
 
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+
 #include "common/logging.h"
 #include "input_common/main.h"
 #include "qt_config.h"
@@ -71,6 +73,48 @@ void QtConfig::ReloadAllValues() {
 void QtConfig::SaveAllValues() {
     SaveValues();
     SaveQtValues();
+}
+
+void QtConfig::SaveLastSeenRelease(u32 build) {
+    UISettings::values.last_seen_release = build;
+    BeginGroup(Settings::TranslateCategory(Settings::Category::Ui));
+    WriteSettingGeneric(&UISettings::values.last_seen_release);
+    EndGroup();
+    WriteToIni();
+}
+
+bool QtConfig::SetAddonEnabled(u64 title_id, const std::string& name, bool enabled) {
+    if (!global) {
+        return false;
+    }
+    auto& addons = Settings::values.disabled_addons;
+    const auto previous = addons.find(title_id);
+    auto disabled = previous == addons.end() ? std::vector<std::string>{} : previous->second;
+    if (enabled) {
+        if (std::erase(disabled, name) == 0) {
+            return true;
+        }
+    } else {
+        if (std::ranges::find(disabled, name) != disabled.end()) {
+            return true;
+        }
+        disabled.push_back(name);
+        std::ranges::sort(disabled);
+    }
+    auto [it, inserted] = addons.try_emplace(title_id);
+    it->second.swap(disabled);
+    SaveDisabledAddOnValues();
+    if (WriteToIni()) {
+        return true;
+    }
+
+    if (inserted) {
+        addons.erase(it);
+    } else {
+        it->second.swap(disabled);
+    }
+    SaveDisabledAddOnValues();
+    return false;
 }
 
 void QtConfig::ReadQtValues() {
@@ -287,6 +331,12 @@ void QtConfig::ReadUIValues() {
     ReadCategory(Settings::Category::Ui);
     ReadCategory(Settings::Category::UiGeneral);
 
+    auto& mod_store_url = UISettings::values.mod_store_api_url;
+    const auto url_key = mod_store_url.GetLabel();
+    mod_store_url.LoadString(ReadBooleanSetting(url_key + "\\default", true)
+                                 ? std::string{}
+                                 : ReadStringSetting(url_key));
+
     EndGroup();
 }
 
@@ -499,6 +549,12 @@ void QtConfig::SaveUIValues() {
 
     WriteCategory(Settings::Category::Ui);
     WriteCategory(Settings::Category::UiGeneral);
+
+    const auto& mod_store_url = UISettings::values.mod_store_api_url;
+    const auto url_key = mod_store_url.GetLabel();
+    const auto url = mod_store_url.ToString();
+    WriteBooleanSetting(url_key + "\\default", url == mod_store_url.DefaultToString());
+    config->SetValue(GetSection().c_str(), GetFullKey(url_key, false).c_str(), url.c_str());
 
     WriteStringSetting(
         std::string("theme"), UISettings::values.theme,

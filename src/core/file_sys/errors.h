@@ -9,6 +9,7 @@ namespace FileSys {
 
 constexpr Result ResultPathNotFound{ErrorModule::FS, 1};
 constexpr Result ResultPathAlreadyExists{ErrorModule::FS, 2};
+constexpr Result ResultTargetLocked{ErrorModule::FS, 7};
 constexpr Result ResultUnsupportedSdkVersion{ErrorModule::FS, 50};
 constexpr Result ResultPartitionNotFound{ErrorModule::FS, 1001};
 constexpr Result ResultTargetNotFound{ErrorModule::FS, 1002};

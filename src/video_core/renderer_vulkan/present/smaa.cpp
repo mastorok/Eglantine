@@ -55,22 +55,19 @@ void SMAA::CreateImages(const Device& device) {
     m_static_image_views[Search] =
         CreateWrappedImageView(device, m_static_images[Search], VK_FORMAT_R8_UNORM);
 
-    for (u32 i = 0; i < m_image_count; i++) {
-        Images& images = m_dynamic_images.emplace_back();
+    m_dynamic_images[Blend] =
+        CreateWrappedImage(m_allocator, m_extent, VK_FORMAT_R16G16B16A16_SFLOAT);
+    m_dynamic_images[Edges] = CreateWrappedImage(m_allocator, m_extent, VK_FORMAT_R16G16_SFLOAT);
+    m_dynamic_images[Output] =
+        CreateWrappedImage(m_allocator, m_extent, VK_FORMAT_R16G16B16A16_SFLOAT);
 
-        images.images[Blend] =
-            CreateWrappedImage(m_allocator, m_extent, VK_FORMAT_R16G16B16A16_SFLOAT);
-        images.images[Edges] = CreateWrappedImage(m_allocator, m_extent, VK_FORMAT_R16G16_SFLOAT);
-        images.images[Output] =
-            CreateWrappedImage(m_allocator, m_extent, VK_FORMAT_R16G16B16A16_SFLOAT);
-
-        images.image_views[Blend] =
-            CreateWrappedImageView(device, images.images[Blend], VK_FORMAT_R16G16B16A16_SFLOAT);
-        images.image_views[Edges] =
-            CreateWrappedImageView(device, images.images[Edges], VK_FORMAT_R16G16_SFLOAT);
-        images.image_views[Output] =
-            CreateWrappedImageView(device, images.images[Output], VK_FORMAT_R16G16B16A16_SFLOAT);
-    }
+    m_dynamic_image_views[Blend] =
+        CreateWrappedImageView(device, m_dynamic_images[Blend], VK_FORMAT_R16G16B16A16_SFLOAT);
+    m_dynamic_image_views[Edges] =
+        CreateWrappedImageView(device, m_dynamic_images[Edges], VK_FORMAT_R16G16_SFLOAT);
+    m_dynamic_image_views[Output] =
+        CreateWrappedImageView(device, m_dynamic_images[Output], VK_FORMAT_R16G16B16A16_SFLOAT);
+    m_frames.resize(m_image_count);
 }
 
 void SMAA::CreateRenderPasses(const Device& device) {
@@ -80,16 +77,16 @@ void SMAA::CreateRenderPasses(const Device& device) {
     m_renderpasses[NeighborhoodBlending] =
         CreateWrappedRenderPass(device, VK_FORMAT_R16G16B16A16_SFLOAT);
 
-    for (auto& images : m_dynamic_images) {
-        images.framebuffers[EdgeDetection] = CreateWrappedFramebuffer(
-            device, m_renderpasses[EdgeDetection], images.image_views[Edges], m_extent);
+    for (Frame& frame : m_frames) {
+        frame.framebuffers[EdgeDetection] = CreateWrappedFramebuffer(
+            device, m_renderpasses[EdgeDetection], m_dynamic_image_views[Edges], m_extent);
 
-        images.framebuffers[BlendingWeightCalculation] =
+        frame.framebuffers[BlendingWeightCalculation] =
             CreateWrappedFramebuffer(device, m_renderpasses[BlendingWeightCalculation],
-                                     images.image_views[Blend], m_extent);
+                                     m_dynamic_image_views[Blend], m_extent);
 
-        images.framebuffers[NeighborhoodBlending] = CreateWrappedFramebuffer(
-            device, m_renderpasses[NeighborhoodBlending], images.image_views[Output], m_extent);
+        frame.framebuffers[NeighborhoodBlending] = CreateWrappedFramebuffer(
+            device, m_renderpasses[NeighborhoodBlending], m_dynamic_image_views[Output], m_extent);
     }
 }
 
@@ -142,8 +139,8 @@ void SMAA::CreateDescriptorSets(const Device& device) {
     std::ranges::transform(m_descriptor_set_layouts, layouts.begin(),
                            [](auto& layout) { return *layout; });
 
-    for (auto& images : m_dynamic_images) {
-        images.descriptor_sets = CreateWrappedDescriptorSets(m_descriptor_pool, layouts);
+    for (Frame& frame : m_frames) {
+        frame.descriptor_sets = CreateWrappedDescriptorSets(m_descriptor_pool, layouts);
     }
 }
 
@@ -162,28 +159,29 @@ void SMAA::CreatePipelines(const Device& device) {
 }
 
 void SMAA::UpdateDescriptorSets(const Device& device, VkImageView image_view, size_t image_index) {
-    Images& images = m_dynamic_images[image_index];
+    Frame& frame = m_frames[image_index];
     std::vector<VkDescriptorImageInfo> image_infos;
     std::vector<VkWriteDescriptorSet> updates;
     image_infos.reserve(6);
 
     updates.push_back(CreateWriteDescriptorSet(image_infos, *m_sampler, image_view,
-                                               images.descriptor_sets[EdgeDetection], 0));
+                                               frame.descriptor_sets[EdgeDetection], 0));
 
-    updates.push_back(CreateWriteDescriptorSet(image_infos, *m_sampler, *images.image_views[Edges],
-                                               images.descriptor_sets[BlendingWeightCalculation],
-                                               0));
+    updates.push_back(
+        CreateWriteDescriptorSet(image_infos, *m_sampler, *m_dynamic_image_views[Edges],
+                                 frame.descriptor_sets[BlendingWeightCalculation], 0));
     updates.push_back(CreateWriteDescriptorSet(image_infos, *m_sampler, *m_static_image_views[Area],
-                                               images.descriptor_sets[BlendingWeightCalculation],
+                                               frame.descriptor_sets[BlendingWeightCalculation],
                                                1));
     updates.push_back(
         CreateWriteDescriptorSet(image_infos, *m_sampler, *m_static_image_views[Search],
-                                 images.descriptor_sets[BlendingWeightCalculation], 2));
+                                 frame.descriptor_sets[BlendingWeightCalculation], 2));
 
     updates.push_back(CreateWriteDescriptorSet(image_infos, *m_sampler, image_view,
-                                               images.descriptor_sets[NeighborhoodBlending], 0));
-    updates.push_back(CreateWriteDescriptorSet(image_infos, *m_sampler, *images.image_views[Blend],
-                                               images.descriptor_sets[NeighborhoodBlending], 1));
+                                               frame.descriptor_sets[NeighborhoodBlending], 0));
+    updates.push_back(
+        CreateWriteDescriptorSet(image_infos, *m_sampler, *m_dynamic_image_views[Blend],
+                                 frame.descriptor_sets[NeighborhoodBlending], 1));
 
     device.GetLogical().UpdateDescriptorSets(updates, {});
 }
@@ -202,10 +200,8 @@ void SMAA::UploadImages(const Device& device, Scheduler& scheduler) {
                 VK_FORMAT_R8_UNORM, ARRAY_TO_SPAN(searchTexBytes));
 
     scheduler.Record([&](vk::CommandBuffer cmdbuf) {
-        for (auto& images : m_dynamic_images) {
-            for (size_t i = 0; i < MaxDynamicImage; i++) {
-                ClearColorImage(cmdbuf, *images.images[i]);
-            }
+        for (size_t i = 0; i < MaxDynamicImage; i++) {
+            ClearColorImage(cmdbuf, *m_dynamic_images[i]);
         }
     });
     scheduler.Finish();
@@ -214,23 +210,23 @@ void SMAA::UploadImages(const Device& device, Scheduler& scheduler) {
 }
 
 void SMAA::Draw(const Device& device, Scheduler& scheduler, size_t image_index, VkImage* inout_image, VkImageView* inout_image_view) {
-    Images& images = m_dynamic_images[image_index];
+    Frame& frame = m_frames[image_index];
 
     VkImage input_image = *inout_image;
-    VkImage output_image = *images.images[Output];
-    VkImage edges_image = *images.images[Edges];
-    VkImage blend_image = *images.images[Blend];
+    VkImage output_image = *m_dynamic_images[Output];
+    VkImage edges_image = *m_dynamic_images[Edges];
+    VkImage blend_image = *m_dynamic_images[Blend];
 
-    VkDescriptorSet edge_detection_descriptor_set = images.descriptor_sets[EdgeDetection];
+    VkDescriptorSet edge_detection_descriptor_set = frame.descriptor_sets[EdgeDetection];
     VkDescriptorSet blending_weight_calculation_descriptor_set =
-        images.descriptor_sets[BlendingWeightCalculation];
+        frame.descriptor_sets[BlendingWeightCalculation];
     VkDescriptorSet neighborhood_blending_descriptor_set =
-        images.descriptor_sets[NeighborhoodBlending];
+        frame.descriptor_sets[NeighborhoodBlending];
 
-    VkFramebuffer edge_detection_framebuffer = *images.framebuffers[EdgeDetection];
+    VkFramebuffer edge_detection_framebuffer = *frame.framebuffers[EdgeDetection];
     VkFramebuffer blending_weight_calculation_framebuffer =
-        *images.framebuffers[BlendingWeightCalculation];
-    VkFramebuffer neighborhood_blending_framebuffer = *images.framebuffers[NeighborhoodBlending];
+        *frame.framebuffers[BlendingWeightCalculation];
+    VkFramebuffer neighborhood_blending_framebuffer = *frame.framebuffers[NeighborhoodBlending];
 
     UploadImages(device, scheduler);
     UpdateDescriptorSets(device, *inout_image_view, image_index);
@@ -273,8 +269,8 @@ void SMAA::Draw(const Device& device, Scheduler& scheduler, size_t image_index, 
         TransitionImageLayout(cmdbuf, output_image, VK_IMAGE_LAYOUT_GENERAL);
     });
 
-    *inout_image = *images.images[Output];
-    *inout_image_view = *images.image_views[Output];
+    *inout_image = *m_dynamic_images[Output];
+    *inout_image_view = *m_dynamic_image_views[Output];
 }
 
 } // namespace Vulkan

@@ -1,0 +1,128 @@
+name: Mark issues obsolete on release
+
+on:
+  release:
+    types: [released]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag (defaults to the latest stable release)
+        type: string
+      dry_run:
+        description: List eligible issues without changing them
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: obsolete-on-release
+  cancel-in-progress: false
+
+jobs:
+  mark-obsolete:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - name: Ask reporters to retest on the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+          DRY_RUN: ${{ inputs.dry_run || false }}
+        run: |
+          set -euo pipefail
+          repo="repos/$GH_REPO"
+          release_path="$repo/releases/latest"
+          if [[ -n "$TAG" ]]; then
+            release_path="$repo/releases/tags/$(jq -rn --arg tag "$TAG" '$tag | @uri')"
+          fi
+          release=$(gh api "$release_path")
+          published_at=$(jq -er 'select(.draft == false and .prerelease == false) | .published_at // empty' <<< "$release")
+          tag=$(jq -er .tag_name <<< "$release")
+          url=$(jq -er .html_url <<< "$release")
+          release_id=$(jq -er .id <<< "$release")
+          notice="<!-- lichii-obsolete:$release_id -->"
+
+          reporter_replied() {
+            jq -e --arg since "$1" '
+              any(.[]; .created_at >= $since and .user.type != "Bot" and
+                (.author_association | IN("OWNER", "MEMBER", "COLLABORATOR") | not))
+            ' >/dev/null
+          }
+
+          eligible=$(cat <<'JQ'
+          select(.state == "open" and (.locked | not) and (has("pull_request") | not)
+            and .created_at <= $published
+            and .milestone == null and (.assignees | length == 0)
+            and all(.labels[]; (.name | ascii_downcase |
+              IN("obsolete", "pinned", "enhancement", "accessibility", "deferred",
+                 "help-wanted", "help wanted", "investigating")) | not))
+          JQ
+          )
+          candidates=$(gh api --paginate "$repo/issues?state=open&per_page=100" |
+            jq -c --arg published "$published_at" ".[] | $eligible | {number, comments, updated_at}")
+
+          if [[ "$DRY_RUN" != true ]]; then
+            gh label create obsolete --color CFD3D7 \
+              --description "Awaiting confirmation on a newer Lichii release" --force
+            gh label create investigating --color 1D76DB \
+              --description "The Lichii crew is actively investigating this issue" --force
+          fi
+
+          count=0
+          while IFS= read -r candidate; do
+            [[ -n "$candidate" ]] || continue
+            n=$(jq -r .number <<< "$candidate")
+            issue="$repo/issues/$n"
+            if [[ "$DRY_RUN" != true ]]; then
+              current=$(gh api "$issue")
+              if [[ -z $(jq -c --arg published "$published_at" "$eligible" <<< "$current") ]]; then
+                continue
+              fi
+              candidate=$current
+            fi
+
+            comments='[]'
+            if jq -e --arg published "$published_at" '.comments > 0 and .updated_at >= $published' <<< "$candidate" >/dev/null; then
+              comments=$(gh api --paginate "$issue/comments?since=$published_at&per_page=100" | jq -cs add)
+            fi
+            notified_at=$(jq -r --arg notice "$notice" '
+              first(.[] | select(.user.login == "github-actions[bot]" and (.body | endswith($notice))) | .created_at) // empty
+            ' <<< "$comments")
+            if [[ -n "$notified_at" ]]; then
+              already_marked=$(gh api --paginate "$issue/events?per_page=100" |
+                jq -r --arg since "$notified_at" '
+                  .[] | select(.event == "labeled" and .label.name == "obsolete" and .created_at >= $since) | .id
+                ')
+              if [[ -n "$already_marked" ]] || reporter_replied "$notified_at" <<< "$comments"; then
+                continue
+              fi
+            fi
+
+            if [[ "$DRY_RUN" == true ]]; then
+              printf 'Would mark #%s for %s\n' "$n" "$tag"
+              count=$((count + 1))
+              continue
+            fi
+
+            if [[ -z "$notified_at" ]]; then
+              body=$(printf '%s\n\n%s\n\n%s' \
+                "Lichii [$tag]($url) is out. Please check whether this still happens on $tag." \
+                "If it does, reply here within 7 days. A new log from **Help → Report a Bug** helps. Otherwise we'll close this issue as not planned. If it still happens later, you can ask us to reopen it or file a new issue." \
+                "$notice")
+              notified_at=$(gh api --method POST "$issue/comments" -f body="$body" --jq .created_at)
+              sleep 1
+              comments=$(gh api --paginate "$issue/comments?since=$notified_at&per_page=100" | jq -cs add)
+              if reporter_replied "$notified_at" <<< "$comments"; then
+                sleep 19
+                continue
+              fi
+            fi
+            gh api --method POST "$issue/labels" -f 'labels[]=obsolete' --silent
+            count=$((count + 1))
+            sleep 19
+          done <<< "$candidates"
+          printf 'Eligible issues processed for %s: %s\n' "$tag" "$count"
