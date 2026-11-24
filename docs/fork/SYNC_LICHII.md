@@ -31,3 +31,11 @@ artifacts of the run, and the `publish-latest` job also puts them in one GitHub 
 `lichii-latest`, replacing the previous build's files each time (assets `lichii-windows-x86_64.zip` and
 `lichii-windows-x86_64-pgo.zip`, no `build-N` tag per run). The launcher on the owner's PC reads that release
 through the GitHub API, which needs no token because the fork is public.
+
+## Things that bit us
+
+- Lichii's workflow saves the compiler caches only on `nx2`; ours also saves them on `claude/lichii`, so a
+  build here takes about 20-25 minutes warm and about 45-60 minutes cold (right after a big merge).
+- The release job tags the branch tip (`--target "${GITHUB_REF_NAME}"`). Targeting the build's own commit
+  fails with HTTP 403 if the branch moved on while the build ran.
+- After a merge, the first push builds cold. Do not push again before it ends if a release matters.

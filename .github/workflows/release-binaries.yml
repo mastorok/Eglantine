@@ -941,10 +941,13 @@ jobs:
           This release is replaced by every build, so the link never changes. Extract a zip and run \`lichii.exe\`.
           The PGO zip is the same program compiled with a profile trained on Ocarina of Time.
           NOTES
+          # The target is the branch, not the build's commit: the workflow token may only tag a commit
+          # that is still the tip of a branch, so a push made while the build ran made the release
+          # fail with HTTP 403 (and the delete below had already removed the old one).
           gh release delete lichii-latest --repo "${GITHUB_REPOSITORY}" --yes --cleanup-tag || true
           gh release create lichii-latest dist/* \
             --repo "${GITHUB_REPOSITORY}" \
-            --target "${GITHUB_SHA}" \
+            --target "${GITHUB_REF_NAME}" \
             --prerelease \
             --title "Lichii, newest build (build ${GITHUB_RUN_NUMBER}, ${GITHUB_SHA::7})" \
             --notes-file notes.md
