@@ -299,6 +299,23 @@ TEST_CASE("Task and mesh programs search the bound buffers inline",
     CHECK(NotInlinedCallers(code).empty());
 }
 
+TEST_CASE("Pascal and older search the bound buffers inline in every stage",
+          "[shader][global_memory_routes]") {
+    Fixture fixture;
+    Profile profile{};
+    profile.supported_spirv = 0x00010600;
+    profile.support_int64 = true;
+    profile.support_descriptor_aliasing = true;
+    profile.unified_descriptor_binding = true;
+    profile.min_ssbo_alignment = 16;
+    profile.select_global_memory_buffer = true;
+    REQUIRE(NotInlinedCallers(Backend::SPIRV::EmitSPIRV(profile, fixture.program)).size() == 1);
+    profile.has_broken_global_memory_search_call = true;
+    const auto code{Backend::SPIRV::EmitSPIRV(profile, fixture.program)};
+    Dump(code, "select_inline_pascal");
+    CHECK(NotInlinedCallers(code).empty());
+}
+
 TEST_CASE("A route through a pointer array keeps the bound slots past those searched",
           "[shader][global_memory_routes]") {
     ObjectPool<IR::Inst> pool;

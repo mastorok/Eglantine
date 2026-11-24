@@ -131,6 +131,10 @@ struct Profile {
 
     /// Maxwell and earlier nVidia architectures have broken robust support
     bool has_broken_robust{};
+    /// NVIDIA's Pascal-and-older compiler miscompiles accesses that call the non-inlined
+    /// select_global_memory_buffer search: Ocarina's terrain and objects draw black, white or
+    /// with holes (#2382, #2442). Every stage searches inline there, as task and mesh programs do.
+    bool has_broken_global_memory_search_call{};
     /// RADV before Mesa 26.2.5 keeps stale vertex user SGPR state when a mesh shader without the
     /// grid size or draw index is bound, and the next mesh draw hangs the GPU (Mesa MR 45092).
     /// Native mesh shaders read the grid size there so that RADV gives them that SGPR.

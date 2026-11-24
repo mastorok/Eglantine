@@ -1228,6 +1228,7 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
     // search is one function that is not inlined, and the accesses stay inlined. Task and mesh
     // programs search inline: as calls, the first of two consecutive loads in Ocarina's tree task
     // program returned 0 on NVIDIA, so every tree cell drew its 256-record cap (upstream #907).
+    // Pascal and older search inline in every stage (has_broken_global_memory_search_call).
     Id search_function{};
     bool selects_all_buffers{};
     const auto define_body{[&](DefPtr ssbo_member, Id addr, const StorageTypeDefinition& type_def,
@@ -1543,7 +1544,8 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
         const bool all{route == 0};
         const bool words{!profile.support_descriptor_aliasing &&
                          (use.accesses[1] || use.accesses[2])};
-        if (selects_all_buffers && stage != Stage::Task && stage != Stage::Mesh) {
+        if (selects_all_buffers && !profile.has_broken_global_memory_search_call &&
+            stage != Stage::Task && stage != Stage::Mesh) {
             search_function = OpFunction(U32[3], spv::FunctionControlMask::DontInline,
                                          TypeFunction(U32[3], U64));
             const Id addr{OpFunctionParameter(U64)};
