@@ -922,6 +922,10 @@ private:
     u64 tc_stale_gpu_written{};  ///< Stale but buffer-written pages: uploaded after all
     /// Skipped uploads by (format, width, height): count and bytes (last 600 frames).
     std::map<std::array<u32, 3>, std::pair<u32, u64>> tc_stale_shapes;
+    /// Images made over GPU-written images they overlap without fitting (shape -> count, bytes
+    /// overlapped), and how many of them are compressed (so sampled, never render targets).
+    std::map<std::array<u32, 3>, std::pair<u32, u64>> tc_join_shapes;
+    u32 tc_join_compressed = 0;
 
     /// The CPU address an image at gpu_addr is keyed by: its backing, or a fixed stand-in.
     [[nodiscard]] std::optional<DAddr> ImageCpuAddress(GPUVAddr gpu_addr, size_t size) const;

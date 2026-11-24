@@ -16,12 +16,14 @@ inline constexpr u64 OcarinaOfTimeProgramId = 0x0400486024DEC000ULL;
 
 /// Titles whose collector and join write-backs and stale-page uploads are on: they sample
 /// GPU-written images the collector would drop, which otherwise show recycled host memory
-/// (The Duskbloods' rainbow-noise characters, Kirby's garbled loading text, #2422). Ocarina of
-/// Time too: some of its textures flicker between black and shown when the collector drops them.
+/// (The Duskbloods' rainbow-noise characters, Kirby's garbled loading text, #2422).
+/// Not Ocarina of Time: it allocates about nine render targets a frame at shifting offsets of a
+/// transient heap, every one overlapping older ones, so the write-backs downloaded and swizzled
+/// multi-MiB targets nobody samples again (build 12: 44 -> 32 fps median, black textures still
+/// there). EDEN_NX2_WRITEBACK=1 turns them on for a test.
 [[nodiscard]] constexpr bool WritebackDefault(u64 program_id) {
     return program_id == DuskbloodsNetworkTestProgramId ||
-           program_id == KirbyForgottenLandNs2eProgramId ||
-           program_id == OcarinaOfTimeProgramId;
+           program_id == KirbyForgottenLandNs2eProgramId;
 }
 
 /// EDEN_NX2_WRITEBACK=0 or 1 forces the write-backs off or on for every title.

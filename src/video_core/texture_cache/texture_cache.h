@@ -1812,6 +1812,31 @@ void TextureCache<P>::TickFrame() {
                      text);
             tc_stale_shapes.clear();
         }
+        if (!tc_join_shapes.empty()) {
+            // Images made over GPU-written memory they do not fit: what they upload is whatever
+            // the guest memory holds (nothing, unless the overlapped image was written back).
+            std::vector<std::pair<std::array<u32, 3>, std::pair<u32, u64>>> top(
+                tc_join_shapes.begin(), tc_join_shapes.end());
+            u32 total = 0;
+            for (const auto& entry : top) {
+                total += entry.second.first;
+            }
+            const size_t shown = (std::min<size_t>)(top.size(), 6);
+            std::partial_sort(top.begin(), top.begin() + shown, top.end(),
+                              [](const auto& a, const auto& b) { return a.second.first > b.second.first; });
+            std::string text;
+            for (size_t i = 0; i < shown; ++i) {
+                text += fmt::format("{}{}x{} format {} x{} ({} KiB overlapped)", i == 0 ? "" : "; ",
+                                    top[i].first[1], top[i].first[2], top[i].first[0],
+                                    top[i].second.first, top[i].second.second >> 10);
+            }
+            LOG_INFO(HW_GPU,
+                     "Texture cache last 600 frames: {} images made over GPU-written overlaps "
+                     "({} shapes, {} of them compressed formats), most often: {}",
+                     total, tc_join_shapes.size(), tc_join_compressed, text);
+            tc_join_shapes.clear();
+            tc_join_compressed = 0;
+        }
         tc_stale_skips = tc_stale_skip_bytes = tc_stale_gpu_written = 0;
         images_uploaded = uploaded_bytes = largest_upload = layer_uploads = 0;
         astc_opaque_images = astc_alpha_images = 0;
@@ -5296,6 +5321,28 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         runtime.TransitionImageLayout(new_image);
     } else {
         if (True(new_image.flags & ImageFlagBits::CpuModified)) {
+            if (!join_bad_overlap_ids.empty()) {
+                // Counted for the log: what the game samples out of memory a GPU-written image
+                // covers (written back or not, see WriteBackBadOverlaps).
+                u64 overlapped = 0;
+                for (const ImageId overlap_id : join_bad_overlap_ids) {
+                    if (overlap_id != new_image_id &&
+                        True(slot_images[overlap_id].flags & ImageFlagBits::GpuModified)) {
+                        overlapped += slot_images[overlap_id].guest_size_bytes;
+                    }
+                }
+                if (overlapped != 0) {
+                    auto& shape = tc_join_shapes[{static_cast<u32>(new_image.info.format),
+                                                  static_cast<u32>(new_image.info.size.width),
+                                                  static_cast<u32>(new_image.info.size.height)}];
+                    ++shape.first;
+                    shape.second += overlapped;
+                    if (IsPixelFormatASTC(new_image.info.format) ||
+                        IsPixelFormatBCn(new_image.info.format)) {
+                        ++tc_join_compressed;
+                    }
+                }
+            }
             WriteBackBadOverlaps(new_image_id);
         }
         // TODO: Only upload what we need
