@@ -1795,6 +1795,23 @@ void TextureCache<P>::TickFrame() {
                      g_volume_uploads_deferred, g_volume_async_started, g_volume_async_applied);
             g_volume_uploads_deferred = g_volume_async_started = g_volume_async_applied = 0;
         }
+        if (!tc_stale_shapes.empty()) {
+            // The shapes skipped most often: what the game sampled after the collector dropped it.
+            std::vector<std::pair<std::array<u32, 3>, std::pair<u32, u64>>> top(
+                tc_stale_shapes.begin(), tc_stale_shapes.end());
+            const size_t shown = (std::min<size_t>)(top.size(), 5);
+            std::partial_sort(top.begin(), top.begin() + shown, top.end(),
+                              [](const auto& a, const auto& b) { return a.second.first > b.second.first; });
+            std::string text;
+            for (size_t i = 0; i < shown; ++i) {
+                text += fmt::format("{}{}x{} format {} x{} ({} KiB)", i == 0 ? "" : "; ",
+                                    top[i].first[1], top[i].first[2], top[i].first[0],
+                                    top[i].second.first, top[i].second.second >> 10);
+            }
+            LOG_INFO(HW_GPU, "Texture cache last 600 frames: stale uploads skipped, most often: {}",
+                     text);
+            tc_stale_shapes.clear();
+        }
         tc_stale_skips = tc_stale_skip_bytes = tc_stale_gpu_written = 0;
         images_uploaded = uploaded_bytes = largest_upload = layer_uploads = 0;
         astc_opaque_images = astc_alpha_images = 0;
@@ -3763,6 +3780,11 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
                 }
                 ++tc_stale_skips;
                 tc_stale_skip_bytes += image.guest_size_bytes;
+                auto& shape = tc_stale_shapes[{static_cast<u32>(image.info.format),
+                                               static_cast<u32>(image.info.size.width),
+                                               static_cast<u32>(image.info.size.height)}];
+                ++shape.first;
+                shape.second += image.guest_size_bytes;
                 runtime.TransitionImageLayout(image);
                 return;
             }

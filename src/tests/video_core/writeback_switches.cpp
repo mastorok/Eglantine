@@ -5,7 +5,7 @@
 
 #include "video_core/texture_cache/writeback_switches.h"
 
-TEST_CASE("Overlap write-backs stay on only for the tested titles",
+TEST_CASE("Overlap write-backs stay on only for the titles that need them",
           "[video_core][texture_cache][writeback]") {
     using namespace VideoCommon::WritebackSwitches;
     REQUIRE(WritebackDefault(DuskbloodsNetworkTestProgramId));
@@ -13,5 +13,6 @@ TEST_CASE("Overlap write-backs stay on only for the tested titles",
     REQUIRE_FALSE(WritebackDefault(0));
     REQUIRE_FALSE(WritebackDefault(0x01004D300C5AE000ULL));
     REQUIRE_FALSE(WritebackDefault(0x04007EF01F8AE000ULL));
-    REQUIRE_FALSE(WritebackDefault(0x0400486024DEC000ULL));
+    REQUIRE(WritebackDefault(OcarinaOfTimeProgramId));
+    REQUIRE_FALSE(WritebackDefault(0x0400C3F00006E000ULL));
 }
