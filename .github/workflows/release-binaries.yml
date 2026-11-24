@@ -462,8 +462,10 @@ jobs:
             -DUSE_DISCORD_PRESENCE=OFF \
             -DUSE_CCACHE=ON
 
+      # This fork builds claude/lichii, not nx2, so that branch saves the caches too: otherwise every
+      # build of the fork starts cold (about twice as long).
       - name: Save CPM downloads
-        if: github.ref == 'refs/heads/nx2' && steps.cpm-cache.outputs.cache-hit != 'true'
+        if: (github.ref == 'refs/heads/nx2' || github.ref == 'refs/heads/claude/lichii') && steps.cpm-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v5
         with:
           path: .cache/cpm
@@ -490,7 +492,7 @@ jobs:
           du -sh .ccache .lto-cache 2> /dev/null || true
 
       - name: Save compiler objects
-        if: github.ref == 'refs/heads/nx2' && !cancelled() && steps.compiler-cache.outcome == 'success'
+        if: (github.ref == 'refs/heads/nx2' || github.ref == 'refs/heads/claude/lichii') && !cancelled() && steps.compiler-cache.outcome == 'success'
         uses: actions/cache/save@v5
         with:
           path: |
@@ -499,7 +501,7 @@ jobs:
           key: ${{ steps.compiler-cache.outputs.cache-primary-key }}
 
       - name: Delete superseded caches
-        if: github.ref == 'refs/heads/nx2' && !cancelled()
+        if: (github.ref == 'refs/heads/nx2' || github.ref == 'refs/heads/claude/lichii') && !cancelled()
         continue-on-error: true
         shell: bash
         # The platform is spelled out rather than passed as PLATFORM: Windows variable names ignore
