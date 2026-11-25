@@ -490,6 +490,20 @@ const RasterizerVulkan::MeshArena& RasterizerVulkan::AcquireMeshArena() {
     if (mesh_arena_current < mesh_arenas.size() && mesh_arenas[mesh_arena_current].tick == tick) {
         return mesh_arenas[mesh_arena_current];
     }
+    // EDEN_NX2_MESH_ARENA_SINGLE=1: every submission uses the first arena, after the GPU is done
+    // with it (A/B comparison for a defect that follows the arena in use).
+    static const bool single_arena{std::getenv("EDEN_NX2_MESH_ARENA_SINGLE") != nullptr};
+    if (single_arena && !mesh_arenas.empty()) {
+        MeshArena& arena{mesh_arenas.front()};
+        scheduler.Wait(arena.tick);
+        const u32 zero{};
+        std::memcpy(arena.counter.Mapped().data(), &zero, sizeof(zero));
+        arena.counter.Flush();
+        arena.tick = tick;
+        arena.counted = false;
+        mesh_arena_current = 0;
+        return arena;
+    }
     // A finished submission's counter holds the words its draws asked for, including those
     // that did not fit: grow later arenas to hold them.
     const u64 max_size{(std::min)(u64{1} << 30, u64{device.GetMaxStorageBufferRange()})};
