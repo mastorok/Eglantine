@@ -201,6 +201,18 @@ public:
     /// to run not yet seen for their shader. Returns true when copies were recorded.
     bool NoteBuffers(bool compute, std::span<const u64> shader_hashes,
                      std::span<BoundBuffer> buffers);
+    /// Records what an indirect draw about to run reads (its argument or count buffer): the guest
+    /// copy and, when `host` is set, the host buffer the GPU reads. Returns true when a host copy
+    /// was recorded.
+    bool NoteDrawArguments(std::string_view type, u64 device_addr, bool gpu_modified, VkBuffer host,
+                           u32 host_offset, u32 size, std::vector<u8> guest);
+    /// Pass and draw numbers of the draw being recorded, as the buffer entries carry them.
+    [[nodiscard]] u32 PassIndex() const noexcept {
+        return pass_index;
+    }
+    [[nodiscard]] u32 DrawIndex() const noexcept {
+        return draws == 0 ? 0 : draws - 1;
+    }
     /// Records the group counts of the dispatch about to run.
     void NoteLaunch(u64 shader_hash, const std::array<u32, 3>& grid,
                     const std::array<u32, 3>& block, std::optional<GPUVAddr> indirect,

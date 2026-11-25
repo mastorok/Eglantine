@@ -730,6 +730,23 @@ void FrameDump::NoteLaunch(u64 shader_hash, const std::array<u32, 3>& grid,
     Enqueue({.tags = tags + "}"});
 }
 
+bool FrameDump::NoteDrawArguments(std::string_view type, u64 device_addr, bool gpu_modified,
+                                  VkBuffer host, u32 host_offset, u32 size,
+                                  std::vector<u8> guest) {
+    const auto tags = [&](std::string_view source) {
+        return fmt::format(
+            R"("kind":"buffer","pass":{},"draw":{},"stage":0,"shader":"{:016x}","type":"{}","index":0,"written":false,"gpu_addr":"0x0","device_addr":"{:#x}","bound_size":{},"size":{},"gpu_modified":{},"source":"{}")",
+            pass_index, DrawIndex(), u64{0}, type, device_addr, size, size, gpu_modified, source);
+    };
+    if (!guest.empty()) {
+        Enqueue({.tags = tags("guest"), .data = std::move(guest), .raw = true});
+    }
+    if (host == VK_NULL_HANDLE) {
+        return false;
+    }
+    return RecordBuffer(host, host_offset, size, tags("host"));
+}
+
 void FrameDump::NoteDraw(std::span<const u64> shader_hashes) {
     ++draws;
     for (const u64 hash : shader_hashes) {

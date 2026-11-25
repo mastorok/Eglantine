@@ -1529,7 +1529,11 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
                 log_slot->pending = true;
                 log_slot->tick = scheduler.CurrentTick();
                 log_slot->frame = render_trace_frame;
-                log_slot->draw = render_trace_draws;
+                if (mesh_task_draw_frame != render_trace_frame) {
+                    mesh_task_draw_frame = render_trace_frame;
+                    mesh_task_draw_count = 0;
+                }
+                log_slot->draw = mesh_task_draw_count++;
                 log_slot->tasks = groups;
                 log_slot->capacity = capacity_words;
                 log_slot->task_hash = pipeline->ShaderHashes()[1];
@@ -1693,6 +1697,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         }
         if (frame_dump.CapturingBuffers()) {
             recorded |= FrameDumpBuffers(false, pipeline->ShaderHashes());
+            if (is_indirect) {
+                recorded |= FrameDumpIndirectArguments();
+            }
         }
         if (recorded) {
             scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
@@ -2629,6 +2636,15 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
                       render_trace_frame, render_trace_draws, draw_params.num_vertices,
                       draw_params.num_instances, draw_params.first_index, draw_params.base_vertex,
                       draw_params.base_instance, mesh_draw);
+        }
+
+        if (frame_dump.Capturing()) {
+            LOG_INFO(Render_Vulkan,
+                     "Frame dump direct draw: pass {} draw {} indexed {} count {} instances {} "
+                     "first_index {} base_vertex {} base_instance {} mesh {}",
+                     frame_dump.PassIndex(), frame_dump.DrawIndex(), is_indexed,
+                     draw_params.num_vertices, draw_params.num_instances, draw_params.first_index,
+                     draw_params.base_vertex, draw_params.base_instance, mesh_draw);
         }
 
         if (Common::DkbFrameTrace::Enabled() &&
@@ -5826,6 +5842,42 @@ bool RasterizerVulkan::FrameDumpBuffers(bool compute, std::span<const u64> shade
         }
     });
     return frame_dump.NoteBuffers(compute, shader_hashes, buffers);
+}
+
+bool RasterizerVulkan::FrameDumpIndirectArguments() {
+    static constexpr u64 ARGUMENTS_CAP = 64 * 1024;
+    const auto& params = maxwell3d->draw_manager.indirect_state;
+    if (params.is_byte_count) {
+        return false;
+    }
+    bool recorded = false;
+    const auto record = [&](std::string_view type, GPUVAddr gpu_addr, u32 size, VkBuffer host,
+                            u32 host_offset) {
+        std::vector<u8> guest(size);
+        gpu_memory->ReadBlockUnsafe(gpu_addr, guest.data(), size);
+        const auto device_addr = gpu_memory->GpuToCpuAddress(gpu_addr);
+        const bool gpu_modified =
+            device_addr && buffer_cache.IsRegionGpuModified(*device_addr, size);
+        recorded |= frame_dump.NoteDrawArguments(type, device_addr.value_or(0), gpu_modified, host,
+                                                 host_offset, size, std::move(guest));
+    };
+    const u32 size = static_cast<u32>((std::min)(u64{params.buffer_size}, ARGUMENTS_CAP));
+    if (size != 0) {
+        const auto args = buffer_cache.GetDrawIndirectBuffer();
+        record("indirect", params.indirect_start_address, size, args.first->Handle(), args.second);
+    }
+    if (params.include_count) {
+        const auto count = buffer_cache.GetDrawIndirectCount();
+        record("indirect_count", params.count_start_address, sizeof(u32), count.first->Handle(),
+               count.second);
+    }
+    LOG_INFO(Render_Vulkan,
+             "Frame dump indirect draw: pass {} draw {} indexed {} address {:#x} count_address "
+             "{:#x} bytes {} max_draws {} stride {} include_count {}",
+             frame_dump.PassIndex(), frame_dump.DrawIndex(), params.is_indexed,
+             params.indirect_start_address, params.count_start_address, params.buffer_size,
+             params.max_draw_counts, params.stride, params.include_count);
+    return recorded;
 }
 
 void RasterizerVulkan::FrameDumpPass(const Framebuffer* framebuffer) {

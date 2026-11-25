@@ -387,6 +387,8 @@ private:
     void ReadOcarinaActor(struct OcarinaActorMesh& mesh);
     /// Records the uniform and storage buffers of the current draw or dispatch for the frame dump.
     bool FrameDumpBuffers(bool compute, std::span<const u64> shader_hashes);
+    /// Records the argument and count buffers the current indirect draw reads for the frame dump.
+    bool FrameDumpIndirectArguments();
 
     Tegra::GPU& gpu;
     Tegra::MaxwellDeviceMemoryManager& device_memory;
@@ -548,6 +550,8 @@ private:
     void ReadMeshTaskLog();
     /// The slot (index + 1, 0 for none) the draw in progress logs its task inputs to.
     size_t mesh_task_log_index{};
+    u64 mesh_task_draw_frame{~u64{}};
+    u32 mesh_task_draw_count{};
     /// EDEN_NX2_MESH_TASK_DUMP=<dir>: when <dir>/dump.now exists, the task program's input
     /// buffers of every task draw of the next two frames are written under <dir>, and those
     /// frames are logged like the 120th ones, so the logged mesh workgroup counts can be compared
