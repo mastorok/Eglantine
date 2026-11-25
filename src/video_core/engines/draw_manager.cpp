@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <cstring>
+#include <atomic>
 #include <set>
 #include <tuple>
 
@@ -17,6 +18,13 @@ namespace Tegra::Engines {
 namespace {
 
 void TraceSuppressedDraw(const Maxwell3D& maxwell3d, bool indirect) {
+    // Draws and clears the render enable condition switched off, counted on every one and logged
+    // every 20000 (pop-in diagnostics: a game that culls with occlusion reports loses draws here).
+    static std::atomic<u64> switched_off{};
+    if (const u64 count = switched_off.fetch_add(1, std::memory_order_relaxed) + 1;
+        count % 20000 == 0) {
+        LOG_INFO(HW_GPU, "{} draws switched off by the render enable condition so far", count);
+    }
     if (!VideoCommon::RenderTrace::Enabled()) {
         return;
     }
@@ -93,6 +101,13 @@ void Maxwell3D::DrawManager::ProcessMethodCall(Maxwell3D& maxwell3d, u32 method,
 void Maxwell3D::DrawManager::Clear(Maxwell3D& maxwell3d, u32 layer_count) {
     if (maxwell3d.ShouldExecute()) {
         maxwell3d.rasterizer->Clear(layer_count);
+    } else {
+        static std::atomic<u64> switched_off{};
+        if (const u64 count = switched_off.fetch_add(1, std::memory_order_relaxed) + 1;
+            count % 2000 == 1) {
+            LOG_INFO(HW_GPU, "{} clears switched off by the render enable condition so far",
+                     count);
+        }
     }
 }
 

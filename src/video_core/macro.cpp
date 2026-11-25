@@ -1398,20 +1398,42 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
         }
         // A method write of the macro (also what a remembered call replays).
         bool read_memory = false;
+        // The occlusion report the macro last read (see the DMA read below) and what it then wrote
+        // to render_enable.mode (0x556), for the decision table logged with the histogram.
+        // 0: none, 1: placeholder (count 1, no timestamp: the game's own initial value), 2: landed
+        // with count 0 (a timestamp, no samples), 3: landed with samples, 4: other words.
+        static int last_report_class{};
+        static std::array<std::array<u64, 5>, 5> decisions{};
         const auto emit = [&](u32 address, u32 value) {
                 if (address >= 0xe00) return false;
                 if (split_writes != nullptr && !(*split_writes)[address]) {
                     ++split_unexpected_writes;
                 }
                 if (address == 0x556) {
-                    // SET_RENDER_ENABLE_OVERRIDE: 0 use the render-enable condition, 1 always,
-                    // 2 never. Log a histogram every 20000 macro writes (pop-in diagnostics).
+                    // 0x556 is render_enable.mode (0 False, 1 True, 2 Conditional, 3 IfEqual,
+                    // 4 IfNotEqual); the macro decides from the report words it read and writes
+                    // False or True. Log a histogram every 20000 macro writes (pop-in
+                    // diagnostics), with the decision per class of report read just before.
                     static std::array<u64, 4> modes{};
                     static u64 enable_writes{};
                     ++modes[value & 3];
+                    ++decisions[last_report_class][value < 2 ? value : 2];
+                    last_report_class = 0;
                     if (++enable_writes % 20000 == 0) {
-                        LOG_INFO(HW_GPU, "Native MME render enable modes: use {} always {} never {} other {}",
+                        LOG_INFO(HW_GPU,
+                                 "Native MME render enable modes: use {} always {} never {} other {}",
                                  modes[0], modes[1], modes[2], modes[3]);
+                        static constexpr std::array<const char*, 5> names{
+                            "no report", "placeholder", "landed zero", "landed samples", "other"};
+                        for (size_t c = 0; c < names.size(); ++c) {
+                            const auto& row = decisions[c];
+                            if (row[0] + row[1] + row[2] != 0) {
+                                LOG_INFO(HW_GPU,
+                                         "Native MME render enable after a report read ({}): "
+                                         "mode False {} True {} other {}",
+                                         names[c], row[0], row[1], row[2]);
+                            }
+                        }
                     }
                 }
                 {
@@ -1484,6 +1506,40 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
                     const u32 word_count = std::min<u32>(value, 0x1000);
                     std::array<u32, 0x1000> dma_words;
                     memory.ReadWordsUnsafe(source, dma_words.data(), word_count);
+                    if (address == DmaReadFifoed && word_count == 6 && dma_words[4] == 0 &&
+                        dma_words[5] == 0) {
+                        // Ocarina of Time's render-enable predicate reads a 16-byte report (a
+                        // 64-bit count, a 64-bit timestamp) and two zero words.
+                        const bool count_zero = dma_words[0] == 0 && dma_words[1] == 0;
+                        const bool stamped = dma_words[2] != 0 || dma_words[3] != 0;
+                        if (count_zero && stamped) {
+                            // EDEN_NX2_OCC_VISIBLE=1 (diagnostic): a landed report with no
+                            // samples reads like the game's initial report, which draws.
+                            static const bool occ_visible = [] {
+                                const char* env = std::getenv("EDEN_NX2_OCC_VISIBLE");
+                                return env != nullptr && env[0] != '0';
+                            }();
+                            static u64 forced{};
+                            if (occ_visible) {
+                                dma_words[0] = 1;
+                                dma_words[2] = 0;
+                                dma_words[3] = 0;
+                                if (++forced % 20000 == 1) {
+                                    LOG_INFO(HW_GPU,
+                                             "Native MME: {} landed zero-sample reports read as "
+                                             "visible (EDEN_NX2_OCC_VISIBLE)",
+                                             forced);
+                                }
+                            }
+                            last_report_class = 2;
+                        } else if (!count_zero && !stamped) {
+                            last_report_class = 1;
+                        } else if (!count_zero && stamped) {
+                            last_report_class = 3;
+                        } else {
+                            last_report_class = 4;
+                        }
+                    }
                     for (u32 i = 0; i < word_count; ++i) {
                         const u32 word = dma_words[i];
                         if (address == DmaReadFifoed) {

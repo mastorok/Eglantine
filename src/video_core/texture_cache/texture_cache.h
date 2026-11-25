@@ -120,13 +120,15 @@ constexpr u64 VolumeThrottleMinBytes = u64{64} << 20;
     return value;
 }
 
-/// EDEN_NX2_UNDEFINED_FILL=1 fills an image sampled while its contents are undefined (made over
-/// dropped GPU-written pages, nothing uploaded, nothing rendered into it yet) with magenta, =2
-/// with zeros: to see which effects sample such images. Off by default.
+/// An image sampled while its contents are undefined (made over dropped GPU-written pages,
+/// nothing uploaded, nothing rendered into it yet) is filled with zeros, so it doesn't show what
+/// the memory held before (Ocarina of Time's enemy lock-on effect sampled such an image).
+/// EDEN_NX2_UNDEFINED_FILL=1 fills it with magenta instead, to see which effects sample one;
+/// =0 leaves it as it is.
 [[nodiscard]] inline int UndefinedFillMode() {
     static const int value = [] {
         const char* const v = std::getenv("EDEN_NX2_UNDEFINED_FILL");
-        return v == nullptr || v[0] == '\0' ? 0 : std::atoi(v);
+        return v == nullptr || v[0] == '\0' ? 2 : std::atoi(v);
     }();
     return value;
 }
@@ -6475,6 +6477,12 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool 
         if (!invalidate) {
             if (is_modification) {
                 ++tc_undefined_partial;
+                if constexpr (requires { image.FillColor(0.0f, 0.0f, 0.0f, 0.0f); }) {
+                    // What a partial render leaves untouched is zeros, not what the memory held.
+                    if (UndefinedFillMode() == 2) {
+                        image.FillColor(0.0f, 0.0f, 0.0f, 0.0f);
+                    }
+                }
             } else {
                 auto& shape = tc_undefined_sampled[{static_cast<u32>(image.info.format),
                                                     static_cast<u32>(image.info.size.width),
