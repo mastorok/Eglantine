@@ -4123,6 +4123,80 @@ void Image::ClearTiles() {
     });
 }
 
+void Image::FillColor(float red, float green, float blue, float alpha) {
+    using VideoCore::Surface::IsPixelFormatASTC;
+    using VideoCore::Surface::IsPixelFormatBCn;
+    using VideoCore::Surface::IsPixelFormatInteger;
+    using VideoCore::Surface::IsPixelFormatSignedInteger;
+    if (aspect_mask != VK_IMAGE_ASPECT_COLOR_BIT || info.num_samples > 1 ||
+        IsPixelFormatASTC(info.format) || IsPixelFormatBCn(info.format)) {
+        return;
+    }
+    VkClearColorValue color{};
+    if (IsPixelFormatSignedInteger(info.format)) {
+        color.int32[0] = red != 0.0f ? 1 : 0;
+        color.int32[1] = green != 0.0f ? 1 : 0;
+        color.int32[2] = blue != 0.0f ? 1 : 0;
+        color.int32[3] = alpha != 0.0f ? 1 : 0;
+    } else if (IsPixelFormatInteger(info.format)) {
+        color.uint32[0] = red != 0.0f ? 1U : 0U;
+        color.uint32[1] = green != 0.0f ? 1U : 0U;
+        color.uint32[2] = blue != 0.0f ? 1U : 0U;
+        color.uint32[3] = alpha != 0.0f ? 1U : 0U;
+    } else {
+        color.float32[0] = red;
+        color.float32[1] = green;
+        color.float32[2] = blue;
+        color.float32[3] = alpha;
+    }
+    scheduler->RequestOutsideRenderPassOperationContext();
+    const VkImage vk_image = Handle();
+    initialized = true;
+    scheduler->Record([vk_image, color](vk::CommandBuffer cmdbuf) {
+        static constexpr VkImageSubresourceRange range{
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .baseMipLevel = 0,
+            .levelCount = VK_REMAINING_MIP_LEVELS,
+            .baseArrayLayer = 0,
+            .layerCount = VK_REMAINING_ARRAY_LAYERS,
+        };
+        // The old contents are not wanted: UNDEFINED as the old layout discards them.
+        const VkImageMemoryBarrier to_transfer{
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                             VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = vk_image,
+            .subresourceRange = range,
+        };
+        const VkImageMemoryBarrier to_general{
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                             VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                             VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT |
+                             VK_ACCESS_TRANSFER_WRITE_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = vk_image,
+            .subresourceRange = range,
+        };
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                               to_transfer);
+        cmdbuf.ClearColorImage(vk_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, color, range);
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
+                               to_general);
+    });
+}
+
 bool Image::BackTilesWhole() {
     SparseLayerMemory& s = sparse_layers;
     if (s.zero_block == VK_NULL_HANDLE) {

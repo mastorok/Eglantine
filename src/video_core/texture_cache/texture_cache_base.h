@@ -926,6 +926,11 @@ private:
     /// overlapped), and how many of them are compressed (so sampled, never render targets).
     std::map<std::array<u32, 3>, std::pair<u32, u64>> tc_join_shapes;
     u32 tc_join_compressed = 0;
+    /// Images made without an upload over dropped GPU-written pages (UndefinedContent), by what
+    /// used them first: sampled (shape -> count, bytes), rendered into without a full clear.
+    std::map<std::array<u32, 3>, std::pair<u32, u64>> tc_undefined_sampled;
+    u32 tc_undefined_sampled_total = 0;
+    u32 tc_undefined_partial = 0;
 
     /// The CPU address an image at gpu_addr is keyed by: its backing, or a fixed stand-in.
     [[nodiscard]] std::optional<DAddr> ImageCpuAddress(GPUVAddr gpu_addr, size_t size) const;

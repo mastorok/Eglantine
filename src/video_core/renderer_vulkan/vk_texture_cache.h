@@ -572,6 +572,10 @@ public:
         return aspect_mask;
     }
 
+    /// Diagnostic (EDEN_NX2_UNDEFINED_FILL): fills every texel of a plain color image, whatever it
+    /// held. Does nothing for depth, compressed and multisampled images.
+    void FillColor(float red, float green, float blue, float alpha);
+
     [[nodiscard]] VkImageUsageFlags UsageFlags() const noexcept {
         return (this->*current_image).UsageFlags();
     }

@@ -120,6 +120,17 @@ constexpr u64 VolumeThrottleMinBytes = u64{64} << 20;
     return value;
 }
 
+/// EDEN_NX2_UNDEFINED_FILL=1 fills an image sampled while its contents are undefined (made over
+/// dropped GPU-written pages, nothing uploaded, nothing rendered into it yet) with magenta, =2
+/// with zeros: to see which effects sample such images. Off by default.
+[[nodiscard]] inline int UndefinedFillMode() {
+    static const int value = [] {
+        const char* const v = std::getenv("EDEN_NX2_UNDEFINED_FILL");
+        return v == nullptr || v[0] == '\0' ? 0 : std::atoi(v);
+    }();
+    return value;
+}
+
 /// Big volumes being read and untiled at once at most (each one uses a thread and up to three
 /// texture workers).
 constexpr size_t AsyncVolumeMaxJobs = 2;
@@ -1811,6 +1822,27 @@ void TextureCache<P>::TickFrame() {
             LOG_INFO(HW_GPU, "Texture cache last 600 frames: stale uploads skipped, most often: {}",
                      text);
             tc_stale_shapes.clear();
+        }
+        if (tc_undefined_sampled_total != 0 || tc_undefined_partial != 0) {
+            // What the game sampled with nothing uploaded and nothing rendered in it first.
+            std::vector<std::pair<std::array<u32, 3>, std::pair<u32, u64>>> top(
+                tc_undefined_sampled.begin(), tc_undefined_sampled.end());
+            const size_t shown = (std::min<size_t>)(top.size(), 6);
+            std::partial_sort(top.begin(), top.begin() + shown, top.end(),
+                              [](const auto& a, const auto& b) { return a.second.first > b.second.first; });
+            std::string text;
+            for (size_t i = 0; i < shown; ++i) {
+                text += fmt::format("{}{}x{} format {} x{} ({} KiB)", i == 0 ? "" : "; ",
+                                    top[i].first[1], top[i].first[2], top[i].first[0],
+                                    top[i].second.first, top[i].second.second >> 10);
+            }
+            LOG_INFO(HW_GPU,
+                     "Texture cache last 600 frames: {} images sampled with undefined contents "
+                     "({} shapes), {} rendered into without a full clear; sampled most often: {}",
+                     tc_undefined_sampled_total, tc_undefined_sampled.size(),
+                     tc_undefined_partial, text);
+            tc_undefined_sampled.clear();
+            tc_undefined_sampled_total = tc_undefined_partial = 0;
         }
         if (!tc_join_shapes.empty()) {
             // Images made over GPU-written memory they do not fit: what they upload is whatever
@@ -3805,6 +3837,7 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
                 }
                 ++tc_stale_skips;
                 tc_stale_skip_bytes += image.guest_size_bytes;
+                image.flags |= ImageFlagBits::UndefinedContent;
                 auto& shape = tc_stale_shapes[{static_cast<u32>(image.info.format),
                                                static_cast<u32>(image.info.size.width),
                                                static_cast<u32>(image.info.size.height)}];
@@ -6433,6 +6466,32 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool 
         // partial render now would keep guest memory's stale bytes where it doesn't draw. Land
         // the write-backs first (they mark it for the upload below).
         FinishAsyncOverlapDownloads(true);
+    }
+    if (True(image.flags & ImageFlagBits::UndefinedContent)) {
+        // First use of an image whose contents were never uploaded (RefreshContents, stale
+        // pages): a full clear rewrites it, a partial render keeps the rest undefined, and a
+        // sample reads it undefined.
+        image.flags &= ~ImageFlagBits::UndefinedContent;
+        if (!invalidate) {
+            if (is_modification) {
+                ++tc_undefined_partial;
+            } else {
+                auto& shape = tc_undefined_sampled[{static_cast<u32>(image.info.format),
+                                                    static_cast<u32>(image.info.size.width),
+                                                    static_cast<u32>(image.info.size.height)}];
+                ++shape.first;
+                shape.second += image.guest_size_bytes;
+                ++tc_undefined_sampled_total;
+                if constexpr (requires { image.FillColor(0.0f, 0.0f, 0.0f, 0.0f); }) {
+                    const int mode = UndefinedFillMode();
+                    if (mode == 1) {
+                        image.FillColor(1.0f, 0.0f, 1.0f, 1.0f);
+                    } else if (mode == 2) {
+                        image.FillColor(0.0f, 0.0f, 0.0f, 0.0f);
+                    }
+                }
+            }
+        }
     }
     if (invalidate) {
         image.flags &= ~(ImageFlagBits::CpuModified | ImageFlagBits::GpuModified);

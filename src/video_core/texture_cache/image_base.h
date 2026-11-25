@@ -65,6 +65,10 @@ enum class ImageFlagBits : u32 {
     NonContiguous = 1 << 24,
     GuestReplacedContents = 1 << 25,
     CompactLayers = 1 << 26,
+    /// Made over pages the collector dropped a GPU-written image from and not uploaded: the host
+    /// image holds whatever the device memory had until something is rendered or drawn into it
+    /// (cleared when the first use is counted, PrepareImage).
+    UndefinedContent = 1 << 27,
 };
 DECLARE_ENUM_FLAG_OPERATORS(ImageFlagBits)
 
