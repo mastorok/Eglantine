@@ -614,6 +614,7 @@ RasterizerVulkan::MeshTaskLogSlot* RasterizerVulkan::AcquireMeshTaskLogSlot() {
     // A draw that never records its commands leaves zeros, which the log reports as unwritten.
     std::memset(slot->buffer.Mapped().data(), 0, args_bytes);
     slot->buffer.Flush();
+    slot->inputs.clear();
     return slot;
 }
 
@@ -641,6 +642,105 @@ void RasterizerVulkan::ReadMeshTaskLog() {
                  words[draw_args], words[draw_args + 1], words[MESH_EMULATION_ARGS_BASE],
                  slot.capacity,
                  words[MESH_EMULATION_ARGS_TASKS] != slot.tasks ? " (arguments not written)" : "");
+        if (!slot.inputs.empty()) {
+            std::string inputs;
+            for (const MeshTaskLogSlot::Input& input : slot.inputs) {
+                inputs += fmt::format(" {}{}@{:x}+{}:{:016x}{}", input.storage ? 's' : 'c',
+                                      input.index, input.device_addr, input.size, input.hash,
+                                      input.gpu_modified ? "(gpu)" : "");
+            }
+            LOG_INFO(Render_Vulkan, "Mesh task inputs: frame {} draw {} task {:016x}:{}", slot.frame,
+                     slot.draw, slot.task_hash, inputs);
+        }
+    }
+}
+
+bool RasterizerVulkan::MeshTaskDumpActive(u64 frame) {
+    static const char* const dir{std::getenv("EDEN_NX2_MESH_TASK_DUMP")};
+    if (dir == nullptr) {
+        return false;
+    }
+    static const bool created{[] {
+        std::error_code error;
+        std::filesystem::create_directories(dir, error);
+        return true;
+    }()};
+    static_cast<void>(created);
+    if (mesh_task_dump.checked_frame != frame) {
+        mesh_task_dump.checked_frame = frame;
+        const std::filesystem::path trigger{std::filesystem::path{dir} / "dump.now"};
+        std::error_code error;
+        if (frame > mesh_task_dump.last_frame && std::filesystem::exists(trigger, error)) {
+            std::filesystem::remove(trigger, error);
+            mesh_task_dump.first_frame = frame + 1;
+            mesh_task_dump.last_frame = frame + 2;
+            LOG_INFO(Render_Vulkan, "Mesh task dump: frames {} and {} to {}", frame + 1, frame + 2,
+                     dir);
+        }
+    }
+    return frame >= mesh_task_dump.first_frame && frame <= mesh_task_dump.last_frame;
+}
+
+void RasterizerVulkan::NoteMeshTaskInputs() {
+    if (mesh_task_log_index == 0 || mesh_task_log_index > mesh_task_log.size()) {
+        mesh_task_log_index = 0;
+        return;
+    }
+    MeshTaskLogSlot& slot{mesh_task_log[mesh_task_log_index - 1]};
+    mesh_task_log_index = 0;
+    static const char* const dump_dir{std::getenv("EDEN_NX2_MESH_TASK_DUMP")};
+    const bool dump{dump_dir != nullptr && MeshTaskDumpActive(slot.frame)};
+    constexpr u32 INPUT_CAP{16U << 20};
+    std::vector<u8> bytes;
+    std::string meta;
+    buffer_cache.ForEachBoundBuffer(
+        false, [&](u32 stage, bool storage, u32 index, bool, const auto& binding, u32 size,
+                   const auto*, u32) {
+            if (stage != 0) {
+                return;
+            }
+            size = (std::min)(size, INPUT_CAP);
+            MeshTaskLogSlot::Input input{
+                .storage = storage,
+                .index = index,
+                .device_addr = binding.device_addr,
+                .size = size,
+                .hash = 0,
+                .gpu_modified = buffer_cache.IsRegionGpuModified(binding.device_addr, size),
+            };
+            if (!input.gpu_modified) {
+                bytes.resize(size);
+                device_memory.ReadBlockUnsafe(binding.device_addr, bytes.data(), size);
+                u64 hash{0xcbf29ce484222325ULL};
+                size_t at{};
+                for (; at + 8 <= bytes.size(); at += 8) {
+                    u64 word;
+                    std::memcpy(&word, bytes.data() + at, sizeof(word));
+                    hash = (hash ^ word) * 0x100000001b3ULL;
+                    hash ^= hash >> 29;
+                }
+                for (; at < bytes.size(); ++at) {
+                    hash = (hash ^ bytes[at]) * 0x100000001b3ULL;
+                }
+                input.hash = hash;
+                if (dump) {
+                    const std::filesystem::path file{
+                        std::filesystem::path{dump_dir} /
+                        fmt::format("f{}_d{}_{}{}.bin", slot.frame, slot.draw,
+                                    storage ? 's' : 'c', index)};
+                    std::ofstream out{file, std::ios::binary};
+                    out.write(reinterpret_cast<const char*>(bytes.data()),
+                              static_cast<std::streamsize>(bytes.size()));
+                }
+            }
+            meta += fmt::format(" {}{}@{:x}+{}{}", storage ? 's' : 'c', index, input.device_addr,
+                                size, input.gpu_modified ? "(gpu)" : "");
+            slot.inputs.push_back(input);
+        });
+    if (dump) {
+        std::ofstream out{std::filesystem::path{dump_dir} / "draws.txt", std::ios::app};
+        out << fmt::format("frame {} draw {} task {:016x} mesh {:016x} tasks {}:{}\n", slot.frame,
+                           slot.draw, slot.task_hash, slot.mesh_hash, slot.tasks, meta);
     }
 }
 
@@ -1215,6 +1315,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     SCOPE_EXIT {
         ReleaseMeshEmulationBuffers();
     };
+    mesh_task_log_index = 0;
     namespace Profile = VideoCommon::Nx2Profile;
     namespace FastDraw = VideoCommon::Nx2FastDraw;
     // Latched here, on the thread that draws: turning fast draws on starts with a full resolve,
@@ -1403,9 +1504,10 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
                 request(u64{groups} * pipeline->MeshEmulationPayloadStride() * 4).first};
             const auto offsets{request(u64{groups} * 4).first};
             constexpr u64 args_bytes{Shader::Backend::SPIRV::MESH_EMULATION_ARGS_WORDS * 4};
-            MeshTaskLogSlot* const log_slot{task_log && render_trace_frame % 120 < 2
-                                                ? AcquireMeshTaskLogSlot()
-                                                : nullptr};
+            MeshTaskLogSlot* const log_slot{
+                task_log && (render_trace_frame % 120 < 2 || MeshTaskDumpActive(render_trace_frame))
+                    ? AcquireMeshTaskLogSlot()
+                    : nullptr};
             const auto [args, args_span] =
                 log_slot ? std::make_pair(GraphicsPipeline::MeshEmulationBuffer{
                                               *log_slot->buffer, 0, args_bytes},
@@ -1432,6 +1534,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
                 log_slot->capacity = capacity_words;
                 log_slot->task_hash = pipeline->ShaderHashes()[1];
                 log_slot->mesh_hash = pipeline->ShaderHashes()[3];
+                mesh_task_log_index = static_cast<size_t>(log_slot - mesh_task_log.data()) + 1;
             }
             const MeshArena& arena{mesh_arenas[mesh_arena_current]};
             pipeline->SetMeshEmulationTaskBuffers(
@@ -1555,6 +1658,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     }
     TracePendingCpuWrites(false, pipeline->ShaderHashes());
     TraceRenderState(is_indexed, "configured", texture_cache.GetFramebuffer());
+    if (mesh_task_log_index != 0) {
+        NoteMeshTaskInputs();
+    }
     if (frame_dump.Capturing()) {
         FrameDumpPass(texture_cache.GetFramebuffer());
         frame_dump.NoteDraw(pipeline->ShaderHashes());

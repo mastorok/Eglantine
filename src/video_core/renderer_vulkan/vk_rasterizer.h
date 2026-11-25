@@ -522,6 +522,16 @@ private:
     /// EDEN_NX2_MESH_TASK_LOG: the distribution arguments of every task draw of two consecutive
     /// frames out of 120, each in a host-visible buffer of its own, logged once the GPU is done.
     struct MeshTaskLogSlot {
+        /// One buffer the task program reads: its guest bytes' hash when the host GPU did not
+        /// write them (a GPU-written range has no guest truth: gpu_modified).
+        struct Input {
+            bool storage{};
+            u32 index{};
+            u64 device_addr{};
+            u32 size{};
+            u64 hash{};
+            bool gpu_modified{};
+        };
         vk::Buffer buffer;
         u64 tick{};
         u64 frame{};
@@ -531,10 +541,26 @@ private:
         u64 task_hash{};
         u64 mesh_hash{};
         bool pending{};
+        std::vector<Input> inputs;
     };
     std::vector<MeshTaskLogSlot> mesh_task_log;
     MeshTaskLogSlot* AcquireMeshTaskLogSlot();
     void ReadMeshTaskLog();
+    /// The slot (index + 1, 0 for none) the draw in progress logs its task inputs to.
+    size_t mesh_task_log_index{};
+    /// EDEN_NX2_MESH_TASK_DUMP=<dir>: when <dir>/dump.now exists, the task program's input
+    /// buffers of every task draw of the next two frames are written under <dir>, and those
+    /// frames are logged like the 120th ones, so the logged mesh workgroup counts can be compared
+    /// with a replay of the same inputs.
+    struct {
+        u64 first_frame{1};
+        u64 last_frame{};
+        u64 checked_frame{~u64{}};
+        u64 frame{~u64{}};
+        u32 draw_index{};
+    } mesh_task_dump;
+    bool MeshTaskDumpActive(u64 frame);
+    void NoteMeshTaskInputs();
     /// With a task program: the vkCmdDrawIndirect arguments the distribution pass writes.
     struct {
         VkBuffer buffer{};
