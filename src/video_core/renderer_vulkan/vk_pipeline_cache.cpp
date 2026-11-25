@@ -717,9 +717,6 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         .max_subgroup_size = device.GetMaxSubgroupSize(),
         .has_broken_robust =
             device.IsNvidia() && device.GetNvidiaArch() <= NvidiaArchitecture::Arch_Pascal,
-        .has_broken_global_memory_search_call =
-            driver_id == VK_DRIVER_ID_NVIDIA_PROPRIETARY &&
-            device.GetNvidiaArch() <= NvidiaArchitecture::Arch_Pascal,
         // Mesa MR 45092 ("radv: Clear stale vertex user SGPR state when binding mesh shaders"),
         // in 26.2.5. Only GFX11+ is affected, but the workaround costs one SGPR read anywhere.
         .has_broken_mesh_user_sgprs = driver_id == VK_DRIVER_ID_MESA_RADV &&
