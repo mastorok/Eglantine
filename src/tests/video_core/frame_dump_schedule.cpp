@@ -115,3 +115,50 @@ TEST_CASE("Frame dump schedule follows EDEN_NX2_FRAME_DUMP_AT", "[frame_dump_sch
     REQUIRE(by_file.Tick(1000.0) == Step::Start);
     REQUIRE(by_file.Frame() == 90);
 }
+
+TEST_CASE("Frame dump schedule captures consecutive frames and the buffers alone",
+          "[frame_dump_schedule]") {
+    FrameDumpSchedule schedule;
+    schedule.Configure("2f", {}, false, true, 3);
+    REQUIRE(schedule.Tick(1.0) == Step::None);
+    REQUIRE(schedule.Tick(1.0) == Step::Start);
+    REQUIRE(schedule.Frame() == 2);
+    REQUIRE(schedule.Buffers());
+    REQUIRE_FALSE(schedule.Sampled());
+    REQUIRE_FALSE(Vulkan::RecordingSampledTextures());
+    // Each frame ends the tick the next one starts: no frame is left out between them.
+    REQUIRE(schedule.Tick(1.0) == Step::Finish);
+    REQUIRE(schedule.MoreFramesFollow());
+    REQUIRE(schedule.Capturing());
+    REQUIRE(schedule.Frame() == 3);
+    REQUIRE(schedule.Tick(1.0) == Step::Finish);
+    REQUIRE(schedule.MoreFramesFollow());
+    REQUIRE(schedule.Capturing());
+    REQUIRE(schedule.Tick(1.0) == Step::Finish);
+    REQUIRE_FALSE(schedule.MoreFramesFollow());
+    REQUIRE_FALSE(schedule.Capturing());
+    REQUIRE(schedule.Frame() == 5);
+    REQUIRE(schedule.Tick(1.0) == Step::None);
+    REQUIRE_FALSE(schedule.MoreFramesFollow());
+
+    // Sampled textures stay recorded through the whole run of frames.
+    FrameDumpSchedule sampled;
+    sampled.Configure("1f", {}, true, false, 2);
+    REQUIRE(sampled.Tick(1.0) == Step::Start);
+    REQUIRE(Vulkan::RecordingSampledTextures());
+    REQUIRE(sampled.Tick(1.0) == Step::Finish);
+    REQUIRE(sampled.MoreFramesFollow());
+    REQUIRE(Vulkan::RecordingSampledTextures());
+    REQUIRE(sampled.Tick(1.0) == Step::Finish);
+    REQUIRE_FALSE(sampled.MoreFramesFollow());
+    REQUIRE_FALSE(Vulkan::RecordingSampledTextures());
+
+    // A debug server request is one frame whatever EDEN_NX2_FRAME_DUMP_FRAMES says.
+    FrameDumpSchedule configured;
+    configured.Configure("never", {}, false, true, 4);
+    REQUIRE(configured.Arm(false, true, 11));
+    REQUIRE(configured.Tick(0.0) == Step::Start);
+    REQUIRE(configured.Tick(0.0) == Step::Finish);
+    REQUIRE_FALSE(configured.MoreFramesFollow());
+    REQUIRE(configured.Tick(0.0) == Step::None);
+}

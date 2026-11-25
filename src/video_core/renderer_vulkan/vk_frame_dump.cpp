@@ -344,16 +344,45 @@ FrameDump::FrameDump(const Device& device_, MemoryAllocator& memory_allocator_,
     if (!dir || *dir == '\0') {
         return;
     }
-    const char* const sampled_value = std::getenv("EDEN_NX2_FRAME_DUMP_SAMPLED");
+    const auto flag = [](const char* const name) {
+        const char* const value = std::getenv(name);
+        return value && *value != '\0' && *value != '0';
+    };
+    const bool sampled = flag("EDEN_NX2_FRAME_DUMP_SAMPLED");
+    // The bound buffers alone, with downscaled previews of the images: small enough for a few
+    // consecutive frames of a game that alternates its buffers.
+    const bool buffers_only = !sampled && flag("EDEN_NX2_FRAME_DUMP_BUFFERS");
+    u32 frames = 1;
+    if (const char* const count = std::getenv("EDEN_NX2_FRAME_DUMP_FRAMES")) {
+        const auto end = count + std::strlen(count);
+        u32 parsed{};
+        if (const auto [ptr, ec] = std::from_chars(count, end, parsed);
+            ec == std::errc{} && ptr == end && parsed >= 1 && parsed <= 16) {
+            frames = parsed;
+        } else {
+            LOG_WARNING(Render_Vulkan, "Ignoring invalid EDEN_NX2_FRAME_DUMP_FRAMES");
+        }
+    }
+    if (buffers_only) {
+        write_raw = false;
+        preview_max = 512;
+        preview_jpeg = true;
+    }
     directory = dir;
+    base_directory = directory;
+    std::error_code error;
+    std::filesystem::create_directories(base_directory, error);
+    if (frames > 1) {
+        directory = base_directory / "frame0";
+    }
     start = std::chrono::steady_clock::now();
     const char* const at = std::getenv("EDEN_NX2_FRAME_DUMP_AT");
     const std::string_view value = at ? at : "60";
     // "file" captures once <dir>/capture.now exists, so a frame can be picked while playing.
-    schedule.Configure(value, directory / "capture.now",
-                       sampled_value && *sampled_value != '\0' && *sampled_value != '0');
-    LOG_INFO(Render_Vulkan, "Frame dump armed: dir={} at={}",
-             Common::FS::PathToUTF8String(directory), value);
+    schedule.Configure(value, base_directory / "capture.now", sampled, buffers_only, frames);
+    LOG_INFO(Render_Vulkan, "Frame dump armed: dir={} at={} frames={}{}",
+             Common::FS::PathToUTF8String(base_directory), value, frames,
+             buffers_only ? " buffers only" : "");
 }
 
 FrameDump::~FrameDump() {
@@ -380,10 +409,19 @@ void FrameDump::Arm(VideoCore::Nx2Debug::CaptureRequest request) {
     }
     StopWriter();
     directory = std::move(request.directory);
+    base_directory = directory;
+    capture_index = 0;
     write_raw = request.raw;
     size_cap = request.size_cap != 0 ? request.size_cap : SIZE_CAP;
     preview_max = request.preview_max;
     preview_jpeg = request.preview_jpeg;
+    ResetCaptureState();
+    if (start == std::chrono::steady_clock::time_point{}) {
+        start = std::chrono::steady_clock::now();
+    }
+}
+
+void FrameDump::ResetCaptureState() {
     truncated = false;
     recorded_bytes = 0;
     sampled_bytes = 0;
@@ -399,9 +437,6 @@ void FrameDump::Arm(VideoCore::Nx2Debug::CaptureRequest request) {
     pass_index = 0;
     draws = 0;
     dispatches = 0;
-    if (start == std::chrono::steady_clock::time_point{}) {
-        start = std::chrono::steady_clock::now();
-    }
 }
 
 std::optional<FrameDump::Target> FrameDump::MakeTarget(ImageView& view, u32 slot,
@@ -1168,10 +1203,27 @@ void FrameDump::TickFrame() {
                                          : std::string{}),
                  .summary = true,
                  .truncated = truncated});
+        if (!schedule.MoreFramesFollow()) {
+            return;
+        }
+        // The next frame starts right now, so the frames are consecutive: the manifest of this
+        // one is closed first, then the next goes into its own folder.
+        StopWriter();
+        ResetCaptureState();
+        directory = base_directory / fmt::format("frame{}", ++capture_index);
+        if (!BeginCapture(elapsed)) {
+            schedule.Abort();
+        }
         return;
     case FrameDumpSchedule::Step::Start:
         break;
     }
+    if (!BeginCapture(elapsed)) {
+        schedule.Abort();
+    }
+}
+
+bool FrameDump::BeginCapture(double elapsed) {
     std::error_code error;
     std::filesystem::create_directories(directory, error);
     manifest.open(directory / "manifest.jsonl", std::ios::trunc);
@@ -1182,8 +1234,7 @@ void FrameDump::TickFrame() {
             VideoCore::Nx2Debug::FinishCapture(
                 id, {.error = fmt::format("cannot write {}", directory.generic_string())});
         }
-        schedule.Abort();
-        return;
+        return false;
     }
     if (schedule.Shaders()) {
         for (const char* const folder : {"native", "spirv", "pipelines"}) {
@@ -1198,14 +1249,20 @@ void FrameDump::TickFrame() {
              << '\n';
     writer = std::thread{[this] { WriterLoop(); }};
     LOG_INFO(Render_Vulkan, "Frame dump: capturing frame {} ({:.1f} s after boot){} into {}", frame,
-             elapsed, schedule.Sampled() ? (schedule.Buffers() ? " with sampled textures and buffers" : " with sampled textures") : (schedule.Buffers() ? " with buffers" : ""), Common::FS::PathToUTF8String(directory));
+             elapsed,
+             schedule.Sampled() ? (schedule.Buffers() ? " with sampled textures and buffers"
+                                                      : " with sampled textures")
+                                : (schedule.Buffers() ? " with buffers" : ""),
+             Common::FS::PathToUTF8String(directory));
+    return true;
 }
 
 void FrameDumpSchedule::Configure(std::string_view at, std::filesystem::path trigger_file_,
-                                  bool sampled_) {
+                                  bool sampled_, bool buffers_only, u32 frames) {
     enabled = true;
     sampled = sampled_;
-    buffers = sampled_;
+    buffers = sampled_ || buffers_only;
+    frames_left = frames > 1 ? frames - 1 : 0;
     if (at == "file") {
         trigger_file = std::move(trigger_file_);
     } else if (at.ends_with('f')) {
@@ -1226,6 +1283,8 @@ bool FrameDumpSchedule::Arm(bool sampled_, bool buffers_, u64 id, bool shaders_)
     shaders = shaders_;
     trigger_frame = 0;
     capture_id = id;
+    frames_left = 0;
+    more_follow = false;
     return true;
 }
 
@@ -1234,7 +1293,14 @@ FrameDumpSchedule::Step FrameDumpSchedule::Tick(double elapsed_seconds) {
         return Step::None;
     }
     ++frame;
+    more_follow = false;
     if (capturing) {
+        if (frames_left > 0) {
+            // The next frame is captured too: it starts as this one ends, with no frame between.
+            --frames_left;
+            more_follow = true;
+            return Step::Finish;
+        }
         SetCapturing(false);
         done = true;
         return Step::Finish;
@@ -1251,6 +1317,7 @@ FrameDumpSchedule::Step FrameDumpSchedule::Tick(double elapsed_seconds) {
 
 void FrameDumpSchedule::Abort() {
     SetCapturing(false);
+    more_follow = false;
     done = true;
 }
 

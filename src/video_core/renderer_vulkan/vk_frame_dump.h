@@ -42,8 +42,11 @@ public:
 
     /// EDEN_NX2_FRAME_DUMP_AT: seconds after boot ("45"), a frame number ("2700f"), or "file" to
     /// capture once `trigger_file` exists. EDEN_NX2_FRAME_DUMP_SAMPLED reads back both the
-    /// sampled textures and the bound buffers.
-    void Configure(std::string_view at, std::filesystem::path trigger_file, bool sampled);
+    /// sampled textures and the bound buffers; `buffers_only` (EDEN_NX2_FRAME_DUMP_BUFFERS) reads
+    /// back the bound buffers alone. `frames` (EDEN_NX2_FRAME_DUMP_FRAMES) captures that many
+    /// consecutive frames, a game that alternates its buffers every frame showing both halves.
+    void Configure(std::string_view at, std::filesystem::path trigger_file, bool sampled,
+                   bool buffers_only = false, u32 frames = 1);
     /// Captures the next frame for the debug server, which is told `id`. False while a capture
     /// runs.
     bool Arm(bool sampled, bool buffers, u64 id, bool shaders = false);
@@ -51,6 +54,11 @@ public:
     Step Tick(double elapsed_seconds);
     /// The capture Tick started could not begin.
     void Abort();
+    /// Whether the Finish Tick just returned is followed by another capture, which starts with
+    /// the next frame.
+    [[nodiscard]] bool MoreFramesFollow() const noexcept {
+        return more_follow;
+    }
 
     [[nodiscard]] bool Capturing() const noexcept {
         return capturing;
@@ -88,6 +96,8 @@ private:
     double trigger_seconds{std::numeric_limits<double>::infinity()};
     u64 frame{};
     u64 capture_id{};
+    u32 frames_left{};
+    bool more_follow{};
 };
 
 /// Whether pipelines keep the textures each draw and dispatch samples: only while a capture that
@@ -213,6 +223,11 @@ public:
     void Arm(VideoCore::Nx2Debug::CaptureRequest request);
 
 private:
+    /// Forgets what the last capture recorded, for the next one.
+    void ResetCaptureState();
+    /// Opens `directory`'s manifest and starts the writer thread; false when it cannot.
+    bool BeginCapture(double elapsed);
+
     enum class DepthEncoding { None, Unorm16, Unorm24, Float32 };
 
     struct Target {
@@ -289,6 +304,9 @@ private:
     u32 preview_max{};
     bool preview_jpeg{};
     std::filesystem::path directory;
+    /// EDEN_NX2_FRAME_DUMP_FRAMES above one: each frame goes into base_directory/frame<N>.
+    std::filesystem::path base_directory;
+    u32 capture_index{};
     std::chrono::steady_clock::time_point start;
 
     std::ofstream manifest;
