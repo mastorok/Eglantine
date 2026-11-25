@@ -396,6 +396,21 @@ constexpr float FAR_PLANE_DEPTH_BIAS = 16.0f;
 
 /// Earlier writes must be visible to a dispatch, including its indirect arguments.
 void RecordDispatchBarrier(vk::CommandBuffer cmdbuf) {
+    // EDEN_NX2_FULL_BARRIER_ALL=1: every dispatch, render pass start and end waits for all earlier
+    // work and sees all its memory writes (A/B for a visibility defect that may be a missing
+    // dependency).
+    static const bool full_barrier{std::getenv("EDEN_NX2_FULL_BARRIER_ALL") != nullptr};
+    if (full_barrier) {
+        static constexpr VkMemoryBarrier FULL{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+        };
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                               0, FULL);
+        return;
+    }
     static constexpr VkMemoryBarrier READ_BARRIER{
         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
         .pNext = nullptr,
@@ -3590,6 +3605,11 @@ void RasterizerVulkan::DispatchCompute() {
     if (!pipeline) {
         if (kepler_compute->IsNativeMode()) throw Shader::RuntimeError("Native compute pipeline unavailable");
         return;
+    }
+    static const bool dispatch_log{std::getenv("EDEN_NX2_DISPATCH_LOG") != nullptr};
+    if (dispatch_log && render_trace_frame % 120 < 8) {
+        LOG_INFO(Render_Vulkan, "Dispatch log: frame {} draws {} shader {:016x}", render_trace_frame,
+                 render_trace_draws, pipeline->ShaderHash());
     }
     std::scoped_lock lock{texture_cache.mutex, buffer_cache.mutex};
     std::optional<ByteAddressedShadow> byte_addressed_shadow;

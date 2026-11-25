@@ -441,7 +441,17 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
             .clearValueCount = clear_value_count,
             .pClearValues = clear_value_count != 0 ? values.data() : nullptr,
         };
-        if (after_compute) {
+        static const bool full_barrier{std::getenv("EDEN_NX2_FULL_BARRIER_ALL") != nullptr};
+        if (full_barrier) {
+            static constexpr VkMemoryBarrier FULL{
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .pNext = nullptr,
+                .srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+            };
+            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                   VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, FULL);
+        } else if (after_compute) {
             // Draws read compute output as indirect arguments, vertices and resources; nothing
             // else orders those reads after the dispatch.
             static constexpr VkMemoryBarrier COMPUTE_TO_GRAPHICS{
@@ -1351,6 +1361,17 @@ void Scheduler::EndRenderPass()
             }
             TracePassEnd(cmdbuf, render_area);
             cmdbuf.EndRenderPass();
+            static const bool full_barrier{std::getenv("EDEN_NX2_FULL_BARRIER_ALL") != nullptr};
+            if (full_barrier) {
+                static constexpr VkMemoryBarrier FULL{
+                    .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                    .pNext = nullptr,
+                    .srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+                    .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+                };
+                cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                       VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, FULL);
+            }
             cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
                                    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, vk::PIPELINE_STAGE_GRAPHICS_COMPUTE,
                                    0, nullptr, nullptr, vk::Span(barriers.data(), num_images));
