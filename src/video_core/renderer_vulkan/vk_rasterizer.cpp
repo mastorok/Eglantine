@@ -1505,7 +1505,8 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
             const auto offsets{request(u64{groups} * 4).first};
             constexpr u64 args_bytes{Shader::Backend::SPIRV::MESH_EMULATION_ARGS_WORDS * 4};
             MeshTaskLogSlot* const log_slot{
-                task_log && (render_trace_frame % 120 < 2 || MeshTaskDumpActive(render_trace_frame))
+                task_log && (render_trace_frame % 120 < 2 || MeshTaskDumpActive(render_trace_frame) ||
+                             frame_dump.Capturing())
                     ? AcquireMeshTaskLogSlot()
                     : nullptr};
             const auto [args, args_span] =

@@ -371,6 +371,7 @@ FrameDump::FrameDump(const Device& device_, MemoryAllocator& memory_allocator_,
     }
     directory = dir;
     base_directory = directory;
+    root_directory = directory;
     std::error_code error;
     std::filesystem::create_directories(base_directory, error);
     if (frames > 1) {
@@ -381,6 +382,9 @@ FrameDump::FrameDump(const Device& device_, MemoryAllocator& memory_allocator_,
     const std::string_view value = at ? at : "60";
     // "file" captures once <dir>/capture.now exists, so a frame can be picked while playing.
     schedule.Configure(value, base_directory / "capture.now", sampled, buffers_only, frames);
+    if (flag("EDEN_NX2_FRAME_DUMP_SHADERS")) {
+        schedule.RecordShaders();
+    }
     LOG_INFO(Render_Vulkan, "Frame dump armed: dir={} at={} frames={}{}",
              Common::FS::PathToUTF8String(base_directory), value, frames,
              buffers_only ? " buffers only" : "");
@@ -1246,6 +1250,14 @@ void FrameDump::TickFrame() {
     case FrameDumpSchedule::Step::Start:
         break;
     }
+    if (schedule.CapturesDone() > 0) {
+        // The trigger file was written again: this capture goes into its own folder.
+        StopWriter();
+        ResetCaptureState();
+        capture_index = 0;
+        base_directory = root_directory / fmt::format("shot{}", schedule.CapturesDone() + 1);
+        directory = schedule.FramesPerCapture() > 1 ? base_directory / "frame0" : base_directory;
+    }
     if (!BeginCapture(elapsed)) {
         schedule.Abort();
     }
@@ -1291,6 +1303,7 @@ void FrameDumpSchedule::Configure(std::string_view at, std::filesystem::path tri
     sampled = sampled_;
     buffers = sampled_ || buffers_only;
     frames_left = frames > 1 ? frames - 1 : 0;
+    frames_per_capture = frames;
     if (at == "file") {
         trigger_file = std::move(trigger_file_);
     } else if (at.ends_with('f')) {
@@ -1330,7 +1343,15 @@ FrameDumpSchedule::Step FrameDumpSchedule::Tick(double elapsed_seconds) {
             return Step::Finish;
         }
         SetCapturing(false);
-        done = true;
+        std::error_code remove_error;
+        if (capture_id == 0 && !trigger_file.empty() &&
+            std::filesystem::remove(trigger_file, remove_error) && !remove_error) {
+            // File trigger: the next capture starts when the file is written again.
+            ++captures_done;
+            frames_left = frames_per_capture > 1 ? frames_per_capture - 1 : 0;
+        } else {
+            done = true;
+        }
         return Step::Finish;
     }
     std::error_code error;

@@ -81,6 +81,18 @@ public:
     [[nodiscard]] u64 CaptureId() const noexcept {
         return capture_id;
     }
+    /// Record the programs and SPIR-V of each captured pipeline (EDEN_NX2_FRAME_DUMP_SHADERS).
+    void RecordShaders() noexcept {
+        shaders = true;
+    }
+    /// With the file trigger: how many captures ended so far. The file is removed after each one
+    /// and the next capture starts when it is written again.
+    [[nodiscard]] u32 CapturesDone() const noexcept {
+        return captures_done;
+    }
+    [[nodiscard]] u32 FramesPerCapture() const noexcept {
+        return frames_per_capture;
+    }
 
 private:
     void SetCapturing(bool value);
@@ -97,6 +109,8 @@ private:
     u64 frame{};
     u64 capture_id{};
     u32 frames_left{};
+    u32 frames_per_capture{1};
+    u32 captures_done{};
     bool more_follow{};
 };
 
@@ -321,6 +335,8 @@ private:
     std::filesystem::path directory;
     /// EDEN_NX2_FRAME_DUMP_FRAMES above one: each frame goes into base_directory/frame<N>.
     std::filesystem::path base_directory;
+    /// The folder the first capture uses; later file-triggered captures go into shot<N> below it.
+    std::filesystem::path root_directory;
     u32 capture_index{};
     std::chrono::steady_clock::time_point start;
 
