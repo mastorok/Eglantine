@@ -519,6 +519,22 @@ private:
         u32 capacity{};
         bool pending{};
     } mesh_task_probe;
+    /// EDEN_NX2_MESH_TASK_LOG: the distribution arguments of every task draw of two consecutive
+    /// frames out of 120, each in a host-visible buffer of its own, logged once the GPU is done.
+    struct MeshTaskLogSlot {
+        vk::Buffer buffer;
+        u64 tick{};
+        u64 frame{};
+        u32 draw{};
+        u32 tasks{};
+        u32 capacity{};
+        u64 task_hash{};
+        u64 mesh_hash{};
+        bool pending{};
+    };
+    std::vector<MeshTaskLogSlot> mesh_task_log;
+    MeshTaskLogSlot* AcquireMeshTaskLogSlot();
+    void ReadMeshTaskLog();
     /// With a task program: the vkCmdDrawIndirect arguments the distribution pass writes.
     struct {
         VkBuffer buffer{};

@@ -300,6 +300,9 @@ private:
     u32 first_pass{};
     bool truncated{};
     bool write_raw{true};
+    /// EDEN_NX2_FRAME_DUMP_HOST: also reads each cached buffer back from the host buffer that
+    /// the draw uses, next to the guest memory copy, to find a cache that holds stale bytes.
+    bool host_check{};
     size_t size_cap{};
     u32 preview_max{};
     bool preview_jpeg{};

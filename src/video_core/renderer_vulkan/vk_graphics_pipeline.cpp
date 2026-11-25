@@ -1818,9 +1818,16 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                 cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout, 0,
                                           descriptor_set, nullptr);
             };
+            // EDEN_NX2_MESH_FULL_BARRIER=1: every barrier of the emulation waits for and exposes
+            // everything (A/B comparison for a missing dependency).
+            static const bool full_barrier{std::getenv("EDEN_NX2_MESH_FULL_BARRIER") != nullptr};
             const auto memory_barrier = [&](VkAccessFlags src_access, VkAccessFlags dst_access,
                                             VkPipelineStageFlags src_stages,
                                             VkPipelineStageFlags dst_stages) {
+                if (full_barrier) {
+                    src_access = dst_access = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+                    src_stages = dst_stages = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+                }
                 const VkMemoryBarrier barrier{
                     .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
                     .pNext = nullptr,

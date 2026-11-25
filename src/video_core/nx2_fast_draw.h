@@ -62,7 +62,8 @@ inline constexpr std::array<const char*, static_cast<size_t>(Reason::Count)> rea
 };
 
 /// Read by every thread: on its own cache line, away from the serials the breaks bump.
-alignas(64) inline std::atomic<bool> g_enabled{true};
+/// EDEN_NX2_FAST_DRAW_OFF=1 starts with them off (A/B comparisons).
+alignas(64) inline std::atomic<bool> g_enabled{std::getenv("EDEN_NX2_FAST_DRAW_OFF") == nullptr};
 
 /// Whether pipelines take their vertex input as dynamic state (VK_EXT_vertex_input_dynamic_state):
 /// then the vertex attribute formats are draw parameters, as only each attribute's type class is

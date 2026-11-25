@@ -363,6 +363,7 @@ FrameDump::FrameDump(const Device& device_, MemoryAllocator& memory_allocator_,
             LOG_WARNING(Render_Vulkan, "Ignoring invalid EDEN_NX2_FRAME_DUMP_FRAMES");
         }
     }
+    host_check = flag("EDEN_NX2_FRAME_DUMP_HOST");
     if (buffers_only) {
         write_raw = false;
         preview_max = 512;
@@ -696,6 +697,16 @@ bool FrameDump::NoteBuffers(bool compute, std::span<const u64> shader_hashes,
             buffer.gpu_modified, from_host ? "host" : "guest");
         if (!from_host) {
             Enqueue({.tags = std::move(tags), .data = std::move(buffer.guest), .raw = true});
+            if (host_check && buffer.host != VK_NULL_HANDLE) {
+                // What the draw reads: the cache's host buffer, to compare with the guest copy.
+                recorded |= RecordBuffer(
+                    buffer.host, buffer.host_offset, buffer.size,
+                    fmt::format(
+                        R"("kind":"buffer",{},"stage":{},"shader":"{:016x}","type":"{}","index":{},"written":{},"gpu_addr":"{:#x}","device_addr":"{:#x}","bound_size":{},"size":{},"gpu_modified":{},"source":"host_check")",
+                        owner, buffer.stage, shader, buffer.storage ? "storage" : "uniform",
+                        buffer.index, buffer.written, buffer.gpu_addr, buffer.device_addr,
+                        buffer.bound_size, buffer.size, buffer.gpu_modified));
+            }
             continue;
         }
         recorded |= RecordBuffer(buffer.host, buffer.host_offset, buffer.size, std::move(tags));

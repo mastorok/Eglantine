@@ -502,6 +502,11 @@ const RasterizerVulkan::MeshArena& RasterizerVulkan::AcquireMeshArena() {
         u32 words;
         std::memcpy(&words, arena.counter.Mapped().data(), sizeof(words));
         const u64 needed{u64{words} * 4};
+        static const bool task_log{std::getenv("EDEN_NX2_MESH_TASK_LOG") != nullptr};
+        if (task_log && needed != 0) {
+            LOG_INFO(Render_Vulkan, "Mesh arena: a submission asked for {} KiB of its {} MiB",
+                     needed >> 10, arena.size >> 20);
+        }
         if (needed > arena.size && mesh_arena_size < max_size) {
             mesh_arena_size = (std::min)(std::bit_ceil(needed + needed / 4), max_size);
             LOG_INFO(Render_Vulkan, "Mesh emulation: a submission needed {} MiB of output, arenas "
@@ -546,6 +551,68 @@ const RasterizerVulkan::MeshArena& RasterizerVulkan::AcquireMeshArena() {
     it->counted = false;
     mesh_arena_current = static_cast<size_t>(std::distance(mesh_arenas.begin(), it));
     return *it;
+}
+
+RasterizerVulkan::MeshTaskLogSlot* RasterizerVulkan::AcquireMeshTaskLogSlot() {
+    constexpr u64 args_bytes{Shader::Backend::SPIRV::MESH_EMULATION_ARGS_WORDS * 4};
+    ReadMeshTaskLog();
+    MeshTaskLogSlot* slot{};
+    for (MeshTaskLogSlot& candidate : mesh_task_log) {
+        if (!candidate.pending) {
+            slot = &candidate;
+            break;
+        }
+    }
+    if (!slot) {
+        if (mesh_task_log.size() >= 256) {
+            return nullptr;
+        }
+        slot = &mesh_task_log.emplace_back();
+        slot->buffer = memory_allocator.CreateBuffer(
+            VkBufferCreateInfo{
+                .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                .pNext = nullptr,
+                .flags = 0,
+                .size = args_bytes,
+                .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
+                         VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                .queueFamilyIndexCount = 0,
+                .pQueueFamilyIndices = nullptr,
+            },
+            MemoryUsage::Download);
+    }
+    // A draw that never records its commands leaves zeros, which the log reports as unwritten.
+    std::memset(slot->buffer.Mapped().data(), 0, args_bytes);
+    slot->buffer.Flush();
+    return slot;
+}
+
+void RasterizerVulkan::ReadMeshTaskLog() {
+    for (MeshTaskLogSlot& slot : mesh_task_log) {
+        // The draw's commands may sit one submission after the tick it was requested in.
+        if (!slot.pending || !scheduler.IsFree(slot.tick + 1)) {
+            continue;
+        }
+        slot.pending = false;
+        slot.buffer.Invalidate();
+        std::array<u32, Shader::Backend::SPIRV::MESH_EMULATION_ARGS_WORDS> words{};
+        std::memcpy(words.data(), slot.buffer.Mapped().data(), sizeof(words));
+        using Shader::Backend::SPIRV::MESH_EMULATION_ARGS_BASE;
+        using Shader::Backend::SPIRV::MESH_EMULATION_ARGS_REQUESTED;
+        using Shader::Backend::SPIRV::MESH_EMULATION_ARGS_TASKS;
+        using Shader::Backend::SPIRV::MESH_EMULATION_DRAW_ARGS_OFFSET;
+        constexpr u32 draw_args{MESH_EMULATION_DRAW_ARGS_OFFSET / 4};
+        LOG_INFO(Render_Vulkan,
+                 "Mesh task log: frame {} (odd {}) draw {} task {:016x} mesh {:016x}: {} tasks, "
+                 "{} mesh workgroups asked, {} dispatched, draw {} vertices x {} instances, "
+                 "first output word {} of {}{}",
+                 slot.frame, slot.frame & 1, slot.draw, slot.task_hash, slot.mesh_hash,
+                 slot.tasks, words[MESH_EMULATION_ARGS_REQUESTED], words[0],
+                 words[draw_args], words[draw_args + 1], words[MESH_EMULATION_ARGS_BASE],
+                 slot.capacity,
+                 words[MESH_EMULATION_ARGS_TASKS] != slot.tasks ? " (arguments not written)" : "");
+    }
 }
 
 void RasterizerVulkan::ReleaseMeshEmulationBuffers() {
@@ -1247,6 +1314,10 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
                          draws, empty, total_groups, frames_drawn, frames);
             }
         }
+        static const bool task_log{std::getenv("EDEN_NX2_MESH_TASK_LOG") != nullptr};
+        if (task_log && !mesh_task_log.empty()) {
+            ReadMeshTaskLog();
+        }
         // Read the pending probe before Request can hand its buffer out again.
         if (mesh_probe.pending && scheduler.IsFree(mesh_probe.tick)) {
             ReadMeshEmulationProbe();
@@ -1303,8 +1374,15 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
                 request(u64{groups} * pipeline->MeshEmulationPayloadStride() * 4).first};
             const auto offsets{request(u64{groups} * 4).first};
             constexpr u64 args_bytes{Shader::Backend::SPIRV::MESH_EMULATION_ARGS_WORDS * 4};
+            MeshTaskLogSlot* const log_slot{task_log && render_trace_frame % 120 < 2
+                                                ? AcquireMeshTaskLogSlot()
+                                                : nullptr};
             const auto [args, args_span] =
-                request(args_bytes, task_probe ? MemoryUsage::Download : MemoryUsage::DeviceLocal);
+                log_slot ? std::make_pair(GraphicsPipeline::MeshEmulationBuffer{
+                                              *log_slot->buffer, 0, args_bytes},
+                                          std::span<u8>{})
+                         : request(args_bytes,
+                                   task_probe ? MemoryUsage::Download : MemoryUsage::DeviceLocal);
             const u32 capacity_words{static_cast<u32>(
                 (std::min)(bytes / 4, u64{(std::numeric_limits<u32>::max)()}))};
             if (task_probe && args_span.size() >= args_bytes) {
@@ -1315,6 +1393,16 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
                     .capacity = capacity_words,
                     .pending = true,
                 };
+            }
+            if (log_slot) {
+                log_slot->pending = true;
+                log_slot->tick = scheduler.CurrentTick();
+                log_slot->frame = render_trace_frame;
+                log_slot->draw = render_trace_draws;
+                log_slot->tasks = groups;
+                log_slot->capacity = capacity_words;
+                log_slot->task_hash = pipeline->ShaderHashes()[1];
+                log_slot->mesh_hash = pipeline->ShaderHashes()[3];
             }
             const MeshArena& arena{mesh_arenas[mesh_arena_current]};
             pipeline->SetMeshEmulationTaskBuffers(
